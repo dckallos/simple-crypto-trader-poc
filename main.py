@@ -6,22 +6,27 @@ main.py
 
 Entrypoint for the lightweight AI trading application. This file:
 1. Initializes simple configuration (API keys, intervals).
-2. (New) Starts a WebSocket feed to capture real-time price data from Kraken.
-3. Fetches or reads market data (from the DB or fallback HTTP request).
+2. Starts a WebSocket feed to capture real-time price data from Kraken for multiple pairs.
+3. Fetches or reads market data from the DB (no HTTP fallback).
 4. Feeds data to the AIStrategy.
 5. Places trades and records them in a simplified database.
+
+NOTE (Single-Threaded Trade Logic):
+- The only concurrency here is the background thread for the WebSocket feed, which
+  writes price data to the DB. All trade placement occurs in the main while-loop below.
+  This ensures no concurrency issues for trade execution: only one loop can place orders.
 """
 
 import time
 import os
 import logging
-import requests
 import sqlite3
 from dotenv import load_dotenv
+import yaml
 
 from ai_strategy import AIStrategy
 from db import init_db, record_trade_in_db
-from ws_data_feed import KrakenWSClient  # <-- NEW: reference the WebSocket module
+from ws_data_feed import KrakenWSClient  # reference the WebSocket module
 
 # ------------------------------------------------------------------------------
 # Logging Setup: simple console-based logging
@@ -33,59 +38,24 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ------------------------------------------------------------------------------
 load_dotenv()
-KRAKEN_API_KEY = os.getenv("KRAKEN_API_KEY", "FAKE_KEY")  # replace with real
+KRAKEN_API_KEY = os.getenv("KRAKEN_API_KEY", "FAKE_KEY")     # replace with real
 KRAKEN_API_SECRET = os.getenv("KRAKEN_SECRET_API_KEY", "FAKE_SECRET")
-TRADING_PAIR = "ETH/USD"  # symbol for demonstration
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "FAKE_OPENAI_KEY")
+
+# Load pairs from your config.yaml
+with open("config.yaml", "r") as file:
+    config = yaml.safe_load(file)
+
+TRADED_PAIRS = config.get("traded_pairs", [])
+
 POLL_INTERVAL_SECONDS = 15  # how often we fetch data & run the AI
-MAX_POSITION_SIZE = 0.001  # example max size for a single trade in BTC
-DB_ENABLED = True  # toggle whether we record trades in sqlite
+MAX_POSITION_SIZE = 0.001   # example max size for a single trade in BTC
+DB_ENABLED = True           # toggle whether we record trades in sqlite
 
-DB_FILE = "trades.db"  # name of the DB file
-
-# ------------------------------------------------------------------------------
-# Market Data Fetch (HTTP Fallback or for additional data)
-# ------------------------------------------------------------------------------
-def fetch_kraken_data(pair: str) -> dict:
-    """
-    Fetches basic market data for the given Kraken pair using Kraken's
-    public Ticker endpoint. This function is synchronous for simplicity.
-
-    :param pair: Friendly pair string, e.g. "XBT/USD".
-    :return: A dict containing at least {"price": float, "timestamp": float}.
-    """
-    # Convert "XBT/USD" -> "XBTUSD" for Kraken's REST API call
-    pair_for_url = pair.replace("/", "")
-    url = f"https://api.kraken.com/0/public/Ticker?pair={pair_for_url}"
-
-    try:
-        resp = requests.get(url, timeout=10)
-        data = resp.json()
-        if data.get("error"):
-            logger.warning(f"Kraken Ticker error: {data['error']}")
-            return {"price": 0.0, "timestamp": time.time()}
-
-        # Extract the first ticker entry
-        result = data.get("result", {})
-        if not result:
-            logger.warning("No 'result' in Kraken response.")
-            return {"price": 0.0, "timestamp": time.time()}
-
-        first_key = list(result.keys())[0]
-        ticker_info = result[first_key]
-        last_trade_price_str = ticker_info["c"][0]  # "c" => last trade [price, lot volume]
-
-        return {
-            "price": float(last_trade_price_str),
-            "timestamp": time.time()
-        }
-
-    except Exception as e:
-        logger.exception(f"Error fetching data from Kraken: {e}")
-        return {"price": 0.0, "timestamp": time.time()}
-
+DB_FILE = "trades.db"       # name of the DB file
 
 # ------------------------------------------------------------------------------
-# Utility: get the latest price from our DB
+# Utility: Get the latest price from our DB
 # ------------------------------------------------------------------------------
 def get_latest_price_from_db(pair: str) -> dict:
     """
@@ -105,7 +75,6 @@ def get_latest_price_from_db(pair: str) -> dict:
             ORDER BY id DESC
             LIMIT 1
         """, (pair,))
-
         row = c.fetchone()
         if row:
             # row: (timestamp, bid, ask, last, volume)
@@ -124,7 +93,6 @@ def get_latest_price_from_db(pair: str) -> dict:
     finally:
         conn.close()
 
-
 # ------------------------------------------------------------------------------
 # Order Placement (Mock)
 # ------------------------------------------------------------------------------
@@ -141,18 +109,21 @@ def place_order(pair: str, side: str, volume: float) -> str:
     mock_order_id = f"MOCK-{side}-{int(time.time())}"
     return mock_order_id
 
-
 # ------------------------------------------------------------------------------
-# Main Loop
+# Main Loop (Single-Threaded Trade Logic)
 # ------------------------------------------------------------------------------
 def main():
     """
     Main loop for:
       1. Initializing DB (if desired).
-      2. Loading AI strategy.
-      3. Starting WebSocket for real-time data capture.
-      4. Periodically fetching the latest data from DB (or fallback to HTTP).
-      5. Getting AI signals and placing trades.
+      2. Loading AI strategy (with multi-pair awareness).
+      3. Starting WebSocket for real-time data capture of all pairs (background thread).
+      4. Periodically fetching the latest data from DB.
+      5. Getting AI signals and placing trades for each pair if data is available.
+
+    Concurrency:
+      - The WebSocket feed runs in a separate thread to store price data in DB.
+      - Only this main thread places trades, ensuring no concurrency risk for orders.
     """
     logger.info("Starting AI trading app...")
 
@@ -161,55 +132,48 @@ def main():
         init_db()
         logger.info("Database initialized.")
 
-    # Start the WebSocket feed in background
-    ws_client = KrakenWSClient([TRADING_PAIR])
+    # Start the WebSocket feed (feed_type="trade" or "ticker") in background
+    ws_client = KrakenWSClient(TRADED_PAIRS, feed_type="ticker")
     ws_client.start()
 
-    # Load the AI strategy
-    ai_model = AIStrategy()
-    logger.info("AI strategy loaded.")
+    # Load the AI strategy, passing the same pairs for multi-coin consideration
+    ai_model = AIStrategy(pairs=TRADED_PAIRS, model_path="trained_model.pkl", use_openai=True)
+    logger.info(f"AI strategy loaded with pairs: {TRADED_PAIRS}")
 
     while True:
         try:
-            # Attempt to get latest price from DB (populated by WebSocket)
-            market_data = get_latest_price_from_db(TRADING_PAIR)
+            # For each pair, we fetch the latest data from DB
+            for pair in TRADED_PAIRS:
+                market_data = get_latest_price_from_db(pair)
 
-            # If DB doesn't have data yet (e.g., just started), fallback to HTTP
-            if not market_data or 'price' not in market_data:
-                logger.info("No WS data yet, fetching from HTTP as fallback...")
-                fallback_data = fetch_kraken_data(TRADING_PAIR)
-                # Format fallback to match the 'market_data' structure
-                market_data = {
-                    "timestamp": fallback_data["timestamp"],
-                    "price": fallback_data["price"],
-                    "bid": fallback_data["price"],
-                    "ask": fallback_data["price"],
-                    "volume": 0.0
-                }
+                # If there's no data in DB for this pair yet, skip it
+                if not market_data or 'price' not in market_data:
+                    logger.warning(f"No WS data yet for {pair}. Skipping this pair.")
+                    continue  # skip the rest of logic for this pair
 
-            logger.info(f"Latest price for {TRADING_PAIR} = {market_data['price']}")
+                logger.info(f"Latest price for {pair} = {market_data['price']}")
 
-            # AI strategy decides what to do
-            signal, suggested_size = ai_model.predict(market_data)
-            logger.info(f"AIStrategy suggests: {signal} with size={suggested_size}")
+                # AI strategy decides what to do
+                signal, suggested_size = ai_model.predict(market_data)
+                logger.info(f"AIStrategy suggests: {signal} with size={suggested_size} for {pair}")
 
-            # Minimal risk check: do not exceed MAX_POSITION_SIZE
-            final_size = min(suggested_size, MAX_POSITION_SIZE)
+                # Minimal risk check: do not exceed MAX_POSITION_SIZE
+                final_size = min(suggested_size, MAX_POSITION_SIZE)
 
-            if signal in ("BUY", "SELL"):
-                order_id = place_order(TRADING_PAIR, signal, final_size)
+                if signal in ("BUY", "SELL"):
+                    order_id = place_order(pair, signal, final_size)
 
-                if DB_ENABLED:
-                    record_trade_in_db(
-                        side=signal,
-                        quantity=final_size,
-                        price=market_data["price"],
-                        order_id=order_id,
-                        pair=TRADING_PAIR
-                    )
-                    logger.info(f"Trade recorded in DB: order_id={order_id}")
-            else:
-                logger.info("No action taken (HOLD).")
+                    if DB_ENABLED:
+                        record_trade_in_db(
+                            side=signal,
+                            quantity=final_size,
+                            price=market_data["price"],
+                            order_id=order_id,
+                            pair=pair
+                        )
+                        logger.info(f"Trade recorded in DB for {pair}: order_id={order_id}")
+                else:
+                    logger.info(f"No action taken (HOLD) for {pair}.")
 
             logger.info(f"Sleeping {POLL_INTERVAL_SECONDS} seconds...\n")
             time.sleep(POLL_INTERVAL_SECONDS)

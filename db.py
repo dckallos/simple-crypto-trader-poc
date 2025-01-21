@@ -94,6 +94,7 @@ def store_price_history(pair: str, bid: float, ask: float, last: float, volume: 
     :param last: Last traded price
     :param volume: Volume in the last period or since last update
     """
+    logger.debug(f"Inserting price for {pair}: last={last}, volume={volume}")
     conn = sqlite3.connect(DB_FILE)
     try:
         c = conn.cursor()

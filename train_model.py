@@ -4,56 +4,68 @@
 """
 train_model.py
 
-A minimal example of how to:
-1. Read historical price data from the 'price_history' table in 'trades.db'.
-2. Construct basic features and labels for a predictive model.
-3. Train a simple scikit-learn model (e.g., a RandomForestClassifier).
-4. Save the trained model to disk (e.g., using joblib).
+1) Reads historical price data from the 'price_history' table in 'trades.db' for multiple pairs.
+2) Constructs basic features and labels for each pair; combines them.
+3) Trains a simple scikit-learn model (e.g., a RandomForestClassifier).
+4) Saves the trained model to disk (by default: "trained_model.pkl").
+5) Optionally logs the model's validation accuracy each time to "training_metrics.csv".
 
-You can run this script from the command line:
+Usage:
     python train_model.py
 
-This example is simplified for demonstration. In a real scenario, you'll likely
-create more sophisticated features (moving averages, indicators, etc.) and
-a more carefully chosen label (future price movement, returns, etc.).
+Notes:
+- In a real scenario, you'd likely create more sophisticated features
+  (moving averages, indicators, etc.) and a more carefully chosen label
+  (future return, etc.).
+- We remove deprecated fillna(method="ffill"/"bfill") usage by using df.ffill()
+  and df.bfill() instead.
+- If you want to skip logging to a CSV, just remove or comment out the
+  log_accuracy_to_csv(...) call.
 """
 
-import sqlite3
 import os
+import sqlite3
 import logging
 import numpy as np
 import pandas as pd
+import yaml
 
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 import joblib
-from db import init_db
+
+# If you have a db.py with init_db or other DB utilities, you can import them, but
+# it's not strictly necessary unless you want to ensure DB creation from here.
+# from db import init_db
 
 # ------------------------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------------------------
-DB_FILE = "trades.db"  # The same DB that main.py uses
+DB_FILE = "trades.db"                # The same DB that main.py uses
 MODEL_OUTPUT_PATH = "trained_model.pkl"
+METRICS_OUTPUT_FILE = "training_metrics.csv"
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Load pairs from config.yaml (in the same folder)
+with open("config.yaml", "r") as file:
+    config = yaml.safe_load(file)
+TRADED_PAIRS = config.get("traded_pairs", [])
 
 # ------------------------------------------------------------------------------
-# Fetch Data from DB
+# Step 1: Load Data from DB
 # ------------------------------------------------------------------------------
-def load_data_from_db(db_file=DB_FILE, pair="ETH/USD"):
+def load_data_for_pair(db_file: str, pair: str) -> pd.DataFrame:
     """
-    Loads data from 'price_history' table for the specified pair.
-
-    Returns a Pandas DataFrame with columns:
-        timestamp, pair, bid_price, ask_price, last_price, volume
-    If there's no data, returns an empty DataFrame.
+    Loads data from 'price_history' for a single pair, returning a DataFrame with:
+        [timestamp, pair, bid_price, ask_price, last_price, volume]
+    Sorted ascending by timestamp. Empty if no data or error.
     """
     if not os.path.exists(db_file):
         logger.error(f"Database file {db_file} not found.")
-        return pd.DataFrame()  # empty
+        return pd.DataFrame()
 
     conn = sqlite3.connect(db_file)
     try:
@@ -66,123 +78,159 @@ def load_data_from_db(db_file=DB_FILE, pair="ETH/USD"):
         df = pd.read_sql_query(query, conn)
         return df
     except Exception as e:
-        logger.exception(f"Error reading from DB: {e}")
+        logger.exception(f"Error reading from DB for pair={pair}: {e}")
         return pd.DataFrame()
     finally:
         conn.close()
 
-
 # ------------------------------------------------------------------------------
-# Feature Engineering
+# Step 2: Feature Engineering
 # ------------------------------------------------------------------------------
 def build_features_and_labels(df: pd.DataFrame) -> (pd.DataFrame, pd.Series):
     """
-    Given a dataframe of price data, create simple features and a target label.
+    Given a DataFrame of price data, create simple features and a target label.
 
-    For demonstration, we define a trivial "label" = whether the price 1 step in
-    the future is higher than the current price. In reality, you'd do something
-    more robust (like a future return threshold, multi-step ahead prediction, etc.)
+    For demonstration, we define a trivial label = whether the price 1 step
+    in the future is higher than the current price. In reality, you'd do
+    something more robust (like a future return threshold, multi-step ahead
+    prediction, etc.).
 
-    Returns:
-        X: a DataFrame of features
-        y: a Series of labels (1 => price up, 0 => price down or same)
+    :param df: DataFrame with columns at least:
+               [timestamp, last_price, bid_price, ask_price, volume]
+    :return: (X, y)
+             X => DataFrame of features
+             y => Series (binary label: 1 => up, 0 => down or same)
     """
     if df.empty or "last_price" not in df.columns:
         return pd.DataFrame(), pd.Series(dtype=int)
 
-    # Sort by timestamp to ensure chronological order
+    # Sort ascending by timestamp
     df = df.sort_values("timestamp").reset_index(drop=True)
 
-    # Example feature 1: "last_price" as the direct input
+    # Example features
     df["feature_price"] = df["last_price"]
-
-    # Example feature 2: rolling mean over a small window
     df["feature_ma_3"] = df["last_price"].rolling(window=3).mean()
-
-    # Example feature 3: difference between bid/ask
     df["feature_spread"] = df["ask_price"] - df["bid_price"]
 
-    # Fill NaNs from rolling computations
-    df.fillna(method="ffill", inplace=True)
-    df.fillna(method="bfill", inplace=True)
+    # Forward/backward fill instead of deprecated fillna(method=...)
+    df.ffill(inplace=True)
+    df.bfill(inplace=True)
 
-    # Construct label: compare next price to current price
-    # Shift last_price by -1 to get future price
+    # Label: next price > current price?
     df["future_price"] = df["last_price"].shift(-1)
     df["label_up"] = (df["future_price"] > df["last_price"]).astype(int)
 
-    # Drop the last row because it won't have a future price
-    df = df.dropna(subset=["future_price"]).reset_index(drop=True)
+    # Drop the last row (no future_price)
+    df.dropna(subset=["future_price"], inplace=True)
+    df.reset_index(drop=True, inplace=True)
 
-    # Our feature set (X) and label (y)
+    # Our X, y
     feature_cols = ["feature_price", "feature_ma_3", "feature_spread"]
     X = df[feature_cols]
     y = df["label_up"]
 
     return X, y
 
-
 # ------------------------------------------------------------------------------
-# Training Routine
+# Step 3: Training Routine
 # ------------------------------------------------------------------------------
 def train_model(X: pd.DataFrame, y: pd.Series):
     """
     Trains a random forest classifier on the given features and labels.
 
     :param X: Features DataFrame
-    :param y: Label Series
-    :return: Trained model
+    :param y: Labels Series
+    :return: (model, accuracy) or (None, None) if insufficient data.
     """
     if X.empty or len(X) < 10:
         logger.warning("Not enough data to train a robust model!")
-        return None
+        return None, None
 
     # Simple train/test split
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, shuffle=False
-    )
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
 
-    # Create and train the model
+    # Train the model
     model = RandomForestClassifier(n_estimators=50, random_state=42)
     model.fit(X_train, y_train)
 
-    # Evaluate
+    # Evaluate on the test set
     y_pred = model.predict(X_test)
     acc = accuracy_score(y_test, y_pred)
-    logger.info(f"Validation Accuracy = {acc:.4f}")
 
-    return model
+    return model, acc
 
+# ------------------------------------------------------------------------------
+# Step 4: (Optional) Log Accuracy Over Time
+# ------------------------------------------------------------------------------
+def log_accuracy_to_csv(accuracy: float):
+    """
+    Appends a new line with current timestamp and accuracy to METRICS_OUTPUT_FILE,
+    so you can track how model performance changes over time.
+
+    You can remove/comment this out if you don't want to track accuracy over time.
+    """
+    import datetime
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # If file doesn't exist, write header
+    if not os.path.exists(METRICS_OUTPUT_FILE):
+        with open(METRICS_OUTPUT_FILE, "w") as f:
+            f.write("timestamp,accuracy\n")
+
+    # Append a new line
+    with open(METRICS_OUTPUT_FILE, "a") as f:
+        f.write(f"{timestamp},{accuracy:.4f}\n")
 
 # ------------------------------------------------------------------------------
 # Main Execution
 # ------------------------------------------------------------------------------
 def main():
-    # 1) Load data from DB
-    df = load_data_from_db(DB_FILE, pair="ETH/USD")
-    if df.empty:
-        logger.error("No data retrieved from DB. Exiting.")
+    # Step A) Gather data for all pairs
+    all_X = []
+    all_y = []
+
+    for pair in TRADED_PAIRS:
+        df = load_data_for_pair(DB_FILE, pair)
+        if df.empty:
+            logger.warning(f"No data found for pair={pair}. Skipping.")
+            continue
+
+        X_pair, y_pair = build_features_and_labels(df)
+        if X_pair.empty:
+            logger.warning(f"No valid features after building labels for {pair}. Skipping.")
+            continue
+
+        # Optionally store the pair name in features to differentiate pairs (e.g. one-hot)
+        # X_pair["pair"] = pair
+
+        all_X.append(X_pair)
+        all_y.append(y_pair)
+
+    if not all_X:
+        logger.error("No data retrieved for any pairs. Exiting.")
         return
 
-    logger.info(f"Loaded {len(df)} rows of price data for 'ETH/USD'.")
+    # Combine all pairs into a single dataset
+    X_full = pd.concat(all_X, ignore_index=True)
+    y_full = pd.concat(all_y, ignore_index=True)
 
-    # 2) Build features and labels
-    X, y = build_features_and_labels(df)
-    if X.empty:
-        logger.error("Feature DataFrame is empty. Exiting.")
-        return
+    logger.info(f"Combined dataset size: X={X_full.shape}, y={y_full.shape}")
 
-    logger.info(f"Feature shape: {X.shape}, Label shape: {y.shape}")
-
-    # 3) Train model
-    model = train_model(X, y)
+    # Step B) Train the model
+    model, accuracy = train_model(X_full, y_full)
     if model is None:
-        logger.error("Model training returned None. Exiting.")
+        logger.error("Model training returned None (insufficient data). Exiting.")
         return
 
-    # 4) Save model to disk
+    logger.info(f"Validation Accuracy = {accuracy:.4f}")
+
+    # Step C) Save the model
     joblib.dump(model, MODEL_OUTPUT_PATH)
     logger.info(f"Model saved to {MODEL_OUTPUT_PATH}")
+
+    # Step D) Optional: log accuracy to CSV
+    log_accuracy_to_csv(accuracy)
+    logger.info(f"Appended accuracy={accuracy:.4f} to {METRICS_OUTPUT_FILE}")
 
 
 if __name__ == "__main__":
