@@ -1,0 +1,108 @@
+# Byte-compiled / optimized / compiled Python files
+__pycache__/
+*.py[cod]
+*$py.class
+
+bin/
+
+logs/
+
+# Virtual environment files
+env/
+venv/
+.Python
+pyvenv.cfg
+
+# Distribution / packaging files
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+*.cover
+.coverage.*
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+.env
+logs/
+*.log
+__pycache__/
+*.pyc
+
+# Jupyter Notebook files
+.ipynb_checkpoints/
+
+# pyenv files
+.python-version
+
+# celery beat schedule file
+celerybeat-schedule
+
+# Django stuff:
+db.sqlite3
+*.log
+*.pot
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# site customizations
+*.mo
+*.po
+
+# ENV configuration files
+.env
+.env.*
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+*~
+
+# Specific log files
+*.log
+*.out
+
+# Backup files
+*.bak
+
+# OS generated files
+.DS_Store
+Thumbs.db
+._*
+
+# Dependency file for poetry
+poetry.lock
+
+# Configurations like Bandit that require exclusions
+.bandit
