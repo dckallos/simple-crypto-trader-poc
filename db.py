@@ -1,10 +1,12 @@
-# db.py
-
+# =============================================================================
+# FILE: db.py
+# =============================================================================
 """
 db.py
 
 Minimal SQLite database usage to record trades and now price data.
-We add a 'store_price_history' function for the WebSocket feed.
+We add a 'store_price_history' function for the WebSocket feed,
+and a new table for CryptoPanic data with a function to insert rows.
 """
 
 import sqlite3
@@ -18,6 +20,7 @@ DB_FILE = "trades.db"
 def init_db():
     """
     Creates the 'trades' table and the 'price_history' table if they don't exist.
+    Also creates the 'cryptopanic_news' table to store news data.
     """
     conn = sqlite3.connect(DB_FILE)
     try:
@@ -35,7 +38,7 @@ def init_db():
             )
         """)
 
-        # New 'price_history' table
+        # 'price_history' table
         c.execute("""
             CREATE TABLE IF NOT EXISTS price_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,6 +48,17 @@ def init_db():
                 ask_price REAL,
                 last_price REAL,
                 volume REAL
+            )
+        """)
+
+        # 'cryptopanic_news' table for storing aggregated or raw news data
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS cryptopanic_news (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER,
+                title TEXT,
+                url TEXT,
+                sentiment_score REAL
             )
         """)
 
@@ -112,5 +126,32 @@ def store_price_history(pair: str, bid: float, ask: float, last: float, volume: 
         conn.commit()
     except Exception as e:
         logger.exception(f"Error storing price in DB: {e}")
+    finally:
+        conn.close()
+
+def store_cryptopanic_data(title: str, url: str, sentiment_score: float):
+    """
+    Inserts a row into 'cryptopanic_news'.
+
+    :param title: The news title or headline.
+    :param url: Link to the article.
+    :param sentiment_score: A numeric sentiment measure (e.g. from -1 to +1).
+    """
+    logger.info(f"Storing CryptoPanic news: title={title}, sentiment={sentiment_score}")
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO cryptopanic_news (timestamp, title, url, sentiment_score)
+            VALUES (?, ?, ?, ?)
+        """, (
+            int(time.time()),
+            title,
+            url,
+            sentiment_score
+        ))
+        conn.commit()
+    except Exception as e:
+        logger.exception(f"Error storing cryptopanic data: {e}")
     finally:
         conn.close()
