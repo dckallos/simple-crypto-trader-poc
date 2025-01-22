@@ -175,8 +175,8 @@ class HybridApp:
         Example: fetch daily average from cryptopanic_news for today's date,
         or just return 0 if none.
         """
-        import datetime
-        today_str = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+        from datetime import datetime, timezone
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         conn = sqlite3.connect(DB_FILE)
         try:
             c = conn.cursor()
