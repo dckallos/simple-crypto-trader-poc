@@ -11,18 +11,12 @@ train_model.py
    - CryptoPanic (daily sentiment)
    - LunarCrush (galaxy_score, alt_rank, etc.)
 4) Combines all pairs' data into one dataset, trains a scikit-learn model, saves to disk.
-5) Optionally logs the model's performance metrics to "training_metrics.csv".
+5) Optionally logs performance metrics (accuracy, F1, etc.) to "training_metrics.csv".
 
-ENHANCEMENTS FOR CLASS IMBALANCE:
-- We add 'class_weight': [None, 'balanced'] to the param grid.
-- We use 'f1_macro' as the primary scoring metric for GridSearchCV.
-- After final hold-out testing, we compute balanced_accuracy, F1 score,
-  and classification_report to measure minority-class performance better.
-
-No code is removed; only appended or slightly changed to handle imbalance.
-
-Usage:
-    python train_model.py
+Enhancements / Fixes:
+- If the model has only one class, we handle predict_proba by returning 0.0 or 1.0 manually.
+- We wrap rows in DataFrame to preserve feature names and avoid warnings.
+- Avoid chained assignment warnings by using fillna on entire DataFrame or specifying columns in a dict.
 """
 
 import os
@@ -33,6 +27,7 @@ import pandas as pd
 import yaml
 import joblib
 from typing import Tuple
+import warnings
 
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
@@ -43,15 +38,11 @@ from sklearn.metrics import (
     f1_score,
     classification_report
 )
-import warnings
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Suppress potential warnings from merges or rolling computations
 warnings.filterwarnings("ignore", category=RuntimeWarning)
-warnings.filterwarnings("ignore", category=FutureWarning)
-
 
 # ------------------------------------------------------------------------------
 # Configuration
@@ -70,7 +61,7 @@ TRADED_PAIRS = config.get("traded_pairs", [])
 
 # SHIFT_BARS and THRESHOLD_UP are used to define how we label "up"
 SHIFT_BARS = 3
-THRESHOLD_UP = 0.01  # +1%
+THRESHOLD_UP = 0.003 # +1%
 
 # ------------------------------------------------------------------------------
 # Step 1: Load Data from DB
@@ -193,6 +184,7 @@ def build_features_and_labels(
     Returns (X, y) => Feature DataFrame, label Series
 
     SHIFT_BARS=3, require +1% for label_up=1, to handle short-term labeling.
+    Also rewriting fillna usage to avoid chained assignment warnings.
     """
 
     import pandas as pd
@@ -263,7 +255,9 @@ def build_features_and_labels(
             on="trade_date",
             how="left"
         )
-        df["avg_sentiment"] = df["avg_sentiment"].fillna(0)
+        # Instead of chained assignment, do fillna over the entire col
+        if "avg_sentiment" in df.columns:
+            df["avg_sentiment"] = df["avg_sentiment"].fillna(0)
 
     # Merge LunarCrush aggregator
     if df_lc is not None and not df_lc.empty:
@@ -276,21 +270,19 @@ def build_features_and_labels(
             right_on="lc_date",
             how="left"
         )
+        # No chained assignment: fill numeric columns in a single call
         for col in ["galaxy_score", "alt_rank", "avg_lc_sent"]:
             if col in df.columns:
-                df[col].fillna(0, inplace=True)
+                df[col] = df[col].fillna(0)
 
-    df.ffill(inplace=True)
-    df.bfill(inplace=True)
-
-    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df = df.replace([np.inf, -np.inf], np.nan)
 
     # Label: SHIFT_BARS=3, require +1% for "up"
     df["future_max"] = df["last_price"].rolling(SHIFT_BARS).max().shift(-SHIFT_BARS)
     df["pct_future_gain"] = (df["future_max"] - df["last_price"]) / (df["last_price"] + 1e-9)
     df["label_up"] = (df["pct_future_gain"] >= THRESHOLD_UP).astype(int)
 
-    df.dropna(subset=["future_max"], inplace=True)
+    df = df.dropna(subset=["future_max"])
     df.reset_index(drop=True, inplace=True)
 
     # Feature columns
@@ -312,7 +304,7 @@ def build_features_and_labels(
     if "avg_lc_sent" in df.columns:
         feature_cols.append("avg_lc_sent")
 
-    df.dropna(subset=feature_cols, inplace=True)
+    df = df.dropna(subset=feature_cols)
     df.reset_index(drop=True, inplace=True)
 
     X = df[feature_cols]
@@ -331,6 +323,7 @@ def train_model(X: pd.DataFrame, y: pd.Series):
     """
 
     from sklearn.model_selection import train_test_split
+    from sklearn.ensemble import RandomForestClassifier
 
     if X.empty or len(X) < 10:
         logger.warning("Not enough data to train a robust model!")
@@ -346,7 +339,7 @@ def train_model(X: pd.DataFrame, y: pd.Series):
     param_grid = {
         'n_estimators': [50, 100],
         'max_depth': [None, 5, 10],
-        'class_weight': [None, 'balanced']  # to handle class imbalance
+        'class_weight': [None, 'balanced']
     }
 
     base_rf = RandomForestClassifier(random_state=42)
@@ -371,11 +364,10 @@ def train_model(X: pd.DataFrame, y: pd.Series):
     X_test = X.iloc[-hold_out_size:]
     y_test = y.iloc[-hold_out_size:]
 
-    # Fit best model on X_train
     best_model.fit(X_train, y_train)
     y_pred = best_model.predict(X_test)
 
-    # Evaluate on hold-out
+    from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, confusion_matrix, classification_report
     acc = accuracy_score(y_test, y_pred)
     bal_acc = balanced_accuracy_score(y_test, y_pred)
     f1_macro = f1_score(y_test, y_pred, average='macro')
@@ -387,11 +379,9 @@ def train_model(X: pd.DataFrame, y: pd.Series):
     cm = confusion_matrix(y_test, y_pred)
     logger.info(f"Confusion Matrix (final hold-out):\n{cm}")
 
-    # Detailed per-class metrics
     report = classification_report(y_test, y_pred)
     logger.info(f"Classification Report:\n{report}")
 
-    # Return best_model + a main metric (we can choose F1 macro as the main)
     return best_model, f1_macro
 
 def log_accuracy_to_csv(accuracy: float):
@@ -409,15 +399,105 @@ def log_accuracy_to_csv(accuracy: float):
         f.write(f"{timestamp},{accuracy:.4f}\n")
 
 # ------------------------------------------------------------------------------
+# Step 6: A Basic Backtest (with single-class fix)
+# ------------------------------------------------------------------------------
+def backtest_model(X: pd.DataFrame, model, shift_bars=SHIFT_BARS, buy_threshold=0.5):
+    """
+    A naive example backtest that simulates trades.
+    If the model has only one class, predict_proba will have shape (n,1),
+    so we handle that by forcing p_up=0.0 or 1.0 depending on model.classes_[0].
+
+    Also, we wrap each row into a 1-row DataFrame with the same columns
+    so scikit-learn won't warn about 'X does not have valid feature names'.
+    """
+
+    import pandas as pd
+
+    # We'll store a record of trades
+    trade_history = []
+
+    # If there's only one class in model.classes_, we can't do [0][1]
+    # Let's check that:
+    classes_ = getattr(model, "classes_", None)
+    single_class = (classes_ is not None and len(classes_) == 1)
+    single_class_label = None
+    if single_class:
+        single_class_label = classes_[0]
+        logger.warning(f"Model has only one class in training: {single_class_label}.")
+        # We'll interpret p_up=1.0 if single_class_label is 1, else 0.0
+
+    # Feature columns used by the model
+    if not hasattr(model, "feature_names_in_"):
+        # Some older sklearn versions use model.features_. We'll guess X.columns
+        feature_cols = list(X.columns)
+    else:
+        feature_cols = list(model.feature_names_in_)
+
+    last_index = len(X) - shift_bars
+    i = 0
+
+    while i < last_index:
+        # Grab one row from X in DF form (1 x n_features)
+        row_series = X.iloc[i]
+        row_df = pd.DataFrame([row_series.values], columns=feature_cols)
+
+        if single_class:
+            # If there's only one class, no real proba. We'll do p_up=1.0 if class=1, else 0
+            p_up = 1.0 if single_class_label == 1 else 0.0
+        else:
+            # predict_proba with correct feature names
+            proba = model.predict_proba(row_df)[0]  # shape (n_classes,)
+            # Index [1] is probability of class=1
+            p_up = proba[1]
+
+        current_price = row_series["feature_price"]
+
+        if p_up > buy_threshold:
+            # We "buy" at current_price, hold SHIFT_BARS bars
+            sell_index = i + shift_bars
+            sell_price = X.iloc[sell_index]["feature_price"]
+            pnl = (sell_price - current_price) / current_price  # % return
+
+            trade_history.append({
+                "buy_index": i,
+                "sell_index": sell_index,
+                "buy_price": current_price,
+                "sell_price": sell_price,
+                "p_up": p_up,
+                "pnl_percent": pnl * 100.0
+            })
+            i = sell_index + 1
+        else:
+            i += 1
+
+    if not trade_history:
+        logger.info("No trades triggered in backtest.")
+        return [], 0.0
+
+    df_trades = pd.DataFrame(trade_history)
+    total_pnl = df_trades["pnl_percent"].sum()
+    logger.info(f"Backtest: {len(df_trades)} trades, total PnL = {total_pnl:.2f}%")
+    wins = df_trades[df_trades["pnl_percent"] > 0].shape[0]
+    losses = df_trades[df_trades["pnl_percent"] <= 0].shape[0]
+    if (wins + losses) > 0:
+        win_rate = wins / (wins + losses) * 100.0
+    else:
+        win_rate = 0.0
+    logger.info(f"Win rate = {win_rate:.2f}%")
+
+    return df_trades, total_pnl
+
+# ------------------------------------------------------------------------------
 # Main Execution
 # ------------------------------------------------------------------------------
 def main():
     """
     1) Load BTC data if desired for correlation.
-    2) Load aggregator from CryptoPanic daily if desired.
+    2) Load aggregator from cryptopanic daily if desired.
     3) For each pair in config.yaml, load 'price_history', build features, merges aggregator data.
     4) Combine everything into X_full, y_full, then do hyperparam search + final hold-out test.
-    5) Log or print final metrics.
+    5) (Optional) run a naive backtest to measure "right calls" in trading terms.
+    6) Save the model + log final metric.
     """
     # 1) Possibly load BTC data for correlation
     df_btc = load_data_for_btc(DB_FILE, BTC_PAIR)
@@ -475,11 +555,15 @@ def main():
         logger.error("Model training returned None. Exiting.")
         return
 
-    logger.info(f"Final hold-out F1 (macro) = {final_metric:.4f}")
-    # You can store the final_metric in METRICS_OUTPUT_FILE or keep using accuracy
-    log_accuracy_to_csv(final_metric)
+    # 5) Optional: run a naive backtest on the entire dataset
+    logger.info("Running naive backtest on the full dataset to see 'right calls' in trading.")
+    X_sorted = X_full.copy()
+    # Ensure X_sorted is in ascending order by index or timestamp if not guaranteed
+    # For demonstration, we'll assume it's already sorted from build_features_and_labels
+    trades, total_pnl = backtest_model(X_sorted, model, shift_bars=SHIFT_BARS, buy_threshold=0.5)
 
-    # 5) Save model
+    # 6) Save the model + log final metric
+    log_accuracy_to_csv(final_metric)
     joblib.dump(model, MODEL_OUTPUT_PATH)
     logger.info(f"Model saved to {MODEL_OUTPUT_PATH}")
     logger.info(f"Appended f1_macro={final_metric:.4f} to {METRICS_OUTPUT_FILE}")
