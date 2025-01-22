@@ -12,12 +12,13 @@ A production-ready AIStrategy that:
    - LunarCrush (db table 'lunarcrush_data' with galaxy_score, alt_rank, etc.).
 4. Falls back to dummy logic or manual normalization if needed.
 
-UPDATED CHANGES:
-- Incorporate probability-based decision thresholds instead of a strict 0/1.
-- Provide a simple 3-way logic: if prob_up > 0.6 => BUY, if prob_up < 0.4 => SELL, else HOLD.
-- Track current positions in-memory so we don't keep opening positions repeatedly.
-- Integrate a simple RiskManager clamp on size.
-- Retain existing GPT approach and fallback logic but do not remove code outside these enhancements.
+UPDATED CHANGES FOR RISKMANAGER:
+- Initialize RiskManager with optional stop_loss_pct, take_profit_pct, and daily drawdown limit.
+- Track entry prices in a dict so we can do check_take_profit in real-time.
+- If a take-profit or stop-loss triggers, we SELL the entire position.
+- Example daily PnL updates on closes.
+
+NOTE: In real usage, you'd refine how PnL is calculated and handle partial closes or shorting logic carefully.
 """
 
 import logging
@@ -34,7 +35,7 @@ import json
 from openai import OpenAI
 
 from db import store_price_history, DB_FILE
-from risk_manager import RiskManager  # NEW import for risk management
+from risk_manager import RiskManager  # Import our enhanced risk manager
 
 logger = logging.getLogger(__name__)
 
@@ -85,12 +86,21 @@ class AIStrategy:
         self.client = OpenAI(api_key=openai_api_key)
         logger.info("OpenAI client instantiated in AIStrategy.")
 
-        # NEW: Simple in-memory position tracking: { "ETH/USD": 0.01, ... }
-        # Positive => holding a long. Negative => short. Zero => flat.
+        # Simple in-memory position tracking: { "ETH/USD": 0.01, ... }
         self.current_positions = {}
 
-        # NEW: Integrate a basic risk manager (set a max position size).
-        self.risk_manager = RiskManager(max_position_size=0.001)  # Example: clamp at 0.001 BTC or eq.
+        # Track the "entry price" for each pair if we hold a position
+        # so we can compute unrealized gains/losses.
+        self.entry_prices = {}  # e.g. { "ETH/USD": 1500.0, ... }
+
+        # NEW: Integrate an enhanced RiskManager with optional stop-loss, take-profit, etc.
+        # Set parameters as you see fit. Example:
+        self.risk_manager = RiskManager(
+            max_position_size=0.001,
+            stop_loss_pct=0.05,      # 5% stop-loss
+            take_profit_pct=0.10,    # 10% take-profit
+            max_daily_drawdown=-0.02 # -2% daily drawdown limit
+        )
 
     # --------------------------------------------------------------------------
     # Main predict() entry point
@@ -124,7 +134,7 @@ class AIStrategy:
         return self._dummy_logic(market_data)
 
     # --------------------------------------------------------------------------
-    # GPT-based function-calling approach (unchanged except for minimal doc tweaks)
+    # GPT-based function-calling approach
     # --------------------------------------------------------------------------
     def _openai_inference(self, market_data: dict):
         """
@@ -141,7 +151,7 @@ class AIStrategy:
 
         # Summaries from DB
         trade_summary = self._summarize_recent_trades(pair, limit=3)
-        cryptopanic_sent = self._fetch_cryptopanic_sentiment_today()  # average from aggregator
+        cryptopanic_sent = self._fetch_cryptopanic_sentiment_today()
         symbol = pair.split("/")[0].upper()
         lunarcrush_metrics = self._fetch_lunarcrush_metrics(symbol)
 
@@ -216,8 +226,8 @@ class AIStrategy:
                 size = args.get("size", 0.0)
                 # Risk management clamp
                 action, size = self.risk_manager.adjust_trade(action, size)
-                # Update position tracking if actually buying or selling:
-                self._update_position(pair, action, size)
+                # Update position tracking if actually buying or selling
+                self._update_position(pair, action, size, current_price)
                 return (action, size)
             else:
                 logger.warning(f"Unknown function call: {fn_name}")
@@ -227,11 +237,11 @@ class AIStrategy:
             raw_text = choice.message.content.upper() if choice.message.content else ""
             if "BUY" in raw_text:
                 action, size = self.risk_manager.adjust_trade("BUY", 0.0005)
-                self._update_position(pair, action, size)
+                self._update_position(pair, action, size, current_price)
                 return (action, size)
             elif "SELL" in raw_text:
                 action, size = self.risk_manager.adjust_trade("SELL", 0.0005)
-                self._update_position(pair, action, size)
+                self._update_position(pair, action, size, current_price)
                 return (action, size)
             else:
                 return ("HOLD", 0.0)
@@ -245,11 +255,12 @@ class AIStrategy:
         2. Merge correlation with BTC if pair != BTC itself.
         3. Merge CryptoPanic aggregator daily sentiment if needed.
         4. Merge LunarCrush metrics if needed.
-        5. Instead of a strict (if pred==1 => BUY else HOLD), we do a probability-based
-           approach: if prob_up > 0.6 => BUY, if prob_up < 0.4 => SELL, else HOLD.
-        6. We incorporate a simple position check so we don't keep buying if we already have a position.
+        5. Probability-based approach: if prob_up > 0.6 => BUY, if prob_up < 0.4 => SELL, else HOLD.
+        6. Check if we have a position => might apply stop-loss/take-profit logic from RiskManager.
         """
         pair = market_data.get("pair", self.pairs[-1])
+        latest_price = market_data.get("price", 0.0)  # we'll pass to risk manager checks
+
         # 1) fetch recent price data for the primary coin
         recent_df = self._fetch_recent_price_data(pair, limit=50)
         if recent_df.empty:
@@ -269,12 +280,6 @@ class AIStrategy:
         daily_sent = self._fetch_cryptopanic_sentiment_today()
         df_with_ind["avg_sentiment"] = daily_sent
 
-        # 5) Optional LunarCrush integration (if your model used it, you'd set columns)
-        symbol = pair.split("/")[0].upper()
-        # We'll skip a full time-series merge but you can set single values if needed:
-        # e.g., df_with_ind["galaxy_score"] = <some live galaxy_score>
-        # For demonstration, we won't remove or modify existing structure.
-
         # We'll take the last row
         latest_row = df_with_ind.iloc[[-1]].copy(deep=True)
 
@@ -283,46 +288,53 @@ class AIStrategy:
             if col not in latest_row.columns:
                 latest_row[col] = 0.0  # fallback for missing data
 
-        # restrict to those columns
         X_input = latest_row[TRAIN_FEATURE_COLS]
 
-        # ---- CHANGE: we use predict_proba for probabilities
+        # ---- Use predict_proba for probabilities
         if hasattr(self.model, "predict_proba"):
             probs = self.model.predict_proba(X_input)[0]
-            # Assuming binary classification: index [0] => prob of class=0, index [1] => prob of class=1
             prob_up = probs[1]
-            logger.info(f"For {pair}, prob_up={prob_up:.4f}")
         else:
             # Fallback if model doesn't support predict_proba
-            # We'll just revert to a basic 0/1 classification
             pred_label = self.model.predict(X_input)[0]
             prob_up = 1.0 if pred_label == 1 else 0.0
-            logger.info(f"For {pair}, prob_up={prob_up:.4f}")
 
-
-        # We'll define thresholds: prob_up > 0.6 => BUY, < 0.4 => SELL, else HOLD
+        # Before we decide new trades, let's see if we have a position and need to forcibly close
         current_pos = self.current_positions.get(pair, 0.0)
+        if current_pos != 0.0:
+            entry_price = self.entry_prices.get(pair, latest_price)
+            # Check take-profit / stop-loss, etc.
+            should_close, reason = self.risk_manager.check_take_profit(
+                current_price=latest_price,
+                entry_price=entry_price,
+                current_position=current_pos
+            )
+            if should_close:
+                # Force a SELL of the entire position
+                final_action, final_size = self.risk_manager.adjust_trade("SELL", abs(current_pos))
+                self._update_position(pair, final_action, final_size, latest_price)
+                logger.info(f"Closing position for {pair} due to risk manager => {reason}")
+                return (final_action, final_size)
+
+        # Now we do normal logic
         action = "HOLD"
         size_suggested = 0.0
 
-        # If we already have a long, consider if we want to exit (SELL)
         if current_pos > 0:
-            # Already in a long, see if prob_up is telling us to keep it or close
+            # Already in a long, check if we want to hold or close
             if prob_up < 0.4:
                 action = "SELL"
-                size_suggested = current_pos  # fully close
+                size_suggested = current_pos  # close
             else:
-                # else hold
                 action = "HOLD"
                 size_suggested = 0.0
         else:
-            # We have no position (flat). Maybe we want to open a new long or short
-            # (For a 2-class model, we'll treat 'below 0.4' as "price-down" => short, if we want that.)
+            # We have no position => maybe open a new long or short
             if prob_up > 0.6:
                 action = "BUY"
-                size_suggested = 0.0005  # example base size
+                size_suggested = 0.0005
             elif prob_up < 0.4:
-                # If you'd like to short, you could do:
+                # If you want to short, uncomment:
                 action = "SELL"
                 size_suggested = 0.0005
             else:
@@ -333,7 +345,7 @@ class AIStrategy:
         final_action, final_size = self.risk_manager.adjust_trade(action, size_suggested)
 
         # Update our position tracking
-        self._update_position(pair, final_action, final_size)
+        self._update_position(pair, final_action, final_size, latest_price)
 
         return (final_action, final_size)
 
@@ -341,9 +353,6 @@ class AIStrategy:
     # Helper: compute RSI, MACD, Bollinger, correlation from a DF (unchanged)
     # --------------------------------------------------------------------------
     def _compute_indicators(self, df: pd.DataFrame, df_btc: pd.DataFrame = None):
-        """
-        Replicates the logic from train_model for RSI, MACD, Bollinger, correlation.
-        """
         df = df.sort_values("timestamp").reset_index(drop=True)
 
         # Basic features
@@ -423,10 +432,6 @@ class AIStrategy:
     # CryptoPanic aggregator sentiment (unchanged)
     # --------------------------------------------------------------------------
     def _fetch_cryptopanic_sentiment_today(self) -> float:
-        """
-        Example: we have a daily aggregator that groups by date,
-        computing an average sentiment_score. We'll return today's average or 0.0
-        """
         import datetime
         today_str = datetime.datetime.utcnow().strftime("%Y-%m-%d")
         conn = sqlite3.connect(DB_FILE)
@@ -451,10 +456,6 @@ class AIStrategy:
     # LunarCrush aggregator (unchanged)
     # --------------------------------------------------------------------------
     def _fetch_lunarcrush_metrics(self, symbol: str) -> dict:
-        """
-        We'll look up the LATEST entry in 'lunarcrush_data' for the given symbol,
-        sorted by timestamp desc. Return it as a dict or empty if none found.
-        """
         conn = sqlite3.connect(DB_FILE)
         try:
             c = conn.cursor()
@@ -520,7 +521,7 @@ class AIStrategy:
             conn.close()
 
     # --------------------------------------------------------------------------
-    # Dummy fallback (unchanged except docstring comment)
+    # Dummy fallback
     # --------------------------------------------------------------------------
     def _dummy_logic(self, market_data: dict):
         """
@@ -528,38 +529,69 @@ class AIStrategy:
         ignoring advanced indicators.
         """
         price = market_data.get("price", 0.0)
+        pair = market_data.get("pair", self.pairs[-1])
         if price < 20000:
-            # clamp with RiskManager
             action, size = self.risk_manager.adjust_trade("BUY", 0.0005)
-            self._update_position(market_data.get("pair", self.pairs[-1]), action, size)
+            self._update_position(pair, action, size, price)
             return (action, size)
         else:
             return ("HOLD", 0.0)
 
     # --------------------------------------------------------------------------
-    # NEW: Position Update Helper
+    # Updated: Position Update Helper
     # --------------------------------------------------------------------------
-    def _update_position(self, pair: str, action: str, trade_size: float):
+    def _update_position(self, pair: str, action: str, trade_size: float, trade_price: float):
         """
         Updates the in-memory position tracking based on the action and trade size.
-        If 'BUY', we increase the position. If 'SELL', we decrease or close.
+        If 'BUY', we increase the position. If 'SELL', we decrease or close it.
+        Also tracks entry price for new positions, and logs realized PnL on closes.
         """
         if trade_size <= 0:
             return
 
         current_pos = self.current_positions.get(pair, 0.0)
+        old_pos = current_pos
 
         if action == "BUY":
-            # Increase the long position
             new_pos = current_pos + trade_size
+
+            # If we were previously flat (0) and are now opening a new long,
+            # set entry_price to the trade_price.
+            if old_pos == 0:
+                self.entry_prices[pair] = trade_price
+            # If we were partially in a position, you might want a more
+            # sophisticated approach to recalc average cost basis.
+            # For simplicity, we won't do that here.
+
             self.current_positions[pair] = new_pos
-            logger.debug(f"Updated position for {pair}: was {current_pos}, now {new_pos} (BUY {trade_size})")
+            logger.debug(f"Updated position for {pair}: was {old_pos}, now {new_pos} (BUY {trade_size} @ {trade_price})")
 
         elif action == "SELL":
-            # Decrease the long position (or go negative if shorting)
+            # If we had a long, we reduce it:
             new_pos = current_pos - trade_size
             self.current_positions[pair] = new_pos
-            logger.debug(f"Updated position for {pair}: was {current_pos}, now {new_pos} (SELL {trade_size})")
+            logger.debug(f"Updated position for {pair}: was {old_pos}, now {new_pos} (SELL {trade_size} @ {trade_price})")
+
+            # If we've gone from a positive position to zero or negative, that means
+            # we closed or partially closed a long. Let's assume a full close if new_pos <= 0.
+            if old_pos > 0 and new_pos <= 0:
+                # Realized PnL:
+                entry_price = self.entry_prices.get(pair, trade_price)
+                # for a long, realized is (exit - entry) * size. We'll do partial logic for the entire position.
+                # If we are fully closing the position:
+                closed_size = old_pos if new_pos <= 0 else (old_pos - new_pos)
+                realized_pnl = (trade_price - entry_price) * closed_size
+                logger.info(f"Closed LONG for {pair} with realized PnL: {realized_pnl:.4f}")
+                # We can record it in the risk_manager if we want
+                self.risk_manager.record_trade_pnl(realized_pnl)
+
+                # Reset entry price if fully closed
+                if new_pos <= 0:
+                    self.entry_prices[pair] = 0.0
+
+            # If shorting, you'd want a new 'entry_price' as well.
+            # We'll keep it simple for now.
+
         else:
             # HOLD or anything else doesn't change the position
             pass
