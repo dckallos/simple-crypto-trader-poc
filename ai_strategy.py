@@ -26,6 +26,7 @@ import joblib
 import pandas as pd
 import time
 from dotenv import load_dotenv
+import json
 
 # The official new OpenAI Python library client
 from openai import OpenAI
@@ -181,13 +182,15 @@ class AIStrategy:
         user_message = {"role": "user", "content": user_prompt}
 
         response = self.client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o-mini",
             messages=[system_message, user_message],
             functions=functions,
             function_call="auto",
             temperature=0.0,
             max_tokens=500  # to avoid 'max tokens' error
         )
+        import json
+        print(f'response: {response}')
 
         choice = response.choices[0]
         finish_reason = choice.finish_reason
