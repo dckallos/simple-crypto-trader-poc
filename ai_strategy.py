@@ -145,6 +145,32 @@ class AIStrategy:
         else:
             return ""
 
+    def _fetch_recent_price_data(self, pair: str, limit=50):
+        """
+        Loads the last 'limit' rows from price_history for the given pair,
+        ordered ascending by timestamp.
+        """
+        import sqlite3
+        import pandas as pd
+
+        conn = sqlite3.connect(DB_FILE)
+        try:
+            query = f"""
+                SELECT timestamp, pair, bid_price, ask_price, last_price, volume
+                FROM price_history
+                WHERE pair='{pair}'
+                ORDER BY id DESC
+                LIMIT {limit}
+            """
+            df = pd.read_sql_query(query, conn)
+            # reverse so earliest row is first
+            return df[::-1].reset_index(drop=True)
+        except Exception as e:
+            logger.exception(f"Error loading recent data for {pair}: {e}")
+            return pd.DataFrame()
+        finally:
+            conn.close()
+
     # --------------------------------------------------------------------------
     # GPT Memory or Conversation Functions
     # --------------------------------------------------------------------------
