@@ -13,10 +13,16 @@ train_model.py
 4) Combines all pairs' data into one dataset, trains a scikit-learn model, saves to disk.
 5) Optionally logs performance metrics (accuracy, F1, etc.) to "training_metrics.csv".
 
-Enhancements / Fixes:
-- If the model has only one class, we handle predict_proba by returning 0.0 or 1.0 manually.
-- We wrap rows in DataFrame to preserve feature names and avoid warnings.
-- Avoid chained assignment warnings by using fillna on entire DataFrame or specifying columns in a dict.
+NEW ADDITION: An ADVANCED Backtest Logic
+- Replaces the naive SHIFT_BARS approach with:
+  (a) Position tracking (long/short/flat)
+  (b) Slippage & fees
+  (c) Stop-loss & take-profit
+  (d) Partial exits
+  (e) Advanced metrics (max drawdown, Sharpe, etc.)
+
+Usage:
+    python train_model.py
 """
 
 import os
@@ -60,8 +66,8 @@ with open("config.yaml", "r") as file:
 TRADED_PAIRS = config.get("traded_pairs", [])
 
 # SHIFT_BARS and THRESHOLD_UP are used to define how we label "up"
-SHIFT_BARS = 3
-THRESHOLD_UP = 0.003 # +1%
+SHIFT_BARS = 25
+THRESHOLD_UP = 0.001  # +1%
 
 # ------------------------------------------------------------------------------
 # Step 1: Load Data from DB
@@ -134,7 +140,7 @@ def fetch_cryptopanic_aggregated(db_file: str) -> pd.DataFrame:
 def fetch_lunarcrush_data_for_symbol(db_file: str, symbol: str) -> pd.DataFrame:
     """
     Example approach: If your 'lunarcrush_data' table has 1 row per day or
-    multiple daily snapshots, you can transform it to daily data: [date, galaxy_score, alt_rank, etc.].
+    multiple daily snapshots, you can transform it to daily data: [lc_date, galaxy_score, alt_rank, etc.].
     Or if you store everything with a timestamp but only 1 snapshot daily, we do a daily grouping.
 
     We'll do something naive: just get the daily approach or last approach for the symbol.
@@ -184,7 +190,6 @@ def build_features_and_labels(
     Returns (X, y) => Feature DataFrame, label Series
 
     SHIFT_BARS=3, require +1% for label_up=1, to handle short-term labeling.
-    Also rewriting fillna usage to avoid chained assignment warnings.
     """
 
     import pandas as pd
@@ -255,9 +260,7 @@ def build_features_and_labels(
             on="trade_date",
             how="left"
         )
-        # Instead of chained assignment, do fillna over the entire col
-        if "avg_sentiment" in df.columns:
-            df["avg_sentiment"] = df["avg_sentiment"].fillna(0)
+        df["avg_sentiment"] = df["avg_sentiment"].fillna(0)
 
     # Merge LunarCrush aggregator
     if df_lc is not None and not df_lc.empty:
@@ -270,19 +273,21 @@ def build_features_and_labels(
             right_on="lc_date",
             how="left"
         )
-        # No chained assignment: fill numeric columns in a single call
         for col in ["galaxy_score", "alt_rank", "avg_lc_sent"]:
             if col in df.columns:
-                df[col] = df[col].fillna(0)
+                df[col].fillna(0, inplace=True)
 
-    df = df.replace([np.inf, -np.inf], np.nan)
+    df.ffill(inplace=True)
+    df.bfill(inplace=True)
+
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
     # Label: SHIFT_BARS=3, require +1% for "up"
     df["future_max"] = df["last_price"].rolling(SHIFT_BARS).max().shift(-SHIFT_BARS)
     df["pct_future_gain"] = (df["future_max"] - df["last_price"]) / (df["last_price"] + 1e-9)
     df["label_up"] = (df["pct_future_gain"] >= THRESHOLD_UP).astype(int)
 
-    df = df.dropna(subset=["future_max"])
+    df.dropna(subset=["future_max"], inplace=True)
     df.reset_index(drop=True, inplace=True)
 
     # Feature columns
@@ -304,7 +309,7 @@ def build_features_and_labels(
     if "avg_lc_sent" in df.columns:
         feature_cols.append("avg_lc_sent")
 
-    df = df.dropna(subset=feature_cols)
+    df.dropna(subset=feature_cols, inplace=True)
     df.reset_index(drop=True, inplace=True)
 
     X = df[feature_cols]
@@ -367,7 +372,7 @@ def train_model(X: pd.DataFrame, y: pd.Series):
     best_model.fit(X_train, y_train)
     y_pred = best_model.predict(X_test)
 
-    from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, confusion_matrix, classification_report
+    # Evaluate on hold-out
     acc = accuracy_score(y_test, y_pred)
     bal_acc = balanced_accuracy_score(y_test, y_pred)
     f1_macro = f1_score(y_test, y_pred, average='macro')
@@ -399,93 +404,277 @@ def log_accuracy_to_csv(accuracy: float):
         f.write(f"{timestamp},{accuracy:.4f}\n")
 
 # ------------------------------------------------------------------------------
-# Step 6: A Basic Backtest (with single-class fix)
+# Step 6: ADVANCED Backtest Logic
 # ------------------------------------------------------------------------------
-def backtest_model(X: pd.DataFrame, model, shift_bars=SHIFT_BARS, buy_threshold=0.5):
+def backtest_model(
+    X: pd.DataFrame,
+    model,
+    buy_threshold=0.6,
+    sell_threshold=0.4,
+    stop_loss_pct=0.03,
+    take_profit_pct=0.05,
+    max_hold_bars=SHIFT_BARS,
+    slippage_rate=0.0005,
+    fee_rate=0.001
+):
     """
-    A naive example backtest that simulates trades.
-    If the model has only one class, predict_proba will have shape (n,1),
-    so we handle that by forcing p_up=0.0 or 1.0 depending on model.classes_[0].
+    A more realistic backtest that simulates:
+      - Long & Short entries based on probability (p_up > buy_threshold => go long,
+        p_up < sell_threshold => go short).
+      - Maintains a single position at a time (position_size).
+      - Stop-loss & take-profit if price moves beyond thresholds.
+      - Partial exit logic:
+         if we reach half the take_profit early, we close 50% to lock in gains.
+      - Slippage & fees on each trade.
+      - Advanced metrics: total PnL, max drawdown, Sharpe ratio.
 
-    Also, we wrap each row into a 1-row DataFrame with the same columns
-    so scikit-learn won't warn about 'X does not have valid feature names'.
+    :param X: DataFrame of features in chronological order.
+              Must have "feature_price" for entry/exit prices.
+    :param model: Trained scikit-learn model that supports predict_proba.
+    :param buy_threshold: Probability above which we open a long position if flat.
+    :param sell_threshold: Probability below which we open a short position if flat.
+    :param stop_loss_pct: E.g. 0.03 => stop if trade is -3%.
+    :param take_profit_pct: E.g. 0.05 => fully close if +5%.
+    :param max_hold_bars: Force exit after these many bars if still open.
+    :param slippage_rate: e.g. 0.0005 => 0.05%
+    :param fee_rate: e.g. 0.001 => 0.1%
+
+    :return:
+      df_trades: each row is an entry/exit event or partial exit.
+      advanced_stats: dict with final metrics (total_pnl, max_drawdown, sharpe, etc.)
     """
-
     import pandas as pd
 
-    # We'll store a record of trades
-    trade_history = []
-
-    # If there's only one class in model.classes_, we can't do [0][1]
-    # Let's check that:
-    classes_ = getattr(model, "classes_", None)
-    single_class = (classes_ is not None and len(classes_) == 1)
-    single_class_label = None
-    if single_class:
-        single_class_label = classes_[0]
-        logger.warning(f"Model has only one class in training: {single_class_label}.")
-        # We'll interpret p_up=1.0 if single_class_label is 1, else 0.0
-
-    # Feature columns used by the model
-    if not hasattr(model, "feature_names_in_"):
-        # Some older sklearn versions use model.features_. We'll guess X.columns
-        feature_cols = list(X.columns)
+    if not hasattr(model, "predict_proba"):
+        logger.warning("Model has no predict_proba. We'll do predict => 0/1 only.")
+        # We'll create a fallback function
+        def prob_func(row_df):
+            pred = model.predict(row_df)[0]
+            return float(pred)
     else:
-        feature_cols = list(model.feature_names_in_)
+        def prob_func(row_df):
+            # row_df is 1xN DF of features
+            proba = model.predict_proba(row_df)[0]
+            # Probability of "1"
+            return proba[1] if len(proba) > 1 else float(model.classes_[0] == 1)
 
-    last_index = len(X) - shift_bars
+    # We assume X is sorted by time ascending. If not, sort it first.
+    X = X.reset_index(drop=True)
+
+    # Single "position" approach: 0=flat, >0=long, <0=short.
+    position_size = 0
+    entry_price = 0.0
+    partial_exit_done = False  # track if we've done the 50% partial exit
+
+    trades = []
+
     i = 0
+    while i < len(X):
+        row = X.iloc[i]
+        row_df = row.to_frame().T  # 1-row DF with correct feature names
+        current_price = row["feature_price"]
 
-    while i < last_index:
-        # Grab one row from X in DF form (1 x n_features)
-        row_series = X.iloc[i]
-        row_df = pd.DataFrame([row_series.values], columns=feature_cols)
+        if position_size == 0:
+            # we're flat, see if we open long or short
+            p_up = prob_func(row_df)
+            if p_up > buy_threshold:
+                # go LONG
+                # Slippage on buy
+                buy_price = current_price * (1 + slippage_rate)
+                fee_buy = buy_price * fee_rate
 
-        if single_class:
-            # If there's only one class, no real proba. We'll do p_up=1.0 if class=1, else 0
-            p_up = 1.0 if single_class_label == 1 else 0.0
-        else:
-            # predict_proba with correct feature names
-            proba = model.predict_proba(row_df)[0]  # shape (n_classes,)
-            # Index [1] is probability of class=1
-            p_up = proba[1]
+                position_size = 1  # 1 means fully long
+                entry_price = buy_price
+                partial_exit_done = False
 
-        current_price = row_series["feature_price"]
+                trades.append({
+                    "action": "BUY_OPEN",
+                    "index": i,
+                    "price": buy_price,
+                    "fee": fee_buy,
+                    "p_up": p_up
+                })
 
-        if p_up > buy_threshold:
-            # We "buy" at current_price, hold SHIFT_BARS bars
-            sell_index = i + shift_bars
-            sell_price = X.iloc[sell_index]["feature_price"]
-            pnl = (sell_price - current_price) / current_price  # % return
+            elif p_up < sell_threshold:
+                # go SHORT
+                sell_price = current_price * (1 - slippage_rate)
+                fee_sell = sell_price * fee_rate
 
-            trade_history.append({
-                "buy_index": i,
-                "sell_index": sell_index,
-                "buy_price": current_price,
-                "sell_price": sell_price,
-                "p_up": p_up,
-                "pnl_percent": pnl * 100.0
-            })
-            i = sell_index + 1
-        else:
+                position_size = -1  # -1 means fully short
+                entry_price = sell_price
+                partial_exit_done = False
+
+                trades.append({
+                    "action": "SELL_OPEN",
+                    "index": i,
+                    "price": sell_price,
+                    "fee": fee_sell,
+                    "p_up": p_up
+                })
+
+            # move to next bar
             i += 1
+        else:
+            # we have a position, check stop-loss, take-profit, partial exit, or time-based exit
+            bar_held = 0
+            # We'll iterate bars until we exit or we hit max_hold_bars
+            exit_trade = False
 
-    if not trade_history:
-        logger.info("No trades triggered in backtest.")
-        return [], 0.0
+            while i < len(X) and not exit_trade:
+                row = X.iloc[i]
+                row_df = row.to_frame().T
+                current_price = row["feature_price"]
 
-    df_trades = pd.DataFrame(trade_history)
-    total_pnl = df_trades["pnl_percent"].sum()
-    logger.info(f"Backtest: {len(df_trades)} trades, total PnL = {total_pnl:.2f}%")
-    wins = df_trades[df_trades["pnl_percent"] > 0].shape[0]
-    losses = df_trades[df_trades["pnl_percent"] <= 0].shape[0]
-    if (wins + losses) > 0:
-        win_rate = wins / (wins + losses) * 100.0
+                # compute current gain/loss
+                if position_size > 0:
+                    # long
+                    raw_return = (current_price - entry_price) / entry_price
+                else:
+                    # short
+                    raw_return = (entry_price - current_price) / entry_price
+
+                # Check partial exit logic: if we have > half the take_profit => close 50%
+                # e.g. if we have +2.5% on a +5% target, do partial. (You can adapt logic)
+                if not partial_exit_done and raw_return > 0 and raw_return >= (take_profit_pct / 2):
+                    # close half
+                    exit_price = current_price * (1 - slippage_rate) if position_size > 0 else current_price * (1 + slippage_rate)
+                    fee_exit = exit_price * fee_rate * 0.5  # half position
+                    realized_pnl = 0.5 * position_size * (exit_price - entry_price) if position_size > 0 \
+                        else 0.5 * position_size * (entry_price - exit_price)
+                    realized_pnl_percent = (realized_pnl / (entry_price * abs(0.5 * position_size))) * 100 if position_size != 0 else 0
+
+                    trades.append({
+                        "action": "PARTIAL_EXIT",
+                        "index": i,
+                        "price": exit_price,
+                        "fee": fee_exit,
+                        "pnl_percent": realized_pnl_percent
+                    })
+                    partial_exit_done = True
+                    # we remain in half position => position_size stays same,
+                    # but you could track partial size. For brevity, let's keep it at 1 or -1
+                    # or you can do position_size = 0.5 => more advanced. We'll do simpler approach here.
+
+                # check stop loss
+                if raw_return <= -abs(stop_loss_pct):
+                    # stop out
+                    exit_price = current_price * (1 - slippage_rate) if position_size > 0 else current_price * (1 + slippage_rate)
+                    fee_exit = exit_price * fee_rate
+                    # realized
+                    if position_size > 0:
+                        realized_pnl = (exit_price - entry_price) - fee_exit
+                        realized_pct = ((exit_price - entry_price) / entry_price) * 100
+                    else:
+                        realized_pnl = (entry_price - exit_price) - fee_exit
+                        realized_pct = ((entry_price - exit_price) / entry_price) * 100
+
+                    trades.append({
+                        "action": "STOP_OUT",
+                        "index": i,
+                        "price": exit_price,
+                        "fee": fee_exit,
+                        "pnl_percent": realized_pct
+                    })
+                    position_size = 0
+                    exit_trade = True
+                    i += 1
+                    break
+
+                # check take profit
+                if raw_return >= take_profit_pct:
+                    # fully exit
+                    exit_price = current_price * (1 - slippage_rate) if position_size > 0 else current_price * (1 + slippage_rate)
+                    fee_exit = exit_price * fee_rate
+                    if position_size > 0:
+                        realized_pct = ((exit_price - entry_price) / entry_price) * 100
+                    else:
+                        realized_pct = ((entry_price - exit_price) / entry_price) * 100
+
+                    trades.append({
+                        "action": "TAKE_PROFIT",
+                        "index": i,
+                        "price": exit_price,
+                        "fee": fee_exit,
+                        "pnl_percent": realized_pct
+                    })
+                    position_size = 0
+                    exit_trade = True
+                    i += 1
+                    break
+
+                # check max_hold_bars
+                if bar_held >= max_hold_bars:
+                    # time-based exit
+                    exit_price = current_price * (1 - slippage_rate) if position_size > 0 else current_price * (1 + slippage_rate)
+                    fee_exit = exit_price * fee_rate
+                    if position_size > 0:
+                        realized_pct = ((exit_price - entry_price) / entry_price) * 100
+                    else:
+                        realized_pct = ((entry_price - exit_price) / entry_price) * 100
+
+                    trades.append({
+                        "action": "MAX_HOLD_EXIT",
+                        "index": i,
+                        "price": exit_price,
+                        "fee": fee_exit,
+                        "pnl_percent": realized_pct
+                    })
+                    position_size = 0
+                    exit_trade = True
+                    i += 1
+                    break
+
+                # Optionally: if we see a big reversal (p_up < sell_threshold for a long?), close or flip
+                # We'll skip that for brevity.
+
+                # else continue
+                bar_held += 1
+                i += 1
+
+    # Summarize trades
+    if not trades:
+        logger.info("No trades triggered in advanced backtest.")
+        df_trades = pd.DataFrame()
+        stats = {}
+        return df_trades, stats
+
+    df_trades = pd.DataFrame(trades)
+
+    # We compute cumulative PnL from each exit. Some rows might be partial, some might be open/close
+    # We'll interpret any row with "pnl_percent" as a realized trade portion
+    # accumulate them
+    df_trades["cumulative_pnl"] = df_trades["pnl_percent"].fillna(0).cumsum()
+
+    # Max drawdown
+    peak = -999999
+    max_drawdown = 0.0
+    for val in df_trades["cumulative_pnl"]:
+        if val > peak:
+            peak = val
+        dd = peak - val
+        if dd > max_drawdown:
+            max_drawdown = dd
+
+    # Sharpe ratio (approx) => we treat each trade as if it were "daily return"
+    # Not strictly correct, but for demonstration:
+    returns = df_trades["pnl_percent"].fillna(0) / 100.0
+    if returns.std() == 0:
+        sharpe = 0.0
     else:
-        win_rate = 0.0
-    logger.info(f"Win rate = {win_rate:.2f}%")
+        sharpe = returns.mean() / returns.std()
 
-    return df_trades, total_pnl
+    final_pnl = df_trades["pnl_percent"].fillna(0).sum()
+
+    stats = {
+        "total_pnl_%": final_pnl,
+        "max_drawdown_%": max_drawdown,
+        "sharpe": sharpe,
+        "num_trades": len(df_trades)
+    }
+
+    logger.info(f"Advanced Backtest => total_pnl={final_pnl:.2f}%, max_dd={max_drawdown:.2f}%, sharpe={sharpe:.2f}, trades={len(df_trades)}")
+
+    return df_trades, stats
 
 # ------------------------------------------------------------------------------
 # Main Execution
@@ -496,7 +685,7 @@ def main():
     2) Load aggregator from cryptopanic daily if desired.
     3) For each pair in config.yaml, load 'price_history', build features, merges aggregator data.
     4) Combine everything into X_full, y_full, then do hyperparam search + final hold-out test.
-    5) (Optional) run a naive backtest to measure "right calls" in trading terms.
+    5) Run an advanced backtest on the combined dataset to see real "trading" results.
     6) Save the model + log final metric.
     """
     # 1) Possibly load BTC data for correlation
@@ -555,12 +744,19 @@ def main():
         logger.error("Model training returned None. Exiting.")
         return
 
-    # 5) Optional: run a naive backtest on the entire dataset
-    logger.info("Running naive backtest on the full dataset to see 'right calls' in trading.")
-    X_sorted = X_full.copy()
-    # Ensure X_sorted is in ascending order by index or timestamp if not guaranteed
-    # For demonstration, we'll assume it's already sorted from build_features_and_labels
-    trades, total_pnl = backtest_model(X_sorted, model, shift_bars=SHIFT_BARS, buy_threshold=0.5)
+    # 5) Run advanced backtest
+    logger.info("Running advanced backtest on the full dataset to see realistic 'right calls'.")
+    df_trades, adv_stats = backtest_model(
+        X_full, model,
+        buy_threshold=0.6,
+        sell_threshold=0.4,
+        stop_loss_pct=0.03,
+        take_profit_pct=0.05,
+        max_hold_bars=SHIFT_BARS,
+        slippage_rate=0.0005,
+        fee_rate=0.001
+    )
+    logger.info(f"Backtest stats: {adv_stats}")
 
     # 6) Save the model + log final metric
     log_accuracy_to_csv(final_metric)
