@@ -6,14 +6,13 @@ ai_strategy.py
 
 A production-ready AIStrategy that:
 1. Loads a trained model if model_path is provided.
-2. (NEW) Replicates the same indicator logic (RSI, MACD, Bollinger, volume change, etc.)
-   for real-time inference.
-3. Incorporates correlation with BTC by loading recent BTC data from DB if needed.
-4. Incorporates CryptoPanic sentiment in GPT prompts or as a numeric feature.
-5. Falls back to manual normalization or dummy logic if needed.
+2. Replicates advanced indicators for real-time inference (RSI, MACD, Bollinger, etc.).
+3. Merges optional BTC data for correlation, optional CryptoPanic data for GPT usage.
+4. Falls back to dummy logic or manual normalization if needed.
 
-All existing code is retained. We only add new methods to generate these indicators
-in real-time, plus optional GPT usage for sentiment data.
+FIXES:
+- Increase max_tokens in the GPT calls to avoid "max_tokens reached" errors.
+- Use the same TRAIN_FEATURE_COLS as training to avoid scikit feature mismatch.
 """
 
 import logging
@@ -21,23 +20,26 @@ import sqlite3
 import numpy as np
 import os
 import joblib
+import pandas as pd
+from dotenv import load_dotenv
 
-# The new official library client approach
 from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
 DB_FILE = "trades.db"
+BTC_PAIR = "XBT/USD"
 
-BTC_PAIR = "XBT/USD"  # for correlation reference
+# The exact columns we used in train_model.py
+TRAIN_FEATURE_COLS = [
+    "feature_price", "feature_ma_3", "feature_spread",
+    "vol_change", "rsi", "macd_line", "macd_signal",
+    "boll_upper", "boll_lower",
+    "corr_with_btc",       # if computed
+    "avg_sentiment"        # if used
+]
 
 class AIStrategy:
-    """
-    AIStrategy class that decides whether to BUY, SELL, or HOLD based on
-    a combination of scikit-learn model inference, GPT signals, or fallback logic.
-    Now includes real-time RSI, MACD, Bollinger, correlation, CryptoPanic data, etc.
-    """
-
     def __init__(self, pairs=None, model_path=None, use_openai=False):
         self.pairs = pairs if pairs else ["XBT/USD"]
         self.model = None
@@ -54,52 +56,41 @@ class AIStrategy:
                 logger.warning(f"AIStrategy: No model file found at '{model_path}'. Using fallback.")
             else:
                 logger.info("AIStrategy: No model_path provided. Using fallback logic.")
-
-        # Instantiate the new OpenAI client
+        load_dotenv()
         openai_api_key = os.getenv("OPENAI_API_KEY", "FAKE_OPENAI_KEY")
         self.client = OpenAI(api_key=openai_api_key)
         logger.info("OpenAI client instantiated in AIStrategy.")
 
     def predict(self, market_data: dict):
-        """
-        Decide BUY, SELL, or HOLD for the given market_data, e.g. {"pair":..., "price":..., ...}.
-
-        If use_openai=True, we attempt GPT function-calling with historical trades.
-        Otherwise we do scikit model inference or fallback.
-        """
         pair = market_data.get("pair", self.pairs[-1])
 
-        # (1) Attempt GPT inference if configured
+        # 1) If user wants GPT
         if self.use_openai:
             try:
                 return self._openai_inference(market_data)
             except Exception as e:
                 logger.exception(f"OpenAI inference failed: {e}")
 
-        # (2) If we have a scikit model, do the real-time indicator logic
+        # 2) If we have a scikit model
         if self.model:
             try:
                 return self._model_inference_realtime(market_data)
             except Exception as e:
                 logger.exception(f"Error in scikit inference: {e}")
 
-        # (3) Otherwise fallback
+        # 3) fallback
         return self._dummy_logic(market_data)
 
     # --------------------------------------------------------------------------
-    # GPT Logic with CryptoPanic Summaries + Function Calling
+    # Raise max_tokens to avoid 400 "max_tokens reached" error
     # --------------------------------------------------------------------------
     def _openai_inference(self, market_data: dict):
         pair = market_data.get("pair", self.pairs[-1])
         current_price = market_data.get("price", 0.0)
 
-        # Summarize last 3 trades
-        trade_summary = self._summarize_recent_trades(pair, limit=3)
-
-        # Also fetch aggregated CryptoPanic sentiment (e.g. today's avg)
+        trade_summary = self._summarize_recent_trades(pair, 3)
         sentiment_today = self._fetch_today_sentiment()
 
-        # Provide function signature
         functions = [
             {
                 "name": "trade_decision",
@@ -123,7 +114,6 @@ class AIStrategy:
                 "Return your final answer by calling the function 'trade_decision'."
             )
         }
-
         user_message = {
             "role": "user",
             "content": (
@@ -141,7 +131,7 @@ class AIStrategy:
             functions=functions,
             function_call="auto",
             temperature=0.0,
-            max_tokens=150
+            max_tokens=500,  # <-- increased from 150 to 500
         )
 
         choice = response.choices[0]
@@ -160,7 +150,6 @@ class AIStrategy:
                 logger.warning(f"Unknown function call: {fn_name}. Fallback to dummy.")
                 return self._dummy_logic(market_data)
         else:
-            # Fallback parse
             raw = choice.message.content.upper() if choice.message.content else ""
             if "BUY" in raw:
                 return ("BUY", 0.0005)
@@ -170,55 +159,44 @@ class AIStrategy:
                 return ("HOLD", 0.0)
 
     # --------------------------------------------------------------------------
-    # Real-Time Scikit Inference with Indicators
+    # Real-time scikit inference, restricting to TRAIN_FEATURE_COLS
     # --------------------------------------------------------------------------
     def _model_inference_realtime(self, market_data: dict):
-        """
-        Recompute indicators for the last ~30 rows in DB, then produce scikit prediction.
-        """
         pair = market_data.get("pair", self.pairs[-1])
 
-        # 1) load recent data for this pair
-        recent_df = self._fetch_recent_price_data(pair, 50)  # 50 bars
+        recent_df = self._fetch_recent_price_data(pair, 50)
         if recent_df.empty:
-            logger.warning(f"No recent data to do real-time scikit inference. Fallback.")
+            logger.warning(f"No recent data for {pair}, fallback to dummy.")
             return self._dummy_logic(market_data)
 
-        # 2) possibly load BTC data for correlation
+        # If not BTC, fetch BTC for correlation
         if pair != BTC_PAIR:
             btc_df = self._fetch_recent_price_data(BTC_PAIR, 50)
         else:
             btc_df = None
 
-        # 3) compute indicators
         df_with_ind = self._compute_indicators(recent_df, btc_df)
 
-        # 4) generate row for the "latest" bar
-        latest_row = df_with_ind.iloc[[-1]]  # shape (1, n_features)
-        # drop columns not in the model
-        needed_cols = [
-            col for col in latest_row.columns
-            if col not in ["timestamp","pair","trade_date","future_price","label_up"]
-        ]
-        X_input = latest_row[needed_cols]
+        # The final row:
+        latest_row = df_with_ind.iloc[[-1]].copy(deep=True)
 
-        # 5) predict
-        pred_label = self.model.predict(X_input)[0]  # 0 or 1
+        # If "avg_sentiment" is not in columns, add it with 0
+        for col in TRAIN_FEATURE_COLS:
+            if col not in latest_row.columns:
+                latest_row[col] = 0.0
+
+        # Only select TRAIN_FEATURE_COLS
+        X_input = latest_row[TRAIN_FEATURE_COLS]
+        pred_label = self.model.predict(X_input)[0]
         if pred_label == 1:
-            # e.g. size 0.0005
             return ("BUY", 0.0005)
         else:
             return ("HOLD", 0.0)
 
-    def _compute_indicators(self, df: np.ndarray, df_btc: np.ndarray=None):
-        """
-        Similar logic to build_features_and_labels but for real-time.
-        We won't produce a label. We'll just create features in the DataFrame.
-        """
-        import pandas as pd
+    # same code as before, but ensure we do not skip
+    def _compute_indicators(self, df: pd.DataFrame, df_btc: pd.DataFrame=None):
         df = df.sort_values("timestamp").reset_index(drop=True)
 
-        # Basic
         df["feature_price"] = df["last_price"]
         df["feature_ma_3"] = df["last_price"].rolling(3).mean()
         df["feature_spread"] = df["ask_price"] - df["bid_price"]
@@ -246,27 +224,23 @@ class AIStrategy:
         df["boll_upper"] = sma20 + (2 * std20)
         df["boll_lower"] = sma20 - (2 * std20)
 
-        # Correlation if we have BTC
         if df_btc is not None and not df_btc.empty:
             df_btc = df_btc.sort_values("timestamp").reset_index(drop=True)
             df_btc_ren = df_btc[["timestamp","last_price"]].rename(columns={"last_price":"btc_price"})
-            df_merged = pd.merge_asof(df, df_btc_ren, on="timestamp", direction="nearest", tolerance=30)
+            df_merged = pd.merge_asof(
+                df, df_btc_ren, on="timestamp", direction="nearest", tolerance=30
+            )
             df = df_merged
             df["corr_with_btc"] = df["last_price"].rolling(30).corr(df["btc_price"])
 
-        # Fill
         df.ffill(inplace=True)
         df.bfill(inplace=True)
 
         return df
 
     def _fetch_recent_price_data(self, pair: str, limit=50):
-        """
-        Load last 'limit' rows from price_history for the pair, return as DataFrame.
-        """
         conn = sqlite3.connect(DB_FILE)
         try:
-            import pandas as pd
             query = f"""
                 SELECT timestamp, pair, bid_price, ask_price, last_price, volume
                 FROM price_history
@@ -284,8 +258,7 @@ class AIStrategy:
 
     def _fetch_today_sentiment(self):
         """
-        Example: fetch today's average sentiment from cryptopanic_news table.
-        Returns a float, or 0.0 if not found.
+        Return average sentiment for today's date, or 0.0 if none found.
         """
         import datetime
         today_str = datetime.datetime.utcnow().strftime("%Y-%m-%d")
@@ -308,9 +281,6 @@ class AIStrategy:
             conn.close()
 
     def _summarize_recent_trades(self, pair: str, limit=3):
-        """
-        Similar to your existing summarizing approach, returning short text.
-        """
         conn = sqlite3.connect(DB_FILE)
         summary_lines = []
         try:
@@ -347,9 +317,6 @@ class AIStrategy:
             return ("HOLD", 0.0)
 
     def _fetch_latest_prices_for_pairs(self):
-        """
-        Existing code to gather last prices for all pairs.
-        """
         multi_prices = {}
         conn = sqlite3.connect(DB_FILE)
         try:
