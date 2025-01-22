@@ -155,3 +155,38 @@ def store_cryptopanic_data(title: str, url: str, sentiment_score: float):
         logger.exception(f"Error storing cryptopanic data: {e}")
     finally:
         conn.close()
+
+def store_lunarcrush_data(symbol: str, name: str, galaxy_score: float, alt_rank: int, price: float):
+    """
+    Insert or update row in 'lunarcrush_data' table (example name).
+    You must create this table in your DB schema, e.g.:
+
+    CREATE TABLE IF NOT EXISTS lunarcrush_data (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp INTEGER,
+        symbol TEXT,
+        name TEXT,
+        galaxy_score REAL,
+        alt_rank INTEGER,
+        price REAL
+    );
+    """
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO lunarcrush_data (timestamp, symbol, name, galaxy_score, alt_rank, price)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            int(time.time()),
+            symbol,
+            name,
+            galaxy_score,
+            alt_rank,
+            price
+        ))
+        conn.commit()
+    except Exception as e:
+        logger.exception(f"Error storing LunarCrush data: {e}")
+    finally:
+        conn.close()
