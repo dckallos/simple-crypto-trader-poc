@@ -1,6 +1,6 @@
 enable_training: true
-enable_live_ai_inference: false
-enable_gpt_integration: false
+enable_live_ai_inference: true
+enable_gpt_integration: true
 traded_pairs:
   - ETH/USD
   - XBT/USD

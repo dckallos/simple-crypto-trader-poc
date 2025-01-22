@@ -154,6 +154,8 @@ def main():
     if ENABLE_TRAINING:
         logger.info("ENABLE_TRAINING is True, running training routine now...")
         # If you have a direct function:
+        fetch_cryptopanic_data()
+        fetch_lunarcrush_data()
         training_main()
         # Or if you want to run a separate script:
         # import subprocess
