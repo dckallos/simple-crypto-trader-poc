@@ -88,7 +88,6 @@ def fetch_lunarcrush_data():
         resp.raise_for_status()
 
         data = resp.json()  # Expect JSON data
-        print(f'data: {json.dumps(data, indent=4)}')
         # Usually, the structure might have something like "data": [...]
         coins_list = data.get("data", [])
         logger.info(f"Fetched {len(coins_list)} coins from LunarCrush.")
