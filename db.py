@@ -95,6 +95,10 @@ def init_db():
     finally:
         conn.close()
 
+    create_open_positions_table()
+    create_ai_context_table()
+
+
 def record_trade_in_db(side: str, quantity: float, price: float, order_id: str, pair="ETH/USD"):
     """
     Inserts a new record into the 'trades' table.
@@ -289,6 +293,129 @@ def store_lunarcrush_data(
         conn.commit()
     except Exception as e:
         logger.exception(f"Error storing LunarCrush data: {e}")
+    finally:
+        conn.close()
+
+def create_open_positions_table():
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS open_positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pair TEXT UNIQUE,
+                position_size REAL,
+                avg_entry_price REAL,
+                updated_at INTEGER
+            )
+        """)
+        conn.commit()
+    except Exception as e:
+        logger.exception(f"Error creating open_positions table: {e}")
+    finally:
+        conn.close()
+
+
+def load_positions_from_db():
+    """
+    Returns a dict: { "ETH/USD": {"size": 0.5, "basis": 1500.0}, ... }
+    for all pairs found in 'open_positions'.
+    """
+    results = {}
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        c = conn.cursor()
+        c.execute("SELECT pair, position_size, avg_entry_price FROM open_positions")
+        rows = c.fetchall()
+        for row in rows:
+            pair, size, basis = row
+            results[pair] = {"size": float(size), "basis": float(basis)}
+    except Exception as e:
+        logger.exception(f"Error loading positions from DB: {e}")
+    finally:
+        conn.close()
+    return results
+
+def save_position_to_db(pair: str, position_size: float, avg_entry_price: float):
+    """
+    Upserts a row in 'open_positions' for the given pair. If position_size=0 => remove row.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        c = conn.cursor()
+        ts = int(time.time())
+        if abs(position_size) < 1e-12:
+            # remove the row if position is effectively zero
+            c.execute("DELETE FROM open_positions WHERE pair=?", (pair,))
+        else:
+            # upsert approach
+            c.execute("""
+                INSERT INTO open_positions (pair, position_size, avg_entry_price, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(pair) DO UPDATE SET
+                  position_size=excluded.position_size,
+                  avg_entry_price=excluded.avg_entry_price,
+                  updated_at=excluded.updated_at
+            """, (pair, position_size, avg_entry_price, ts))
+        conn.commit()
+    except Exception as e:
+        logger.exception(f"Error saving position for {pair}: {e}")
+    finally:
+        conn.close()
+
+def create_ai_context_table():
+    """
+    A simple table to store a single row of GPT conversation memory (or you can store multiple rows).
+    """
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS ai_context (
+                id INTEGER PRIMARY KEY,
+                context TEXT
+            )
+        """)
+        # We can store just 1 row with id=1 if we want a single memory, or do a bigger approach
+        conn.commit()
+    except Exception as e:
+        logger.exception(f"Error creating ai_context table: {e}")
+    finally:
+        conn.close()
+
+def load_gpt_context_from_db():
+    """
+    Returns the 'context' field from ai_context WHERE id=1, or empty if none found.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        c = conn.cursor()
+        c.execute("SELECT context FROM ai_context WHERE id=1")
+        row = c.fetchone()
+        if row and row[0]:
+            return row[0]  # this might be a string with all prior GPT memory
+        return ""
+    except Exception as e:
+        logger.exception(f"Error loading GPT context: {e}")
+        return ""
+    finally:
+        conn.close()
+
+def save_gpt_context_to_db(context_str: str):
+    """
+    Upsert the single row in 'ai_context' with id=1, storing context_str.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO ai_context (id, context)
+            VALUES (1, ?)
+            ON CONFLICT(id) DO UPDATE SET context=excluded.context
+        """, (context_str,))
+        conn.commit()
+    except Exception as e:
+        logger.exception(f"Error saving GPT context: {e}")
     finally:
         conn.close()
 
