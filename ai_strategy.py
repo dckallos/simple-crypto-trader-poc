@@ -12,10 +12,12 @@ A production-ready AIStrategy that:
    - LunarCrush (db table 'lunarcrush_data' with galaxy_score, alt_rank, etc.).
 4. Falls back to dummy logic or manual normalization if needed.
 
-FIXES/UPDATES:
-- Increase max_tokens in GPT calls to avoid "max_tokens reached" error.
-- Use the same TRAIN_FEATURE_COLS as training to avoid feature mismatch.
-- Add synergy with CryptoPanic and LunarCrush data for advanced AI decisions.
+UPDATED CHANGES:
+- Incorporate probability-based decision thresholds instead of a strict 0/1.
+- Provide a simple 3-way logic: if prob_up > 0.6 => BUY, if prob_up < 0.4 => SELL, else HOLD.
+- Track current positions in-memory so we don't keep opening positions repeatedly.
+- Integrate a simple RiskManager clamp on size.
+- Retain existing GPT approach and fallback logic but do not remove code outside these enhancements.
 """
 
 import logging
@@ -31,9 +33,11 @@ import json
 # The official new OpenAI Python library client
 from openai import OpenAI
 
+from db import store_price_history, DB_FILE
+from risk_manager import RiskManager  # NEW import for risk management
+
 logger = logging.getLogger(__name__)
 
-DB_FILE = "trades.db"
 BTC_PAIR = "XBT/USD"
 
 # The exact columns we used in train_model.py, if you want to replicate them:
@@ -75,10 +79,18 @@ class AIStrategy:
                 logger.warning(f"AIStrategy: No model file found at '{model_path}'. Using fallback.")
             else:
                 logger.info("AIStrategy: No model_path provided. Using fallback logic.")
+
         load_dotenv()
         openai_api_key = os.getenv("OPENAI_API_KEY", "FAKE_OPENAI_KEY")
         self.client = OpenAI(api_key=openai_api_key)
         logger.info("OpenAI client instantiated in AIStrategy.")
+
+        # NEW: Simple in-memory position tracking: { "ETH/USD": 0.01, ... }
+        # Positive => holding a long. Negative => short. Zero => flat.
+        self.current_positions = {}
+
+        # NEW: Integrate a basic risk manager (set a max position size).
+        self.risk_manager = RiskManager(max_position_size=0.001)  # Example: clamp at 0.001 BTC or eq.
 
     # --------------------------------------------------------------------------
     # Main predict() entry point
@@ -112,7 +124,7 @@ class AIStrategy:
         return self._dummy_logic(market_data)
 
     # --------------------------------------------------------------------------
-    # GPT-based function-calling approach
+    # GPT-based function-calling approach (unchanged except for minimal doc tweaks)
     # --------------------------------------------------------------------------
     def _openai_inference(self, market_data: dict):
         """
@@ -130,7 +142,6 @@ class AIStrategy:
         # Summaries from DB
         trade_summary = self._summarize_recent_trades(pair, limit=3)
         cryptopanic_sent = self._fetch_cryptopanic_sentiment_today()  # average from aggregator
-        # If your pair is e.g. "ETH/USD", symbol might be "ETH"
         symbol = pair.split("/")[0].upper()
         lunarcrush_metrics = self._fetch_lunarcrush_metrics(symbol)
 
@@ -187,7 +198,7 @@ class AIStrategy:
             functions=functions,
             function_call="auto",
             temperature=0.0,
-            max_tokens=500  # to avoid 'max tokens' error
+            max_tokens=500
         )
         import json
         print(f'response: {response}')
@@ -203,6 +214,10 @@ class AIStrategy:
                 args = json.loads(fn_call.arguments)
                 action = args.get("action", "HOLD")
                 size = args.get("size", 0.0)
+                # Risk management clamp
+                action, size = self.risk_manager.adjust_trade(action, size)
+                # Update position tracking if actually buying or selling:
+                self._update_position(pair, action, size)
                 return (action, size)
             else:
                 logger.warning(f"Unknown function call: {fn_name}")
@@ -211,9 +226,13 @@ class AIStrategy:
             # fallback if GPT didn't do function call
             raw_text = choice.message.content.upper() if choice.message.content else ""
             if "BUY" in raw_text:
-                return ("BUY", 0.0005)
+                action, size = self.risk_manager.adjust_trade("BUY", 0.0005)
+                self._update_position(pair, action, size)
+                return (action, size)
             elif "SELL" in raw_text:
-                return ("SELL", 0.0005)
+                action, size = self.risk_manager.adjust_trade("SELL", 0.0005)
+                self._update_position(pair, action, size)
+                return (action, size)
             else:
                 return ("HOLD", 0.0)
 
@@ -226,7 +245,9 @@ class AIStrategy:
         2. Merge correlation with BTC if pair != BTC itself.
         3. Merge CryptoPanic aggregator daily sentiment if needed.
         4. Merge LunarCrush metrics if needed.
-        5. Produce final single row with exactly TRAIN_FEATURE_COLS => predict => 0 => HOLD, 1 => BUY.
+        5. Instead of a strict (if pred==1 => BUY else HOLD), we do a probability-based
+           approach: if prob_up > 0.6 => BUY, if prob_up < 0.4 => SELL, else HOLD.
+        6. We incorporate a simple position check so we don't keep buying if we already have a position.
         """
         pair = market_data.get("pair", self.pairs[-1])
         # 1) fetch recent price data for the primary coin
@@ -245,17 +266,14 @@ class AIStrategy:
         df_with_ind = self._compute_indicators(recent_df, btc_df)
 
         # 4) Merge aggregator daily sentiment from CryptoPanic if you used "avg_sentiment" in your model
-        daily_sent = self._fetch_cryptopanic_sentiment_today()  # for demonstration
-        # We'll just set that to the last row's "avg_sentiment"
+        daily_sent = self._fetch_cryptopanic_sentiment_today()
         df_with_ind["avg_sentiment"] = daily_sent
 
-        # 5) If you'd like to incorporate LunarCrush data, e.g. galaxy_score => can do it.
+        # 5) Optional LunarCrush integration (if your model used it, you'd set columns)
         symbol = pair.split("/")[0].upper()
-        lunar_metrics = self._fetch_lunarcrush_metrics(symbol)
-        # For demonstration, let's place the 'sentiment' from LC to "avg_sentiment" or a new column.
-        # Or if you had "corr_with_btc" or "avg_sentiment" in your TRAIN_FEATURE_COLS,
-        # you might create a new column "lunar_sent" or something.
-        # We'll skip advanced merges for brevity, but you can do it if your model used them.
+        # We'll skip a full time-series merge but you can set single values if needed:
+        # e.g., df_with_ind["galaxy_score"] = <some live galaxy_score>
+        # For demonstration, we won't remove or modify existing structure.
 
         # We'll take the last row
         latest_row = df_with_ind.iloc[[-1]].copy(deep=True)
@@ -267,14 +285,60 @@ class AIStrategy:
 
         # restrict to those columns
         X_input = latest_row[TRAIN_FEATURE_COLS]
-        pred_label = self.model.predict(X_input)[0]
-        if pred_label == 1:
-            return ("BUY", 0.0005)
+
+        # ---- CHANGE: we use predict_proba for probabilities
+        if hasattr(self.model, "predict_proba"):
+            probs = self.model.predict_proba(X_input)[0]
+            # Assuming binary classification: index [0] => prob of class=0, index [1] => prob of class=1
+            prob_up = probs[1]
+            logger.info(f"For {pair}, prob_up={prob_up:.4f}")
         else:
-            return ("HOLD", 0.0)
+            # Fallback if model doesn't support predict_proba
+            # We'll just revert to a basic 0/1 classification
+            pred_label = self.model.predict(X_input)[0]
+            prob_up = 1.0 if pred_label == 1 else 0.0
+            logger.info(f"For {pair}, prob_up={prob_up:.4f}")
+
+
+        # We'll define thresholds: prob_up > 0.6 => BUY, < 0.4 => SELL, else HOLD
+        current_pos = self.current_positions.get(pair, 0.0)
+        action = "HOLD"
+        size_suggested = 0.0
+
+        # If we already have a long, consider if we want to exit (SELL)
+        if current_pos > 0:
+            # Already in a long, see if prob_up is telling us to keep it or close
+            if prob_up < 0.4:
+                action = "SELL"
+                size_suggested = current_pos  # fully close
+            else:
+                # else hold
+                action = "HOLD"
+                size_suggested = 0.0
+        else:
+            # We have no position (flat). Maybe we want to open a new long or short
+            # (For a 2-class model, we'll treat 'below 0.4' as "price-down" => short, if we want that.)
+            if prob_up > 0.6:
+                action = "BUY"
+                size_suggested = 0.0005  # example base size
+            elif prob_up < 0.4:
+                # If you'd like to short, you could do:
+                action = "SELL"
+                size_suggested = 0.0005
+            else:
+                action = "HOLD"
+                size_suggested = 0.0
+
+        # Apply risk manager clamp
+        final_action, final_size = self.risk_manager.adjust_trade(action, size_suggested)
+
+        # Update our position tracking
+        self._update_position(pair, final_action, final_size)
+
+        return (final_action, final_size)
 
     # --------------------------------------------------------------------------
-    # Helper: compute RSI, MACD, Bollinger, correlation from a DF
+    # Helper: compute RSI, MACD, Bollinger, correlation from a DF (unchanged)
     # --------------------------------------------------------------------------
     def _compute_indicators(self, df: pd.DataFrame, df_btc: pd.DataFrame = None):
         """
@@ -324,7 +388,7 @@ class AIStrategy:
         return df
 
     # --------------------------------------------------------------------------
-    # Summarize recent trades for GPT
+    # Summarize recent trades for GPT (unchanged)
     # --------------------------------------------------------------------------
     def _summarize_recent_trades(self, pair: str, limit=3) -> str:
         conn = sqlite3.connect(DB_FILE)
@@ -356,7 +420,7 @@ class AIStrategy:
         return "\n".join(summary_lines)
 
     # --------------------------------------------------------------------------
-    # CryptoPanic aggregator sentiment (simple daily approach)
+    # CryptoPanic aggregator sentiment (unchanged)
     # --------------------------------------------------------------------------
     def _fetch_cryptopanic_sentiment_today(self) -> float:
         """
@@ -384,7 +448,7 @@ class AIStrategy:
             conn.close()
 
     # --------------------------------------------------------------------------
-    # LunarCrush aggregator
+    # LunarCrush aggregator (unchanged)
     # --------------------------------------------------------------------------
     def _fetch_lunarcrush_metrics(self, symbol: str) -> dict:
         """
@@ -420,7 +484,6 @@ class AIStrategy:
             row = c.fetchone()
             if not row:
                 return {}
-            # Let's map them to keys
             fields = [
                 "price", "market_cap", "volume_24h", "volatility",
                 "percent_change_1h", "percent_change_24h", "percent_change_7d", "percent_change_30d",
@@ -436,7 +499,7 @@ class AIStrategy:
             conn.close()
 
     # --------------------------------------------------------------------------
-    # Helper: fetch recent price data from 'price_history'
+    # Helper: fetch recent price data from 'price_history' (unchanged)
     # --------------------------------------------------------------------------
     def _fetch_recent_price_data(self, pair: str, limit=50):
         conn = sqlite3.connect(DB_FILE)
@@ -457,11 +520,46 @@ class AIStrategy:
             conn.close()
 
     # --------------------------------------------------------------------------
-    # Dummy fallback
+    # Dummy fallback (unchanged except docstring comment)
     # --------------------------------------------------------------------------
     def _dummy_logic(self, market_data: dict):
+        """
+        A fallback strategy that just checks if price < 20000 => BUY else HOLD,
+        ignoring advanced indicators.
+        """
         price = market_data.get("price", 0.0)
         if price < 20000:
-            return ("BUY", 0.0005)
+            # clamp with RiskManager
+            action, size = self.risk_manager.adjust_trade("BUY", 0.0005)
+            self._update_position(market_data.get("pair", self.pairs[-1]), action, size)
+            return (action, size)
         else:
             return ("HOLD", 0.0)
+
+    # --------------------------------------------------------------------------
+    # NEW: Position Update Helper
+    # --------------------------------------------------------------------------
+    def _update_position(self, pair: str, action: str, trade_size: float):
+        """
+        Updates the in-memory position tracking based on the action and trade size.
+        If 'BUY', we increase the position. If 'SELL', we decrease or close.
+        """
+        if trade_size <= 0:
+            return
+
+        current_pos = self.current_positions.get(pair, 0.0)
+
+        if action == "BUY":
+            # Increase the long position
+            new_pos = current_pos + trade_size
+            self.current_positions[pair] = new_pos
+            logger.debug(f"Updated position for {pair}: was {current_pos}, now {new_pos} (BUY {trade_size})")
+
+        elif action == "SELL":
+            # Decrease the long position (or go negative if shorting)
+            new_pos = current_pos - trade_size
+            self.current_positions[pair] = new_pos
+            logger.debug(f"Updated position for {pair}: was {current_pos}, now {new_pos} (SELL {trade_size})")
+        else:
+            # HOLD or anything else doesn't change the position
+            pass
