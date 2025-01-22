@@ -12,13 +12,15 @@ A production-ready AIStrategy that:
    - LunarCrush (db table 'lunarcrush_data' with galaxy_score, alt_rank, etc.).
 4. Falls back to dummy logic or manual normalization if needed.
 
-UPDATED CHANGES FOR RISKMANAGER:
-- Initialize RiskManager with optional stop_loss_pct, take_profit_pct, and daily drawdown limit.
-- Track entry prices in a dict so we can do check_take_profit in real-time.
-- If a take-profit or stop-loss triggers, we SELL the entire position.
-- Example daily PnL updates on closes.
+NEW/HYBRID UPDATES:
+- We assume that 'market_data' might now contain an aggregator summary for the
+  last 5 or 10 minutes (e.g. avg_price, total_volume, etc.), and we can incorporate
+  that into GPT prompting or advanced scikit inference.
+- GPT prompts can reference "aggregated data" instead of a single snapshot price.
+- We maintain references to a RiskManager for forced exits (stop-loss, take-profit),
+  but the main AI logic decides strategic BUY/SELL/HOLD on aggregator intervals.
 
-NOTE: In real usage, you'd refine how PnL is calculated and handle partial closes or shorting logic carefully.
+All existing code is retained, only appended or revised lightly for aggregator usage.
 """
 
 import logging
@@ -56,6 +58,18 @@ class AIStrategy:
     AIStrategy class that decides whether to BUY, SELL, or HOLD based on
     AI-driven signals. It can also feed CryptoPanic or LunarCrush data
     into the real-time inference logic or GPT-based logic, if available.
+
+    We now assume 'market_data' might contain aggregator fields like:
+    {
+      "avg_price": 1234.56,
+      "min_price": 1200.00,
+      "max_price": 1250.00,
+      "total_volume": 4567.89,
+      "pair": "ETH/USD",
+      "timestamp": 1681234567.0,
+      ...
+    }
+    plus any single-snapshot fields if needed.
     """
 
     def __init__(self, pairs=None, model_path=None, use_openai=False):
@@ -111,7 +125,16 @@ class AIStrategy:
         do scikit-based inference with advanced indicators + optional data from
         CryptoPanic or LunarCrush. If 'use_openai' is True, try GPT function-calling.
 
-        :param market_data: e.g. {"price": float, "timestamp": float, "pair": "ETH/USD", ...}
+        :param market_data: e.g. {
+            "avg_price": float,
+            "min_price": float,
+            "max_price": float,
+            "total_volume": float,
+            "pair": "ETH/USD",
+            "timestamp": float,
+            "current_position": float,  # optional
+            ...
+          }
         :return: (signal, size)
         """
         pair = market_data.get("pair", self.pairs[-1])
@@ -138,8 +161,10 @@ class AIStrategy:
     # --------------------------------------------------------------------------
     def _openai_inference(self, market_data: dict):
         """
-        Example GPT usage with function calling. We combine:
+        Example GPT usage with function calling. We incorporate aggregator data if present.
+        We combine:
           - short summary of recent trades
+          - aggregator data (avg/min/max price, volume) for last X minutes
           - CryptoPanic daily sentiment
           - LunarCrush galaxy_score or alt_rank if you wish
 
@@ -147,7 +172,15 @@ class AIStrategy:
         """
 
         pair = market_data.get("pair", self.pairs[-1])
-        current_price = market_data.get("price", 0.0)
+        # aggregator fields might be "avg_price", "total_volume", etc.
+        avg_price = market_data.get("avg_price", 0.0)
+        min_price = market_data.get("min_price", 0.0)
+        max_price = market_data.get("max_price", 0.0)
+        total_volume = market_data.get("total_volume", 0.0)
+
+        current_position = market_data.get("current_position", 0.0)
+        # if you also pass a single snapshot "price", you can do:
+        snapshot_price = market_data.get("price", avg_price)
 
         # Summaries from DB
         trade_summary = self._summarize_recent_trades(pair, limit=3)
@@ -179,12 +212,23 @@ class AIStrategy:
 
         system_message = {
             "role": "system",
-            "content": "You are an advanced crypto trading assistant, using the user's data for decisions."
+            "content": (
+                "You are an advanced crypto trading assistant. The user provides aggregator data "
+                "from the last 5-10 minutes plus recent trade info. Use it to decide BUY, SELL, "
+                "or HOLD, returning a structured JSON with action + size."
+            )
         }
 
+        # aggregator mention
+        aggregator_text = (
+            f"Aggregator data for {pair} over last period:\n"
+            f"  avg_price={avg_price}, min_price={min_price}, max_price={max_price}, volume={total_volume}\n"
+        )
+
         user_prompt = (
+            f"{aggregator_text}\n"
+            f"Current open position: {current_position}\n"
             f"Recent trades for {pair}:\n{trade_summary}\n\n"
-            f"Current price: {current_price}\n"
             f"CryptoPanic daily sentiment: {cryptopanic_sent:.2f}\n"
         )
         if lunarcrush_metrics:
@@ -197,7 +241,7 @@ class AIStrategy:
                 f"  24h Social Volume: {lunarcrush_metrics.get('social_volume_24h')}\n\n"
             )
         user_prompt += (
-            "Please suggest a trade decision (BUY, SELL, or HOLD) plus size in a function call."
+            "Please suggest a trade decision (BUY, SELL, or HOLD) plus size in a function call.\n"
         )
 
         user_message = {"role": "user", "content": user_prompt}
@@ -220,14 +264,13 @@ class AIStrategy:
             fn_call = choice.message.function_call
             fn_name = fn_call.name
             if fn_name == "trade_decision":
-                import json
                 args = json.loads(fn_call.arguments)
                 action = args.get("action", "HOLD")
                 size = args.get("size", 0.0)
                 # Risk management clamp
                 action, size = self.risk_manager.adjust_trade(action, size)
                 # Update position tracking if actually buying or selling
-                self._update_position(pair, action, size, current_price)
+                self._update_position(pair, action, size, snapshot_price)
                 return (action, size)
             else:
                 logger.warning(f"Unknown function call: {fn_name}")
@@ -237,11 +280,11 @@ class AIStrategy:
             raw_text = choice.message.content.upper() if choice.message.content else ""
             if "BUY" in raw_text:
                 action, size = self.risk_manager.adjust_trade("BUY", 0.0005)
-                self._update_position(pair, action, size, current_price)
+                self._update_position(pair, action, size, snapshot_price)
                 return (action, size)
             elif "SELL" in raw_text:
                 action, size = self.risk_manager.adjust_trade("SELL", 0.0005)
-                self._update_position(pair, action, size, current_price)
+                self._update_position(pair, action, size, snapshot_price)
                 return (action, size)
             else:
                 return ("HOLD", 0.0)
@@ -256,10 +299,14 @@ class AIStrategy:
         3. Merge CryptoPanic aggregator daily sentiment if needed.
         4. Merge LunarCrush metrics if needed.
         5. Probability-based approach: if prob_up > 0.6 => BUY, if prob_up < 0.4 => SELL, else HOLD.
-        6. Check if we have a position => might apply stop-loss/take-profit logic from RiskManager.
+        6. If we have a position => check risk manager or forcibly exit if needed.
+        7. Return final (action, size).
         """
         pair = market_data.get("pair", self.pairs[-1])
-        latest_price = market_data.get("price", 0.0)  # we'll pass to risk manager checks
+        latest_price = market_data.get("price", 0.0)  # aggregator might have only avg_price
+        if latest_price == 0.0:
+            # fall back to aggregator's avg_price if single snapshot is missing
+            latest_price = market_data.get("avg_price", 0.0)
 
         # 1) fetch recent price data for the primary coin
         recent_df = self._fetch_recent_price_data(pair, limit=50)
@@ -276,7 +323,7 @@ class AIStrategy:
         # 3) compute indicators
         df_with_ind = self._compute_indicators(recent_df, btc_df)
 
-        # 4) Merge aggregator daily sentiment from CryptoPanic if you used "avg_sentiment" in your model
+        # 4) Merge aggregator daily sentiment from CryptoPanic if used
         daily_sent = self._fetch_cryptopanic_sentiment_today()
         df_with_ind["avg_sentiment"] = daily_sent
 
@@ -286,71 +333,61 @@ class AIStrategy:
         # Ensure all columns from TRAIN_FEATURE_COLS exist
         for col in TRAIN_FEATURE_COLS:
             if col not in latest_row.columns:
-                latest_row[col] = 0.0  # fallback for missing data
+                latest_row[col] = 0.0
 
         X_input = latest_row[TRAIN_FEATURE_COLS]
 
-        # ---- Use predict_proba for probabilities
+        # predict_proba => probability of "up"
         if hasattr(self.model, "predict_proba"):
             probs = self.model.predict_proba(X_input)[0]
             prob_up = probs[1]
         else:
-            # Fallback if model doesn't support predict_proba
             pred_label = self.model.predict(X_input)[0]
             prob_up = 1.0 if pred_label == 1 else 0.0
 
-        # Before we decide new trades, let's see if we have a position and need to forcibly close
         current_pos = self.current_positions.get(pair, 0.0)
         if current_pos != 0.0:
             entry_price = self.entry_prices.get(pair, latest_price)
-            # Check take-profit / stop-loss, etc.
+            # Check forced exit
             should_close, reason = self.risk_manager.check_take_profit(
                 current_price=latest_price,
                 entry_price=entry_price,
                 current_position=current_pos
             )
             if should_close:
-                # Force a SELL of the entire position
                 final_action, final_size = self.risk_manager.adjust_trade("SELL", abs(current_pos))
                 self._update_position(pair, final_action, final_size, latest_price)
                 logger.info(f"Closing position for {pair} due to risk manager => {reason}")
                 return (final_action, final_size)
 
-        # Now we do normal logic
         action = "HOLD"
         size_suggested = 0.0
 
+        # Simple threshold logic
         if current_pos > 0:
-            # Already in a long, check if we want to hold or close
+            # If we already hold a long
             if prob_up < 0.4:
                 action = "SELL"
-                size_suggested = current_pos  # close
-            else:
-                action = "HOLD"
-                size_suggested = 0.0
+                size_suggested = current_pos
         else:
-            # We have no position => maybe open a new long or short
+            # no position
             if prob_up > 0.6:
                 action = "BUY"
                 size_suggested = 0.0005
             elif prob_up < 0.4:
-                # If you want to short, uncomment:
+                # optional short
                 action = "SELL"
                 size_suggested = 0.0005
             else:
                 action = "HOLD"
-                size_suggested = 0.0
 
-        # Apply risk manager clamp
         final_action, final_size = self.risk_manager.adjust_trade(action, size_suggested)
-
-        # Update our position tracking
         self._update_position(pair, final_action, final_size, latest_price)
-
         return (final_action, final_size)
 
     # --------------------------------------------------------------------------
-    # Helper: compute RSI, MACD, Bollinger, correlation from a DF (unchanged)
+    # Helper: compute RSI, MACD, Bollinger, correlation from a DF
+    # (unchanged from your snippet)
     # --------------------------------------------------------------------------
     def _compute_indicators(self, df: pd.DataFrame, df_btc: pd.DataFrame = None):
         df = df.sort_values("timestamp").reset_index(drop=True)
@@ -397,7 +434,8 @@ class AIStrategy:
         return df
 
     # --------------------------------------------------------------------------
-    # Summarize recent trades for GPT (unchanged)
+    # Summarize recent trades for GPT
+    # (unchanged from your snippet)
     # --------------------------------------------------------------------------
     def _summarize_recent_trades(self, pair: str, limit=3) -> str:
         conn = sqlite3.connect(DB_FILE)
@@ -429,7 +467,8 @@ class AIStrategy:
         return "\n".join(summary_lines)
 
     # --------------------------------------------------------------------------
-    # CryptoPanic aggregator sentiment (unchanged)
+    # CryptoPanic aggregator sentiment
+    # (unchanged from your snippet)
     # --------------------------------------------------------------------------
     def _fetch_cryptopanic_sentiment_today(self) -> float:
         import datetime
@@ -453,7 +492,8 @@ class AIStrategy:
             conn.close()
 
     # --------------------------------------------------------------------------
-    # LunarCrush aggregator (unchanged)
+    # LunarCrush aggregator
+    # (unchanged from your snippet)
     # --------------------------------------------------------------------------
     def _fetch_lunarcrush_metrics(self, symbol: str) -> dict:
         conn = sqlite3.connect(DB_FILE)
@@ -500,7 +540,8 @@ class AIStrategy:
             conn.close()
 
     # --------------------------------------------------------------------------
-    # Helper: fetch recent price data from 'price_history' (unchanged)
+    # Helper: fetch recent price data from 'price_history'
+    # (unchanged from your snippet)
     # --------------------------------------------------------------------------
     def _fetch_recent_price_data(self, pair: str, limit=50):
         conn = sqlite3.connect(DB_FILE)
@@ -529,6 +570,9 @@ class AIStrategy:
         ignoring advanced indicators.
         """
         price = market_data.get("price", 0.0)
+        # fallback if aggregator only has avg_price
+        if price == 0.0:
+            price = market_data.get("avg_price", 0.0)
         pair = market_data.get("pair", self.pairs[-1])
         if price < 20000:
             action, size = self.risk_manager.adjust_trade("BUY", 0.0005)
@@ -577,7 +621,7 @@ class AIStrategy:
             if old_pos > 0 and new_pos <= 0:
                 # Realized PnL:
                 entry_price = self.entry_prices.get(pair, trade_price)
-                # for a long, realized is (exit - entry) * size. We'll do partial logic for the entire position.
+                # for a long, realized is (exit - entry) * size. We'll do partial logic for entire position.
                 # If we are fully closing the position:
                 closed_size = old_pos if new_pos <= 0 else (old_pos - new_pos)
                 realized_pnl = (trade_price - entry_price) * closed_size
