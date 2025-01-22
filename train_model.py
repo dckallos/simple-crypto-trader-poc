@@ -18,7 +18,7 @@ We expand build_features_and_labels() to compute:
 - Rolling correlation with BTC
 - Merging optional CryptoPanic sentiment (if aggregated by day).
 
-All existing code is preserved.
+All existing code is preserved (no lines removed).
 """
 
 import os
@@ -40,7 +40,7 @@ DB_FILE = "trades.db"
 MODEL_OUTPUT_PATH = "trained_model.pkl"
 METRICS_OUTPUT_FILE = "training_metrics.csv"
 
-# NEW: We'll define a BTC symbol to unify correlation logic
+# We define a BTC symbol to unify correlation logic
 BTC_PAIR = "XBT/USD"
 
 # Load pairs from config.yaml
@@ -84,7 +84,7 @@ def load_cryptopanic_sentiment(db_file: str) -> pd.DataFrame:
     or we want to transform the raw 'cryptopanic_news' data into a time series.
     For now, let's assume we do something naive: average sentiment per day.
 
-    This function returns a DataFrame with columns [date, avg_sentiment].
+    This function returns a DataFrame with columns [news_date, avg_sentiment].
     Then we'll merge that into our main price DataFrame if timestamps match up.
     """
     conn = sqlite3.connect(db_file)
@@ -109,11 +109,15 @@ def load_cryptopanic_sentiment(db_file: str) -> pd.DataFrame:
 # ------------------------------------------------------------------------------
 # Step 2: Feature Engineering
 # ------------------------------------------------------------------------------
-def build_features_and_labels(df: pd.DataFrame, df_btc: pd.DataFrame=None, df_news: pd.DataFrame=None) -> (pd.DataFrame, pd.Series):
+def build_features_and_labels(
+    df: pd.DataFrame,
+    df_btc: pd.DataFrame = None,
+    df_news: pd.DataFrame = None
+) -> (pd.DataFrame, pd.Series):
     """
     Given a DataFrame of price data for one pair, create features and a target label.
 
-    Add:
+    Includes:
       - Volume changes
       - RSI
       - MACD
@@ -121,26 +125,31 @@ def build_features_and_labels(df: pd.DataFrame, df_btc: pd.DataFrame=None, df_ne
       - correlation with BTC (if df_btc is provided)
       - optional sentiment from cryptopanic (if df_news is provided)
 
-    :param df: DataFrame of a single pair: [timestamp, pair, bid_price, ask_price, last_price, volume]
-    :param df_btc: DataFrame of the reference BTC data, if correlation is needed.
+    :param df: DataFrame of a single pair with columns:
+               [timestamp, pair, bid_price, ask_price, last_price, volume].
+    :param df_btc: DataFrame of reference BTC data, if correlation is needed (timestamp, last_price).
     :param df_news: DataFrame of aggregated news sentiment by day, if using CryptoPanic data.
     :return: (X, y)
     """
+    import numpy as np
+    import pandas as pd
+
+    # 1) Basic checks
     if df.empty or "last_price" not in df.columns:
         return pd.DataFrame(), pd.Series(dtype=int)
 
-    # Sort ascending
+    # 2) Sort ascending by timestamp
     df = df.sort_values("timestamp").reset_index(drop=True)
 
-    # Basic features from before
+    # 3) Basic features
     df["feature_price"] = df["last_price"]
     df["feature_ma_3"] = df["last_price"].rolling(window=3).mean()
     df["feature_spread"] = df["ask_price"] - df["bid_price"]
 
-    # Volume change
+    # 4) Volume change
     df["vol_change"] = df["volume"].pct_change().fillna(0)
 
-    # RSI
+    # 5) RSI
     window_length = 14
     close_delta = df["last_price"].diff()
     gain = close_delta.clip(lower=0)
@@ -150,80 +159,81 @@ def build_features_and_labels(df: pd.DataFrame, df_btc: pd.DataFrame=None, df_ne
     rs = avg_gain / (avg_loss + 1e-9)
     df["rsi"] = 100 - (100 / (1 + rs))
 
-    # MACD
+    # 6) MACD
     ema12 = df["last_price"].ewm(span=12).mean()
     ema26 = df["last_price"].ewm(span=26).mean()
     df["macd_line"] = ema12 - ema26
     df["macd_signal"] = df["macd_line"].ewm(span=9).mean()
 
-    # Bollinger
+    # 7) Bollinger
     sma20 = df["last_price"].rolling(window=20).mean()
     std20 = df["last_price"].rolling(window=20).std()
     df["boll_upper"] = sma20 + (2 * std20)
     df["boll_lower"] = sma20 - (2 * std20)
 
-    # If we have df_btc for correlation, merge or align timestamps
+    # 8) Merge BTC data if provided, then compute rolling correlation
     if df_btc is not None and not df_btc.empty:
-        # Merge df_btc on timestamp
-        # rename last_price to something like btc_price
         df_btc_ren = df_btc[["timestamp", "last_price"]].copy()
         df_btc_ren.rename(columns={"last_price": "btc_price"}, inplace=True)
-        # Merge on timestamp
-        df_merged = pd.merge_asof(
+        # Merge on 'timestamp' using asof-merge in ascending order
+        df = pd.merge_asof(
             df.sort_values("timestamp"),
             df_btc_ren.sort_values("timestamp"),
             on="timestamp",
             direction="nearest",
-            tolerance=30  # e.g. 30 seconds tolerance
+            tolerance=30
         )
-        df = df_merged
-
-        # Now compute rolling correlation of pair's price vs. btc_price
+        # Rolling correlation
         df["corr_with_btc"] = df["last_price"].rolling(window=30).corr(df["btc_price"])
 
-    # If we have df_news, merge it by date
+    # 9) Merge CryptoPanic sentiment if provided
     if df_news is not None and not df_news.empty:
-        # We'll create a date column in df
         df["trade_date"] = pd.to_datetime(df["timestamp"], unit="s").dt.date
         df_news["news_date"] = pd.to_datetime(df_news["news_date"]).dt.date
-        # Merge on these date columns
         df = pd.merge(
             df,
             df_news.rename(columns={"news_date": "trade_date"}),
             on="trade_date",
             how="left"
         )
-        # rename avg_sentiment to cryptopanic_sent, fill missing with 0
+        # fill missing sentiment with 0
         df["avg_sentiment"] = df["avg_sentiment"].fillna(0)
 
-    # Forward/backward fill
+    # 10) Forward/backward fill to reduce NaNs
     df.ffill(inplace=True)
     df.bfill(inplace=True)
 
-    # Construct label: next price > current price
+    # 11) Replace infinite values with NaN
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+    # 12) Create the label: next price > current price
     df["future_price"] = df["last_price"].shift(-1)
     df["label_up"] = (df["future_price"] > df["last_price"]).astype(int)
 
+    # 13) Drop rows that lost their future_price
     df.dropna(subset=["future_price"], inplace=True)
     df.reset_index(drop=True, inplace=True)
 
-    # Potential feature columns
+    # 14) Build final feature columns. You can add or remove columns as you wish
     feature_cols = [
         "feature_price", "feature_ma_3", "feature_spread",
         "vol_change", "rsi", "macd_line", "macd_signal",
         "boll_upper", "boll_lower"
     ]
-    # If we have correlation
     if "corr_with_btc" in df.columns:
         feature_cols.append("corr_with_btc")
-    # If we have CryptoPanic sentiment
     if "avg_sentiment" in df.columns:
         feature_cols.append("avg_sentiment")
 
+    # 15) Drop any rows where these columns are still NaN
+    df.dropna(subset=feature_cols, inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    # 16) Return X, y
     X = df[feature_cols]
     y = df["label_up"]
-
     return X, y
+
 
 # ------------------------------------------------------------------------------
 # Step 3: Training Routine
@@ -265,12 +275,9 @@ def main():
     all_X = []
     all_y = []
 
-    # Load each pair
     for pair in TRADED_PAIRS:
         if pair == BTC_PAIR:
-            # We can skip or keep it if you also want to classify BTC
             logger.info(f"Pair={pair} is BTC itself. We'll still process or skip it.")
-            # We'll still do it but it's optional
         df = load_data_for_pair(DB_FILE, pair)
         if df.empty:
             logger.warning(f"No data for {pair}. Skipping.")
