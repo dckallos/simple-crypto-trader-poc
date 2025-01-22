@@ -62,6 +62,33 @@ def init_db():
             )
         """)
 
+        # 4) NEW: 'lunarcrush_data' table for storing metrics from LunarCrush
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS lunarcrush_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER,
+                symbol TEXT,
+                name TEXT,
+                price REAL,
+                market_cap REAL,
+                volume_24h REAL,
+                volatility REAL,
+                percent_change_1h REAL,
+                percent_change_24h REAL,
+                percent_change_7d REAL,
+                percent_change_30d REAL,
+                social_volume_24h REAL,
+                interactions_24h REAL,
+                social_dominance REAL,
+                galaxy_score REAL,
+                alt_rank INTEGER,
+                sentiment REAL,
+                categories TEXT,
+                topic TEXT,
+                logo TEXT
+            )
+        """)
+
         conn.commit()
     except Exception as e:
         logger.exception(f"Error creating DB: {e}")
@@ -156,37 +183,112 @@ def store_cryptopanic_data(title: str, url: str, sentiment_score: float):
     finally:
         conn.close()
 
-def store_lunarcrush_data(symbol: str, name: str, galaxy_score: float, alt_rank: int, price: float):
+def store_lunarcrush_data(
+    symbol: str,
+    name: str,
+    price: float,
+    market_cap: float,
+    volume_24h: float,
+    volatility: float,
+    percent_change_1h: float,
+    percent_change_24h: float,
+    percent_change_7d: float,
+    percent_change_30d: float,
+    social_volume_24h: float,
+    interactions_24h: float,
+    social_dominance: float,
+    galaxy_score: float,
+    alt_rank: int,
+    sentiment: float,
+    categories: str,
+    topic: str,
+    logo: str
+):
     """
-    Insert or update row in 'lunarcrush_data' table (example name).
-    You must create this table in your DB schema, e.g.:
+    Insert a row into 'lunarcrush_data' table.
+
+    You must create (or update) this table in your DB schema, for example:
 
     CREATE TABLE IF NOT EXISTS lunarcrush_data (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp INTEGER,
         symbol TEXT,
         name TEXT,
+        price REAL,
+        market_cap REAL,
+        volume_24h REAL,
+        volatility REAL,
+        percent_change_1h REAL,
+        percent_change_24h REAL,
+        percent_change_7d REAL,
+        percent_change_30d REAL,
+        social_volume_24h REAL,
+        interactions_24h REAL,
+        social_dominance REAL,
         galaxy_score REAL,
         alt_rank INTEGER,
-        price REAL
+        sentiment REAL,
+        categories TEXT,
+        topic TEXT,
+        logo TEXT
     );
     """
+    import time
+    import sqlite3
+    from db import DB_FILE, logger
+
     conn = sqlite3.connect(DB_FILE)
     try:
         c = conn.cursor()
         c.execute("""
-            INSERT INTO lunarcrush_data (timestamp, symbol, name, galaxy_score, alt_rank, price)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO lunarcrush_data (
+                timestamp,
+                symbol,
+                name,
+                price,
+                market_cap,
+                volume_24h,
+                volatility,
+                percent_change_1h,
+                percent_change_24h,
+                percent_change_7d,
+                percent_change_30d,
+                social_volume_24h,
+                interactions_24h,
+                social_dominance,
+                galaxy_score,
+                alt_rank,
+                sentiment,
+                categories,
+                topic,
+                logo
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             int(time.time()),
             symbol,
             name,
+            price,
+            market_cap,
+            volume_24h,
+            volatility,
+            percent_change_1h,
+            percent_change_24h,
+            percent_change_7d,
+            percent_change_30d,
+            social_volume_24h,
+            interactions_24h,
+            social_dominance,
             galaxy_score,
             alt_rank,
-            price
+            sentiment,
+            categories,
+            topic,
+            logo
         ))
         conn.commit()
     except Exception as e:
         logger.exception(f"Error storing LunarCrush data: {e}")
     finally:
         conn.close()
+
