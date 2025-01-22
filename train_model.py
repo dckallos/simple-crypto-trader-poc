@@ -11,21 +11,18 @@ train_model.py
    - CryptoPanic (daily sentiment)
    - LunarCrush (galaxy_score, alt_rank, etc.)
 4) Combines all pairs' data into one dataset, trains a scikit-learn model, saves to disk.
-5) Optionally logs the model's validation accuracy to "training_metrics.csv".
+5) Optionally logs the model's performance metrics to "training_metrics.csv".
 
-UPDATED ENHANCEMENTS:
-- Shifted label to look 3 bars ahead with a +1% threshold
-  (instead of next-bar up).
-- Added hour_of_day, day_of_week, rolling 10-bar volatility & volume
-  as new features.
-- Incorporated a small GridSearchCV to tune n_estimators & max_depth
-  for the RandomForest.
+ENHANCEMENTS FOR CLASS IMBALANCE:
+- We add 'class_weight': [None, 'balanced'] to the param grid.
+- We use 'f1_macro' as the primary scoring metric for GridSearchCV.
+- After final hold-out testing, we compute balanced_accuracy, F1 score,
+  and classification_report to measure minority-class performance better.
 
-You can run:
+No code is removed; only appended or slightly changed to handle imbalance.
+
+Usage:
     python train_model.py
-
-Adapt logic if you want to do full merges of time-series data from LunarCrush
-instead of daily or snapshot data.
 """
 
 import os
@@ -38,17 +35,29 @@ import joblib
 from typing import Tuple
 
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split, GridSearchCV, TimeSeriesSplit
-from sklearn.metrics import accuracy_score
+from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    balanced_accuracy_score,
+    f1_score,
+    classification_report
+)
+import warnings
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Suppress potential warnings from merges or rolling computations
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+
 # ------------------------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------------------------
-DB_FILE = "trades.db"                   # The same DB as main.py uses
-MODEL_OUTPUT_PATH = "trained_model.pkl" # Where we save the scikit model
+DB_FILE = "trades.db"                    # The same DB as main.py uses
+MODEL_OUTPUT_PATH = "trained_model.pkl"  # Where we save the scikit model
 METRICS_OUTPUT_FILE = "training_metrics.csv"
 
 # If you want correlation with BTC, define the pair used in 'price_history' for BTC
@@ -59,7 +68,7 @@ with open("config.yaml", "r") as file:
     config = yaml.safe_load(file)
 TRADED_PAIRS = config.get("traded_pairs", [])
 
-# We will define how many bars ahead we look, and the % threshold for "up"
+# SHIFT_BARS and THRESHOLD_UP are used to define how we label "up"
 SHIFT_BARS = 3
 THRESHOLD_UP = 0.01  # +1%
 
@@ -143,8 +152,6 @@ def fetch_lunarcrush_data_for_symbol(db_file: str, symbol: str) -> pd.DataFrame:
     """
     conn = sqlite3.connect(db_file)
     try:
-        # Suppose you do daily grouping by date(timestamp).
-        # Or you might do last known row if you don't store daily.
         query = f"""
             SELECT
                 DATE(timestamp, 'unixepoch') as lc_date,
@@ -185,10 +192,7 @@ def build_features_and_labels(
 
     Returns (X, y) => Feature DataFrame, label Series
 
-    UPDATES:
-    - Instead of next price > current price, we do a SHIFT_BARS=3 look-ahead
-      and require a +1% threshold for label=1.
-    - Added hour_of_day, day_of_week, rolling volatility, rolling volume.
+    SHIFT_BARS=3, require +1% for label_up=1, to handle short-term labeling.
     """
 
     import pandas as pd
@@ -198,12 +202,9 @@ def build_features_and_labels(
     # Sort ascending
     df = df.sort_values("timestamp").reset_index(drop=True)
 
-    # --------------------------------------------------------------------------
-    # ADD: time-based columns
-    # --------------------------------------------------------------------------
     df["datetime"] = pd.to_datetime(df["timestamp"], unit="s")
     df["hour_of_day"] = df["datetime"].dt.hour
-    df["day_of_week"] = df["datetime"].dt.weekday  # Monday=0, Sunday=6
+    df["day_of_week"] = df["datetime"].dt.weekday
 
     # Basic Indicators
     df["feature_price"] = df["last_price"]
@@ -235,13 +236,11 @@ def build_features_and_labels(
     df["boll_upper"] = sma20 + (2 * std20)
     df["boll_lower"] = sma20 - (2 * std20)
 
-    # --------------------------------------------------------------------------
-    # ADD: rolling volatility & rolling average volume (window=10)
-    # --------------------------------------------------------------------------
+    # Rolling vol & rolling volume
     df["rolling_vol_10"] = df["last_price"].rolling(10).std()
     df["rolling_volume_10"] = df["volume"].rolling(10).mean()
 
-    # If we want correlation with BTC
+    # Merge correlation with BTC
     if df_btc is not None and not df_btc.empty:
         df_btc = df_btc.sort_values("timestamp").reset_index(drop=True)
         df_btc_ren = df_btc[["timestamp", "last_price"]].rename(columns={"last_price": "btc_price"})
@@ -254,7 +253,7 @@ def build_features_and_labels(
         )
         df["corr_with_btc"] = df["last_price"].rolling(30).corr(df["btc_price"])
 
-    # If we want to merge CryptoPanic aggregator daily => we create date col
+    # Merge CryptoPanic aggregator
     if df_cpanic is not None and not df_cpanic.empty:
         df["trade_date"] = df["datetime"].dt.date
         df_cpanic_ren = df_cpanic.rename(columns={"news_date": "trade_date"})
@@ -266,7 +265,7 @@ def build_features_and_labels(
         )
         df["avg_sentiment"] = df["avg_sentiment"].fillna(0)
 
-    # If we want to merge LunarCrush aggregator => we also create date col
+    # Merge LunarCrush aggregator
     if df_lc is not None and not df_lc.empty:
         df["lc_date"] = df["datetime"].dt.date
         df_lc_ren = df_lc.rename(columns={"lc_date": "lc_date"})
@@ -281,47 +280,31 @@ def build_features_and_labels(
             if col in df.columns:
                 df[col].fillna(0, inplace=True)
 
-    # Forward/backward fill for any partial merges
     df.ffill(inplace=True)
     df.bfill(inplace=True)
 
-    # Replace infinite with NaN, then drop if needed
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
-    # --------------------------------------------------------------------------
-    # OLD LOGIC (commented):
-    # df["future_price"] = df["last_price"].shift(-1)
-    # df["label_up"] = (df["future_price"] > df["last_price"]).astype(int)
-    #
-    # NEW LOGIC: SHIFT_BARS=3, +1% threshold
-    # --------------------------------------------------------------------------
-    # We look 3 bars ahead, find the max in that window, measure % difference
+    # Label: SHIFT_BARS=3, require +1% for "up"
     df["future_max"] = df["last_price"].rolling(SHIFT_BARS).max().shift(-SHIFT_BARS)
     df["pct_future_gain"] = (df["future_max"] - df["last_price"]) / (df["last_price"] + 1e-9)
     df["label_up"] = (df["pct_future_gain"] >= THRESHOLD_UP).astype(int)
 
-    # Remove the rows where we don't have a valid future window
     df.dropna(subset=["future_max"], inplace=True)
-
     df.reset_index(drop=True, inplace=True)
 
-    # Potential feature columns
+    # Feature columns
     feature_cols = [
-        # Original columns
         "feature_price", "feature_ma_3", "feature_spread",
         "vol_change", "rsi", "macd_line", "macd_signal",
         "boll_upper", "boll_lower",
-        # New
         "hour_of_day", "day_of_week",
         "rolling_vol_10", "rolling_volume_10"
     ]
-    # If correlation was used
     if "corr_with_btc" in df.columns:
         feature_cols.append("corr_with_btc")
-    # If cryptopanic aggregator is used
     if "avg_sentiment" in df.columns:
         feature_cols.append("avg_sentiment")
-    # If lunarcrush aggregator is used
     if "galaxy_score" in df.columns:
         feature_cols.append("galaxy_score")
     if "alt_rank" in df.columns:
@@ -329,7 +312,6 @@ def build_features_and_labels(
     if "avg_lc_sent" in df.columns:
         feature_cols.append("avg_lc_sent")
 
-    # Drop rows missing essential features
     df.dropna(subset=feature_cols, inplace=True)
     df.reset_index(drop=True, inplace=True)
 
@@ -338,35 +320,41 @@ def build_features_and_labels(
     return X, y
 
 # ------------------------------------------------------------------------------
-# Step 5: The main training routine (with GridSearchCV)
+# Step 5: Training routine with class imbalance handling
 # ------------------------------------------------------------------------------
 def train_model(X: pd.DataFrame, y: pd.Series):
     """
-    Trains a random forest classifier on the given features and labels.
-    Returns (model, accuracy).
-
-    UPDATED:
-    - We now do a small GridSearchCV with a TimeSeriesSplit to find
-      good hyperparams for the random forest (n_estimators, max_depth).
+    Trains a RandomForest with class_weight balancing options.
+    Uses TimeSeriesSplit + GridSearchCV with 'f1_macro' scoring.
+    Then does a final forward-based hold-out for the last 20% of data.
+    Logs accuracy, balanced accuracy, F1, confusion matrix, etc.
     """
+
+    from sklearn.model_selection import train_test_split
+
     if X.empty or len(X) < 10:
         logger.warning("Not enough data to train a robust model!")
         return None, None
 
-    # Instead of a single train_test_split, let's do a time series approach.
-    # However, for demonstration, we will do a final fit on the entire dataset
-    # after we pick the best hyperparams from the CV.
+    # 1) Inspect label distribution
+    logger.info("Label distribution (0 vs 1):\n" + str(y.value_counts(normalize=True)))
+
+    # 2) TimeSeriesSplit for cross-validation
     tscv = TimeSeriesSplit(n_splits=3)
+
+    # 3) Hyperparam grid with class_weight
     param_grid = {
         'n_estimators': [50, 100],
-        'max_depth': [None, 5, 10]
+        'max_depth': [None, 5, 10],
+        'class_weight': [None, 'balanced']  # to handle class imbalance
     }
 
-    rf = RandomForestClassifier(random_state=42)
+    base_rf = RandomForestClassifier(random_state=42)
+    # We use 'f1_macro' to give both classes equal importance
     grid = GridSearchCV(
-        estimator=rf,
+        estimator=base_rf,
         param_grid=param_grid,
-        scoring='accuracy',
+        scoring='f1_macro',
         cv=tscv,
         n_jobs=-1
     )
@@ -374,27 +362,41 @@ def train_model(X: pd.DataFrame, y: pd.Series):
 
     best_model = grid.best_estimator_
     logger.info(f"Best params from GridSearchCV: {grid.best_params_}")
+    logger.info(f"Best CV (f1_macro) score: {grid.best_score_:.4f}")
 
-    # We can compute an "overall" accuracy via a final train/test or
-    # via the best_score_ from cross-validation:
-    cv_best_score = grid.best_score_
-    logger.info(f"Best CV accuracy: {cv_best_score:.4f}")
+    # 4) Final forward-based hold-out (last 20%)
+    hold_out_size = int(0.2 * len(X))
+    X_train = X.iloc[:-hold_out_size]
+    y_train = y.iloc[:-hold_out_size]
+    X_test = X.iloc[-hold_out_size:]
+    y_test = y.iloc[-hold_out_size:]
 
-    # If you still want a final hold-out approach, you can do:
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, shuffle=False
-    )
+    # Fit best model on X_train
     best_model.fit(X_train, y_train)
     y_pred = best_model.predict(X_test)
-    acc = accuracy_score(y_test, y_pred)
-    logger.info(f"Hold-out Accuracy = {acc:.4f}")
 
-    # Return the best_model and hold-out accuracy
-    return best_model, acc
+    # Evaluate on hold-out
+    acc = accuracy_score(y_test, y_pred)
+    bal_acc = balanced_accuracy_score(y_test, y_pred)
+    f1_macro = f1_score(y_test, y_pred, average='macro')
+
+    logger.info(f"Final hold-out Accuracy = {acc:.4f}")
+    logger.info(f"Final hold-out Balanced Accuracy = {bal_acc:.4f}")
+    logger.info(f"Final hold-out F1 (macro) = {f1_macro:.4f}")
+
+    cm = confusion_matrix(y_test, y_pred)
+    logger.info(f"Confusion Matrix (final hold-out):\n{cm}")
+
+    # Detailed per-class metrics
+    report = classification_report(y_test, y_pred)
+    logger.info(f"Classification Report:\n{report}")
+
+    # Return best_model + a main metric (we can choose F1 macro as the main)
+    return best_model, f1_macro
 
 def log_accuracy_to_csv(accuracy: float):
     """
-    Optionally log the accuracy to a CSV file over time.
+    Optionally log the accuracy (or any other metric) to a CSV file over time.
     """
     import datetime
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -413,9 +415,9 @@ def main():
     """
     1) Load BTC data if desired for correlation.
     2) Load aggregator from CryptoPanic daily if desired.
-    3) For each pair in config.yaml, load 'price_history', build features, possibly merges aggregator data.
-    4) Combine everything into X_full, y_full, do hyperparameter search + train a RandomForest, save it.
-    5) Log or print final accuracy.
+    3) For each pair in config.yaml, load 'price_history', build features, merges aggregator data.
+    4) Combine everything into X_full, y_full, then do hyperparam search + final hold-out test.
+    5) Log or print final metrics.
     """
     # 1) Possibly load BTC data for correlation
     df_btc = load_data_for_btc(DB_FILE, BTC_PAIR)
@@ -467,21 +469,20 @@ def main():
     y_full = pd.concat(all_y, ignore_index=True)
     logger.info(f"Combined dataset size: X={X_full.shape}, y={y_full.shape}")
 
-    # 4) Train the model with hyperparam search
-    model, final_accuracy = train_model(X_full, y_full)
+    # 4) Train the model with hyperparam search + final hold-out
+    model, final_metric = train_model(X_full, y_full)
     if model is None:
         logger.error("Model training returned None. Exiting.")
         return
 
-    logger.info(f"Final Validation Accuracy = {final_accuracy:.4f}")
+    logger.info(f"Final hold-out F1 (macro) = {final_metric:.4f}")
+    # You can store the final_metric in METRICS_OUTPUT_FILE or keep using accuracy
+    log_accuracy_to_csv(final_metric)
 
     # 5) Save model
     joblib.dump(model, MODEL_OUTPUT_PATH)
     logger.info(f"Model saved to {MODEL_OUTPUT_PATH}")
-
-    # 6) Log accuracy
-    log_accuracy_to_csv(final_accuracy)
-    logger.info(f"Appended accuracy={final_accuracy:.4f} to {METRICS_OUTPUT_FILE}")
+    logger.info(f"Appended f1_macro={final_metric:.4f} to {METRICS_OUTPUT_FILE}")
 
 
 if __name__ == "__main__":
