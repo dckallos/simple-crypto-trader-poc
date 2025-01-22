@@ -4,82 +4,115 @@
 """
 main.py
 
-Entrypoint for the lightweight AI trading application. This file:
-1. Reads toggles from config.yaml (enable_training, enable_live_ai_inference, enable_gpt_integration).
-2. Optionally runs model training if 'enable_training' is True.
-3. Starts a WebSocket feed to capture real-time price data from Kraken for multiple pairs.
-4. If 'enable_live_ai_inference' is True, it loads the AIStrategy (with or without GPT).
-   Otherwise, it uses a "dummy" strategy that never trades.
-5. Places trades and records them in a simplified database if the strategy suggests it.
+A hybrid AI trading application where:
+1) The AI is polled every 5 minutes for strategic decisions (BUY, SELL, HOLD)
+   based on aggregated data from 'price_history'.
+2) A separate RiskManager forcibly closes positions if a stop-loss or
+   take-profit condition is met, checking real-time price ticks from
+   the WebSocket feed (rather than waiting for the AI's next cycle).
+3) We track a single position per pair in memory.
+4) Model training and aggregator merges remain similar to previous examples.
 
-NOTE (Single-Threaded Trade Logic):
-- The only concurrency here is the background thread for the WebSocket feed, which
-  writes price data to the DB. All trade placement occurs in this main thread.
-  This ensures no concurrency issues for placing orders.
+Usage:
+    python main.py
 """
 
 import time
 import os
+import math
 import logging
 import sqlite3
+from datetime import datetime
 from dotenv import load_dotenv
 import yaml
 
 # ------------------------------------------------------------------------------
-# Import your AIStrategy class
+# Import modules
 # ------------------------------------------------------------------------------
 from ai_strategy import AIStrategy
+from risk_manager import RiskManager  # NEW: For real-time stop-loss / take-profit
 from db import init_db, record_trade_in_db
 from ws_data_feed import KrakenWSClient
 
-# (OPTIONAL) If you have a function to run training in train_model.py, you might import it:
+# If you have a function to run training in train_model.py, you might import it:
 from fetch_lunarcrush import fetch_lunarcrush_data
 from fetch_cryptopanic import fetch_cryptopanic_data
 from train_model import main as training_main
-# or do some other approach like subprocess.
 
-# ------------------------------------------------------------------------------
-# Logging Setup
-# ------------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------------------
-# Configuration + Toggles
+# Load environment for any keys
 # ------------------------------------------------------------------------------
 load_dotenv()
-KRAKEN_API_KEY = os.getenv("KRAKEN_API_KEY", "FAKE_KEY")        # replace with real
+KRAKEN_API_KEY = os.getenv("KRAKEN_API_KEY", "FAKE_KEY")
 KRAKEN_API_SECRET = os.getenv("KRAKEN_SECRET_API_KEY", "FAKE_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "FAKE_OPENAI_KEY")
 
+# ------------------------------------------------------------------------------
 # Load toggles (and other settings) from config.yaml
-with open("config.yaml", "r") as file:
-    config = yaml.safe_load(file)
+# ------------------------------------------------------------------------------
+CONFIG_FILE = "config.yaml"
+with open(CONFIG_FILE, "r") as f:
+    config = yaml.safe_load(f)
 
 TRADED_PAIRS = config.get("traded_pairs", [])
-
-POLL_INTERVAL_SECONDS = 15  # how often we fetch data & run the AI
-MAX_POSITION_SIZE = 0.001   # example max size for a single trade in BTC
-DB_ENABLED = True           # toggle whether we record trades in sqlite
-
-# New toggles from config.yaml
 ENABLE_TRAINING = config.get("enable_training", False)
 ENABLE_LIVE_AI_INFERENCE = config.get("enable_live_ai_inference", True)
 ENABLE_GPT_INTEGRATION = config.get("enable_gpt_integration", False)
+DB_FILE = "trades.db"
+DB_ENABLED = True
+MAX_POSITION_SIZE = 0.001
 
-DB_FILE = "trades.db"       # name of the DB file
+# We'll do 5-minute aggregator cycles => 300s
+AGGREGATOR_INTERVAL_SECONDS = config.get("trade_interval_seconds", 300)
 
 # ------------------------------------------------------------------------------
-# Utility: Get the latest price from our DB
+# (1) get_aggregated_data: aggregator for the last X seconds
+# ------------------------------------------------------------------------------
+def get_aggregated_data(pair: str, period_seconds: int) -> dict:
+    """
+    Aggregates data from the last 'period_seconds' for 'pair' in 'price_history'.
+    Returns a dict with average, min, max price, total volume, etc.
+    """
+    cutoff_ts = math.floor(time.time()) - period_seconds
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        c = conn.cursor()
+        c.execute(f"""
+            SELECT
+                AVG(last_price) as avg_price,
+                MIN(last_price) as min_price,
+                MAX(last_price) as max_price,
+                SUM(volume) as total_volume
+            FROM price_history
+            WHERE pair=? AND timestamp >= ?
+        """, (pair, cutoff_ts))
+        row = c.fetchone()
+        if not row or row[0] is None:
+            logger.warning(f"No aggregator data for {pair} in last {period_seconds} seconds.")
+            return {}
+
+        avg_p, min_p, max_p, vol_sum = row
+        return {
+            "avg_price": float(avg_p),
+            "min_price": float(min_p),
+            "max_price": float(max_p),
+            "total_volume": float(vol_sum),
+            "pair": pair,
+            "timestamp": time.time()
+        }
+    except Exception as e:
+        logger.exception(f"Error aggregating data for {pair}: {e}")
+        return {}
+    finally:
+        conn.close()
+
+# ------------------------------------------------------------------------------
+# (2) Single price fetch (optional leftover from older approach)
 # ------------------------------------------------------------------------------
 def get_latest_price_from_db(pair: str) -> dict:
-    """
-    Fetch the most recent price entry for a given pair from the 'price_history' table.
-
-    :param pair: e.g. 'XBT/USD'.
-    :return: dict with 'price' and 'timestamp' (and optionally other fields),
-             or empty dict if none found.
-    """
     conn = sqlite3.connect(DB_FILE)
     try:
         c = conn.cursor()
@@ -92,12 +125,11 @@ def get_latest_price_from_db(pair: str) -> dict:
         """, (pair,))
         row = c.fetchone()
         if row:
-            # row: (timestamp, bid, ask, last, volume)
             return {
                 "timestamp": row[0],
                 "bid": row[1],
                 "ask": row[2],
-                "price": row[3],  # we'll use 'price' as a general field
+                "price": row[3],
                 "volume": row[4]
             }
         else:
@@ -109,131 +141,250 @@ def get_latest_price_from_db(pair: str) -> dict:
         conn.close()
 
 # ------------------------------------------------------------------------------
-# Order Placement (Mock)
+# (3) place_order mock
 # ------------------------------------------------------------------------------
 def place_order(pair: str, side: str, volume: float) -> str:
-    """
-    Places an order on Kraken (mock implementation).
-
-    :param pair: The trading pair, e.g. 'XBT/USD'.
-    :param side: 'BUY' or 'SELL'.
-    :param volume: Quantity to trade.
-    :return: A mock order ID string. Replace with real Kraken REST calls in production.
-    """
     logger.info(f"Placing {side} order for {volume} of {pair} (mock).")
     mock_order_id = f"MOCK-{side}-{int(time.time())}"
     return mock_order_id
 
 # ------------------------------------------------------------------------------
-# Optional: A DummyStrategy to skip AI logic
+# (4) DummyStrategy if not using AI
 # ------------------------------------------------------------------------------
 class DummyStrategy:
-    """
-    A fallback strategy that always returns HOLD, so no trades are placed.
-    """
     def predict(self, market_data: dict):
-        # always hold
         return ("HOLD", 0.0)
 
 # ------------------------------------------------------------------------------
-# Main Loop
+# (5) The main "Mature + Hybrid" application
+# ------------------------------------------------------------------------------
+class MatureHybridApp:
+    """
+    A hybrid approach:
+    - We poll the AI every aggregator interval (5-10 min by default) to get a strategy decision.
+    - Meanwhile, a separate RiskManager checks real-time ticks for forced exits (stop-loss, take-profit).
+    - We store a single position per pair in memory and update it based on AI or forced exits.
+    """
+
+    def __init__(self, pairs, ai_strategy, risk_manager, aggregator_interval=300):
+        self.pairs = pairs
+        self.ai_strategy = ai_strategy
+        self.risk_manager = risk_manager
+        self.aggregator_interval = aggregator_interval
+
+        # Track in-memory positions: pair => size
+        self.current_positions = {p: 0.0 for p in pairs}
+
+        # Timestamps to track last aggregator call for each pair
+        self.last_agg_call = {p: 0 for p in pairs}
+
+    def on_tick(self, pair: str, latest_price: float):
+        """
+        Called by the WebSocket feed whenever new tick data arrives for a pair.
+        1) We let the RiskManager check if we must forcibly exit.
+        2) If enough time has passed since the last aggregator cycle for that pair, we do an aggregator-based AI call.
+        """
+        # 1) Risk manager checks if we have an open position and must close
+        pos_size = self.current_positions.get(pair, 0.0)
+        if pos_size != 0.0:
+            # If there's a forced exit, we do it
+            should_exit, reason = self.risk_manager.check_exit(
+                pair=pair,
+                current_price=latest_price,
+                position_size=pos_size
+            )
+            if should_exit:
+                logger.info(f"RiskManager forced exit for {pair} => {reason}")
+                self._close_position(pair, latest_price, "FORCED_EXIT")
+                return
+
+        # 2) Check if aggregator interval is up for this pair
+        now = time.time()
+        if now - self.last_agg_call[pair] >= self.aggregator_interval:
+            # aggregator call => fetch aggregated data => AI => possibly open/close
+            self._aggregator_cycle(pair)
+            self.last_agg_call[pair] = now
+
+    def _aggregator_cycle(self, pair: str):
+        """
+        Once aggregator interval hits for a pair, we gather aggregated data
+        and pass it to the AI strategy.
+        """
+        market_data = get_aggregated_data(pair, period_seconds=self.aggregator_interval)
+        if not market_data or "avg_price" not in market_data:
+            logger.warning(f"No aggregator data for {pair}, skipping cycle.")
+            return
+
+        # Add current position info
+        market_data["current_position"] = self.current_positions[pair]
+
+        # Strategy call
+        signal, suggested_size = self.ai_strategy.predict(market_data)
+        logger.info(f"AI => {pair} => {signal}, size={suggested_size}")
+
+        final_size = min(suggested_size, MAX_POSITION_SIZE)
+
+        if signal == "BUY":
+            if self.current_positions[pair] == 0.0:
+                # open position
+                fill_price = market_data["avg_price"]
+                oid = place_order(pair, "BUY", final_size)
+                if DB_ENABLED:
+                    record_trade_in_db(
+                        side="BUY",
+                        quantity=final_size,
+                        price=fill_price,
+                        order_id=oid,
+                        pair=pair
+                    )
+                self.current_positions[pair] = final_size
+                logger.info(f"Opened position for {pair}, size={final_size}, price={fill_price}")
+            else:
+                logger.info(f"Already have a position on {pair}, ignoring BUY.")
+        elif signal == "SELL":
+            if self.current_positions[pair] > 0.0:
+                # close existing long
+                fill_price = market_data["avg_price"]
+                oid = place_order(pair, "SELL", self.current_positions[pair])
+                if DB_ENABLED:
+                    record_trade_in_db(
+                        side="SELL",
+                        quantity=self.current_positions[pair],
+                        price=fill_price,
+                        order_id=oid,
+                        pair=pair
+                    )
+                logger.info(f"Closed position on {pair} of size {self.current_positions[pair]} at ~{fill_price}")
+                self.current_positions[pair] = 0.0
+            else:
+                logger.info(f"No long position to SELL for {pair}. Ignoring.")
+        else:
+            logger.info(f"HOLD => no aggregator action for {pair}.")
+
+    def _close_position(self, pair: str, latest_price: float, exit_reason: str):
+        """
+        Force-close any open position for 'pair' at 'latest_price',
+        e.g. for a risk manager forced exit.
+        """
+        if self.current_positions[pair] > 0:
+            side = "SELL"
+            size = self.current_positions[pair]
+            oid = place_order(pair, side, size)
+            if DB_ENABLED:
+                record_trade_in_db(
+                    side=side,
+                    quantity=size,
+                    price=latest_price,
+                    order_id=oid,
+                    pair=pair
+                )
+            logger.info(f"Force-closed {pair} position of size {size} at {latest_price}, reason={exit_reason}")
+            self.current_positions[pair] = 0.0
+
+
+# ------------------------------------------------------------------------------
+# Mock function for the WebSocket feed => We'll integrate the "on_tick" logic
+# ------------------------------------------------------------------------------
+class CustomKrakenWSClient(KrakenWSClient):
+    """
+    Subclass of your existing KrakenWSClient that, upon receiving a new ticker
+    message, calls 'app.on_tick(...)' for risk manager checks.
+    """
+    def __init__(self, pairs, feed_type, app_ref):
+        super().__init__(pairs, feed_type=feed_type)
+        self.app_ref = app_ref  # reference to MatureHybridApp
+
+    async def _handle_message(self, message: str):
+        """
+        We'll do the normal parse, then call app_ref.on_tick(...) with the new last_price
+        if it's a ticker feed.
+        """
+        import json
+        try:
+            data = json.loads(message)
+            if isinstance(data, dict):
+                event_type = data.get("event")
+                if event_type in ["subscribe", "subscriptionStatus", "heartbeat", "systemStatus"]:
+                    logger.debug(f"WS event: {data}")
+                return
+
+            if isinstance(data, list):
+                if len(data) < 4:
+                    return
+                feed_name = data[2]
+                pair = data[3]
+                if feed_name == "ticker":
+                    update_obj = data[1]
+                    last_trade_info = update_obj.get("c", [])
+                    if len(last_trade_info) > 0:
+                        last_price = float(last_trade_info[0])
+                        # call risk manager => on_tick
+                        self.app_ref.on_tick(pair, last_price)
+
+                    # store in DB
+                    # you can do store_price_history(...) if you want
+                    # We'll rely on the original logic from super:
+                    await super()._handle_message(message)
+
+        except Exception as e:
+            logger.exception(f"Error in custom handle_message: {e}")
+
+
+# ------------------------------------------------------------------------------
+# Main function
 # ------------------------------------------------------------------------------
 def main():
-    """
-    Main loop for:
-      1. Optionally run training if 'enable_training' is True.
-      2. Initializing DB (if desired).
-      3. Starting WebSocket for real-time data capture of all pairs (background thread).
-      4. Either load AIStrategy (if 'enable_live_ai_inference' is True)
-         or a DummyStrategy (if it's False).
-      5. Periodically fetch DB data, run strategy predict, place trades, etc.
-    """
-    logger.info("Starting AI trading app...")
+    logger.info("Starting hybrid AI app with real-time risk manager + 5-min aggregator AI")
 
     # 1) Optional training
     if ENABLE_TRAINING:
-        logger.info("ENABLE_TRAINING is True, running training routine now...")
-        # If you have a direct function:
         fetch_cryptopanic_data()
         fetch_lunarcrush_data()
         training_main()
-        # Or if you want to run a separate script:
-        # import subprocess
-        # subprocess.run(["python", "train_model.py"], check=True)
-        logger.info("Training complete (placeholder).")
+        logger.info("Training complete.")
     else:
-        logger.info("ENABLE_TRAINING is False. Skipping model training step.")
+        logger.info("Skipping training step.")
 
-    # 2) Init the DB if desired
-    if DB_ENABLED:
-        init_db()
-        logger.info("Database initialized.")
+    # 2) DB init
+    init_db()
 
-    # 3) Start the WebSocket feed in background
-    ws_client = KrakenWSClient(TRADED_PAIRS, feed_type="ticker")
-    ws_client.start()
-
-    # 4) Decide if we do real AI or a dummy approach
+    # 3) Decide AI or dummy
     if ENABLE_LIVE_AI_INFERENCE:
-        logger.info("ENABLE_LIVE_AI_INFERENCE is True => Loading AIStrategy.")
         ai_model = AIStrategy(
             pairs=TRADED_PAIRS,
             model_path="trained_model.pkl",
             use_openai=ENABLE_GPT_INTEGRATION
         )
-        logger.info(f"AIStrategy loaded with pairs: {TRADED_PAIRS}")
     else:
-        logger.info("ENABLE_LIVE_AI_INFERENCE is False => Using DummyStrategy. No trades will be placed.")
         ai_model = DummyStrategy()
 
-    # 5) Enter main trading loop
-    while True:
-        try:
-            # For each pair, we fetch the latest data from DB
-            for pair in TRADED_PAIRS:
-                market_data = get_latest_price_from_db(pair)
+    # 4) Create a risk manager
+    # For demonstration, let's say we forcibly exit if we lose 2% or gain 5%
+    # in real-time. See risk_manager.py for logic.
+    rm = RiskManager(stop_loss_pct=0.02, take_profit_pct=0.05)
 
-                # If there's no data in DB for this pair yet, skip it
-                if not market_data or 'price' not in market_data:
-                    logger.warning(f"No WS data yet for {pair}. Skipping this pair.")
-                    continue
+    # 5) Create the main app instance
+    app = MatureHybridApp(
+        pairs=TRADED_PAIRS,
+        ai_strategy=ai_model,
+        risk_manager=rm,
+        aggregator_interval=AGGREGATOR_INTERVAL_SECONDS
+    )
 
-                logger.info(f"Latest price for {pair} = {market_data['price']}")
+    # 6) Start a custom WS client that calls app.on_tick
+    ws_client = CustomKrakenWSClient(TRADED_PAIRS, feed_type="ticker", app_ref=app)
+    ws_client.start()
 
-                # AI (or dummy) strategy decides what to do
-                signal, suggested_size = ai_model.predict(market_data)
-                logger.info(f"Strategy suggests: {signal} with size={suggested_size} for {pair}")
-
-                # Minimal risk check: do not exceed MAX_POSITION_SIZE
-                final_size = min(suggested_size, MAX_POSITION_SIZE)
-
-                if signal in ("BUY", "SELL"):
-                    order_id = place_order(pair, signal, final_size)
-
-                    if DB_ENABLED:
-                        record_trade_in_db(
-                            side=signal,
-                            quantity=final_size,
-                            price=market_data["price"],
-                            order_id=order_id,
-                            pair=pair
-                        )
-                        logger.info(f"Trade recorded in DB for {pair}: order_id={order_id}")
-                else:
-                    logger.info(f"No action taken ({signal}) for {pair}.")
-
-            logger.info(f"Sleeping {POLL_INTERVAL_SECONDS} seconds...\n")
-            time.sleep(POLL_INTERVAL_SECONDS)
-
-        except KeyboardInterrupt:
-            logger.info("Shutting down trading app...")
-            break
-        except Exception as e:
-            logger.exception(f"Unexpected error in main loop: {e}")
-            logger.info("Continuing after exception...")
-
-    # 6) Cleanly stop the WebSocket
-    ws_client.stop()
+    logger.info("Press Ctrl+C to exit.")
+    try:
+        # We'll just wait indefinitely, the on_tick logic handles the rest
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("Exiting main loop.")
+    finally:
+        ws_client.stop()
+        logger.info("Stopped.")
 
 
 if __name__ == "__main__":
