@@ -21,6 +21,10 @@ NEW ADDITION: An ADVANCED Backtest Logic
   (d) Partial exits
   (e) Advanced metrics (max drawdown, Sharpe, etc.)
 
+We also introduce a simple memory-limiting measure:
+  - `MAX_ROWS_PER_PAIR` to truncate the data read from the DB for each pair,
+    so that enormous datasets do not exceed reasonable memory.
+
 Usage:
     python train_model.py
 """
@@ -69,14 +73,24 @@ TRADED_PAIRS = config.get("traded_pairs", [])
 SHIFT_BARS = 25
 THRESHOLD_UP = 0.001  # +1%
 
+# ----------------------------------------------------------------------
+# Memory-limiting measure: limit maximum rows per pair
+# ----------------------------------------------------------------------
+MAX_ROWS_PER_PAIR = 500_000  # Adjust as needed to limit memory usage
+
+
 # ------------------------------------------------------------------------------
-# Step 1: Load Data from DB
+# Step 1: Load Data from DB, but limit to MAX_ROWS_PER_PAIR
 # ------------------------------------------------------------------------------
 def load_data_for_pair(db_file: str, pair: str) -> pd.DataFrame:
     """
     Loads data from 'price_history' for a single pair, returning columns:
         [timestamp, pair, bid_price, ask_price, last_price, volume].
     Sorted ascending by timestamp. Empty if no data or error.
+
+    If the number of rows is larger than MAX_ROWS_PER_PAIR, we truncate to
+    the most recent MAX_ROWS_PER_PAIR rows. This helps prevent enormous
+    memory usage with large tables.
     """
     if not os.path.exists(db_file):
         logger.error(f"Database file {db_file} not found.")
@@ -84,13 +98,46 @@ def load_data_for_pair(db_file: str, pair: str) -> pd.DataFrame:
 
     conn = sqlite3.connect(db_file)
     try:
-        query = f"""
-            SELECT timestamp, pair, bid_price, ask_price, last_price, volume
-            FROM price_history
-            WHERE pair='{pair}'
-            ORDER BY timestamp ASC
+        # We'll do a first pass to see how many total rows exist,
+        # then either read all or read partial.
+        total_rows_query = f"""
+            SELECT COUNT(*) FROM price_history WHERE pair='{pair}'
         """
-        df = pd.read_sql_query(query, conn)
+        c = conn.cursor()
+        c.execute(total_rows_query)
+        rowcount = c.fetchone()[0] or 0
+
+        if rowcount == 0:
+            logger.warning(f"No rows in price_history for pair={pair}")
+            return pd.DataFrame()
+
+        if rowcount > MAX_ROWS_PER_PAIR:
+            # We'll read only the last MAX_ROWS_PER_PAIR rows by timestamp
+            logger.info(
+                f"Pair={pair} has {rowcount} rows; reading only the last {MAX_ROWS_PER_PAIR} to limit memory usage."
+            )
+            # We can do a subquery approach:
+            query_limited = f"""
+                SELECT timestamp, pair, bid_price, ask_price, last_price, volume
+                FROM (
+                    SELECT *
+                    FROM price_history
+                    WHERE pair='{pair}'
+                    ORDER BY timestamp DESC
+                    LIMIT {MAX_ROWS_PER_PAIR}
+                )
+                ORDER BY timestamp ASC
+            """
+            df = pd.read_sql_query(query_limited, conn)
+        else:
+            query = f"""
+                SELECT timestamp, pair, bid_price, ask_price, last_price, volume
+                FROM price_history
+                WHERE pair='{pair}'
+                ORDER BY timestamp ASC
+            """
+            df = pd.read_sql_query(query, conn)
+
         return df
     except Exception as e:
         logger.exception(f"Error reading from DB for pair={pair}: {e}")
@@ -98,14 +145,17 @@ def load_data_for_pair(db_file: str, pair: str) -> pd.DataFrame:
     finally:
         conn.close()
 
+
 def load_data_for_btc(db_file: str, btc_pair: str = BTC_PAIR) -> pd.DataFrame:
     """
     A convenience function to load BTC data if you want correlation.
     Same logic as load_data_for_pair but singled out for clarity.
+    We'll also limit to MAX_ROWS_PER_PAIR if it exceeds that.
     """
     if not btc_pair:
         return pd.DataFrame()
     return load_data_for_pair(db_file, btc_pair)
+
 
 # ------------------------------------------------------------------------------
 # Step 2: CryptoPanic Aggregator (Daily) - Merging
@@ -116,6 +166,10 @@ def fetch_cryptopanic_aggregated(db_file: str) -> pd.DataFrame:
     'cryptopanic_news' table. If you have a different aggregator table, adapt.
     We'll produce columns: [news_date, avg_sentiment].
     """
+    if not os.path.exists(db_file):
+        logger.error(f"Database file {db_file} not found.")
+        return pd.DataFrame()
+
     conn = sqlite3.connect(db_file)
     try:
         query = """
@@ -134,6 +188,7 @@ def fetch_cryptopanic_aggregated(db_file: str) -> pd.DataFrame:
     finally:
         conn.close()
 
+
 # ------------------------------------------------------------------------------
 # Step 3: LunarCrush Aggregator (Daily or Single Snapshot)
 # ------------------------------------------------------------------------------
@@ -147,6 +202,10 @@ def fetch_lunarcrush_data_for_symbol(db_file: str, symbol: str) -> pd.DataFrame:
     For a robust approach, you'd store a time series. For demonstration, we'll produce:
       [lc_date, galaxy_score, alt_rank, sentiment, ...].
     """
+    if not os.path.exists(db_file):
+        logger.error(f"Database file {db_file} not found.")
+        return pd.DataFrame()
+
     conn = sqlite3.connect(db_file)
     try:
         query = f"""
@@ -172,6 +231,7 @@ def fetch_lunarcrush_data_for_symbol(db_file: str, symbol: str) -> pd.DataFrame:
     finally:
         conn.close()
 
+
 # ------------------------------------------------------------------------------
 # Step 4: Build Features, Possibly Merge BTC correlation, CryptoPanic daily sentiment, LunarCrush, etc.
 # ------------------------------------------------------------------------------
@@ -189,7 +249,7 @@ def build_features_and_labels(
 
     Returns (X, y) => Feature DataFrame, label Series
 
-    SHIFT_BARS=3, require +1% for label_up=1, to handle short-term labeling.
+    SHIFT_BARS=25, require +1% for label_up=1, to handle short-term labeling.
     """
 
     import pandas as pd
@@ -282,7 +342,7 @@ def build_features_and_labels(
 
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
-    # Label: SHIFT_BARS=3, require +1% for "up"
+    # SHIFT_BARS=25 => label_up=1 if future price is +1%
     df["future_max"] = df["last_price"].rolling(SHIFT_BARS).max().shift(-SHIFT_BARS)
     df["pct_future_gain"] = (df["future_max"] - df["last_price"]) / (df["last_price"] + 1e-9)
     df["label_up"] = (df["pct_future_gain"] >= THRESHOLD_UP).astype(int)
@@ -316,6 +376,7 @@ def build_features_and_labels(
     y = df["label_up"]
     return X, y
 
+
 # ------------------------------------------------------------------------------
 # Step 5: Training routine with class imbalance handling
 # ------------------------------------------------------------------------------
@@ -327,15 +388,16 @@ def train_model(X: pd.DataFrame, y: pd.Series):
     Logs accuracy, balanced accuracy, F1, confusion matrix, etc.
     """
 
-    from sklearn.model_selection import train_test_split
     from sklearn.ensemble import RandomForestClassifier
+    from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
 
     if X.empty or len(X) < 10:
         logger.warning("Not enough data to train a robust model!")
         return None, None
 
     # 1) Inspect label distribution
-    logger.info("Label distribution (0 vs 1):\n" + str(y.value_counts(normalize=True)))
+    label_dist = y.value_counts(normalize=True)
+    logger.info("Label distribution (0 vs 1):\n" + str(label_dist))
 
     # 2) TimeSeriesSplit for cross-validation
     tscv = TimeSeriesSplit(n_splits=3)
@@ -364,6 +426,9 @@ def train_model(X: pd.DataFrame, y: pd.Series):
 
     # 4) Final forward-based hold-out (last 20%)
     hold_out_size = int(0.2 * len(X))
+    if hold_out_size == 0:
+        hold_out_size = 1  # minimal fallback
+
     X_train = X.iloc[:-hold_out_size]
     y_train = y.iloc[:-hold_out_size]
     X_test = X.iloc[-hold_out_size:]
@@ -372,7 +437,6 @@ def train_model(X: pd.DataFrame, y: pd.Series):
     best_model.fit(X_train, y_train)
     y_pred = best_model.predict(X_test)
 
-    # Evaluate on hold-out
     acc = accuracy_score(y_test, y_pred)
     bal_acc = balanced_accuracy_score(y_test, y_pred)
     f1_macro = f1_score(y_test, y_pred, average='macro')
@@ -389,6 +453,7 @@ def train_model(X: pd.DataFrame, y: pd.Series):
 
     return best_model, f1_macro
 
+
 def log_accuracy_to_csv(accuracy: float):
     """
     Optionally log the accuracy (or any other metric) to a CSV file over time.
@@ -402,6 +467,7 @@ def log_accuracy_to_csv(accuracy: float):
 
     with open(METRICS_OUTPUT_FILE, "a") as f:
         f.write(f"{timestamp},{accuracy:.4f}\n")
+
 
 # ------------------------------------------------------------------------------
 # Step 6: ADVANCED Backtest Logic
@@ -447,43 +513,37 @@ def backtest_model(
 
     if not hasattr(model, "predict_proba"):
         logger.warning("Model has no predict_proba. We'll do predict => 0/1 only.")
-        # We'll create a fallback function
         def prob_func(row_df):
             pred = model.predict(row_df)[0]
             return float(pred)
     else:
         def prob_func(row_df):
-            # row_df is 1xN DF of features
             proba = model.predict_proba(row_df)[0]
-            # Probability of "1"
             return proba[1] if len(proba) > 1 else float(model.classes_[0] == 1)
 
-    # We assume X is sorted by time ascending. If not, sort it first.
+    # Sort by ascending index if not sorted
     X = X.reset_index(drop=True)
 
-    # Single "position" approach: 0=flat, >0=long, <0=short.
     position_size = 0
     entry_price = 0.0
-    partial_exit_done = False  # track if we've done the 50% partial exit
+    partial_exit_done = False
 
     trades = []
 
     i = 0
     while i < len(X):
         row = X.iloc[i]
-        row_df = row.to_frame().T  # 1-row DF with correct feature names
+        row_df = row.to_frame().T
         current_price = row["feature_price"]
 
         if position_size == 0:
-            # we're flat, see if we open long or short
             p_up = prob_func(row_df)
             if p_up > buy_threshold:
                 # go LONG
-                # Slippage on buy
                 buy_price = current_price * (1 + slippage_rate)
                 fee_buy = buy_price * fee_rate
 
-                position_size = 1  # 1 means fully long
+                position_size = 1
                 entry_price = buy_price
                 partial_exit_done = False
 
@@ -500,7 +560,7 @@ def backtest_model(
                 sell_price = current_price * (1 - slippage_rate)
                 fee_sell = sell_price * fee_rate
 
-                position_size = -1  # -1 means fully short
+                position_size = -1
                 entry_price = sell_price
                 partial_exit_done = False
 
@@ -512,12 +572,9 @@ def backtest_model(
                     "p_up": p_up
                 })
 
-            # move to next bar
             i += 1
         else:
-            # we have a position, check stop-loss, take-profit, partial exit, or time-based exit
             bar_held = 0
-            # We'll iterate bars until we exit or we hit max_hold_bars
             exit_trade = False
 
             while i < len(X) and not exit_trade:
@@ -525,23 +582,24 @@ def backtest_model(
                 row_df = row.to_frame().T
                 current_price = row["feature_price"]
 
-                # compute current gain/loss
                 if position_size > 0:
-                    # long
                     raw_return = (current_price - entry_price) / entry_price
                 else:
-                    # short
                     raw_return = (entry_price - current_price) / entry_price
 
-                # Check partial exit logic: if we have > half the take_profit => close 50%
-                # e.g. if we have +2.5% on a +5% target, do partial. (You can adapt logic)
+                # partial exit if half of take_profit
                 if not partial_exit_done and raw_return > 0 and raw_return >= (take_profit_pct / 2):
-                    # close half
-                    exit_price = current_price * (1 - slippage_rate) if position_size > 0 else current_price * (1 + slippage_rate)
-                    fee_exit = exit_price * fee_rate * 0.5  # half position
-                    realized_pnl = 0.5 * position_size * (exit_price - entry_price) if position_size > 0 \
-                        else 0.5 * position_size * (entry_price - exit_price)
-                    realized_pnl_percent = (realized_pnl / (entry_price * abs(0.5 * position_size))) * 100 if position_size != 0 else 0
+                    exit_price = (
+                        current_price * (1 - slippage_rate)
+                        if position_size > 0
+                        else current_price * (1 + slippage_rate)
+                    )
+                    fee_exit = exit_price * fee_rate * 0.5
+                    if position_size > 0:
+                        realized_pnl = 0.5 * ((exit_price - entry_price))
+                    else:
+                        realized_pnl = 0.5 * ((entry_price - exit_price))
+                    realized_pnl_percent = (realized_pnl / (entry_price * 0.5)) * 100
 
                     trades.append({
                         "action": "PARTIAL_EXIT",
@@ -551,16 +609,15 @@ def backtest_model(
                         "pnl_percent": realized_pnl_percent
                     })
                     partial_exit_done = True
-                    # we remain in half position => position_size stays same,
-                    # but you could track partial size. For brevity, let's keep it at 1 or -1
-                    # or you can do position_size = 0.5 => more advanced. We'll do simpler approach here.
 
-                # check stop loss
+                # stop loss
                 if raw_return <= -abs(stop_loss_pct):
-                    # stop out
-                    exit_price = current_price * (1 - slippage_rate) if position_size > 0 else current_price * (1 + slippage_rate)
+                    exit_price = (
+                        current_price * (1 - slippage_rate)
+                        if position_size > 0
+                        else current_price * (1 + slippage_rate)
+                    )
                     fee_exit = exit_price * fee_rate
-                    # realized
                     if position_size > 0:
                         realized_pnl = (exit_price - entry_price) - fee_exit
                         realized_pct = ((exit_price - entry_price) / entry_price) * 100
@@ -580,10 +637,13 @@ def backtest_model(
                     i += 1
                     break
 
-                # check take profit
+                # take profit
                 if raw_return >= take_profit_pct:
-                    # fully exit
-                    exit_price = current_price * (1 - slippage_rate) if position_size > 0 else current_price * (1 + slippage_rate)
+                    exit_price = (
+                        current_price * (1 - slippage_rate)
+                        if position_size > 0
+                        else current_price * (1 + slippage_rate)
+                    )
                     fee_exit = exit_price * fee_rate
                     if position_size > 0:
                         realized_pct = ((exit_price - entry_price) / entry_price) * 100
@@ -602,10 +662,13 @@ def backtest_model(
                     i += 1
                     break
 
-                # check max_hold_bars
+                # max hold
                 if bar_held >= max_hold_bars:
-                    # time-based exit
-                    exit_price = current_price * (1 - slippage_rate) if position_size > 0 else current_price * (1 + slippage_rate)
+                    exit_price = (
+                        current_price * (1 - slippage_rate)
+                        if position_size > 0
+                        else current_price * (1 + slippage_rate)
+                    )
                     fee_exit = exit_price * fee_rate
                     if position_size > 0:
                         realized_pct = ((exit_price - entry_price) / entry_price) * 100
@@ -624,14 +687,9 @@ def backtest_model(
                     i += 1
                     break
 
-                # Optionally: if we see a big reversal (p_up < sell_threshold for a long?), close or flip
-                # We'll skip that for brevity.
-
-                # else continue
                 bar_held += 1
                 i += 1
 
-    # Summarize trades
     if not trades:
         logger.info("No trades triggered in advanced backtest.")
         df_trades = pd.DataFrame()
@@ -640,9 +698,6 @@ def backtest_model(
 
     df_trades = pd.DataFrame(trades)
 
-    # We compute cumulative PnL from each exit. Some rows might be partial, some might be open/close
-    # We'll interpret any row with "pnl_percent" as a realized trade portion
-    # accumulate them
     df_trades["cumulative_pnl"] = df_trades["pnl_percent"].fillna(0).cumsum()
 
     # Max drawdown
@@ -655,8 +710,6 @@ def backtest_model(
         if dd > max_drawdown:
             max_drawdown = dd
 
-    # Sharpe ratio (approx) => we treat each trade as if it were "daily return"
-    # Not strictly correct, but for demonstration:
     returns = df_trades["pnl_percent"].fillna(0) / 100.0
     if returns.std() == 0:
         sharpe = 0.0
@@ -672,9 +725,13 @@ def backtest_model(
         "num_trades": len(df_trades)
     }
 
-    logger.info(f"Advanced Backtest => total_pnl={final_pnl:.2f}%, max_dd={max_drawdown:.2f}%, sharpe={sharpe:.2f}, trades={len(df_trades)}")
+    logger.info(
+        f"Advanced Backtest => total_pnl={final_pnl:.2f}%, "
+        f"max_dd={max_drawdown:.2f}%, sharpe={sharpe:.2f}, trades={len(df_trades)}"
+    )
 
     return df_trades, stats
+
 
 # ------------------------------------------------------------------------------
 # Main Execution
@@ -687,6 +744,10 @@ def main():
     4) Combine everything into X_full, y_full, then do hyperparam search + final hold-out test.
     5) Run an advanced backtest on the combined dataset to see real "trading" results.
     6) Save the model + log final metric.
+
+    Memory-limiting approach:
+    - We read at most MAX_ROWS_PER_PAIR for each pair from 'price_history'.
+      This avoids overloading RAM with very large tables.
     """
     # 1) Possibly load BTC data for correlation
     df_btc = load_data_for_btc(DB_FILE, BTC_PAIR)
@@ -745,7 +806,7 @@ def main():
         return
 
     # 5) Run advanced backtest
-    logger.info("Running advanced backtest on the full dataset to see realistic 'right calls'.")
+    logger.info("Running advanced backtest on the full dataset to see realistic 'trading' results.")
     df_trades, adv_stats = backtest_model(
         X_full, model,
         buy_threshold=0.6,
