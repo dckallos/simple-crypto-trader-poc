@@ -40,9 +40,13 @@ from fetch_cryptopanic import fetch_cryptopanic_data
 from fetch_lunarcrush import fetch_lunarcrush_data
 from train_model import main as training_main
 from ws_data_feed import KrakenWSClient
+import warnings
+import pandas as pd
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
+
+warnings.simplefilter(action="ignore", category=pd.errors.SettingWithCopyWarning)
 
 LOG_CONFIG = {
     'version': 1,
@@ -130,21 +134,18 @@ def get_ws_token(api_key, api_secret):
 
 def main():
     logging.config.dictConfig(LOG_CONFIG)
-    # requests & urllib3 logs at DEBUG, root at INFO below.
 
     CONFIG_FILE = "config.yaml"
     with open(CONFIG_FILE, "r") as f:
         config = yaml.safe_load(f)
 
     ENABLE_TRAINING = config.get("enable_training", True)
-    print(f"Loaded config: {config}")
     ENABLE_LIVE_AI_INFERENCE = config.get("enable_live_ai_inference", True)
     ENABLE_GPT_INTEGRATION = config.get("enable_gpt_integration", True)
     TRADED_PAIRS = config.get("traded_pairs", [])
-    DB_FILE = "trades.db"
     AGGREGATOR_INTERVAL_SECONDS = config.get("trade_interval_seconds", 60)
 
-    # We load the 'risk_controls' from config.yaml. If not found, we provide fallback defaults.
+    # load risk_controls from config if present
     risk_controls = config.get("risk_controls", {
         "initial_spending_account": 50.0,
         "purchase_upper_limit_percent": 1.0,
@@ -175,11 +176,11 @@ def main():
         pairs=TRADED_PAIRS,
         model_path=model_path,
         use_openai=ENABLE_GPT_INTEGRATION,
-        max_position_size=0.001,  # clamp on trade quantity
+        max_position_size=0.001,
         stop_loss_pct=0.05,
         take_profit_pct=0.01,
         max_daily_drawdown=-0.02,
-        risk_controls=risk_controls  # pass the risk controls from config
+        risk_controls=risk_controls
     )
     logger.info(f"AIStrategy loaded with pairs={TRADED_PAIRS}, GPT={ENABLE_GPT_INTEGRATION}")
 
@@ -236,12 +237,13 @@ def main():
         ws_client.stop()
         logger.info("Stopped WebSocket and main app.")
 
+
     # If you want private feed usage, you can do something like:
     token_json = get_ws_token(KRAKEN_API_KEY, KRAKEN_API_SECRET)
     if token_json and "result" in token_json and "token" in token_json["result"]:
         token_str = token_json["result"]["token"]
         logger.info(f"Retrieved token: {token_str}")
-        ws_client.connect_private_feed(token_str)
+        # ws_client.connect_private_feed(token_str)
         # subscribe private feed or send orders
     else:
         logger.warning("Failed to retrieve token or parse it.")
