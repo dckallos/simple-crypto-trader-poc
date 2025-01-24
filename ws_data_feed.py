@@ -7,14 +7,16 @@ ws_data_feed.py
 Connects to Kraken's WebSocket API using the 'websockets' library (async).
 - Subscribes to public feeds (ticker, trade) for real-time data,
   storing them in DB (via store_price_history).
-- Also can connect to private feeds (wss://ws-auth.kraken.com) for
+- Can also connect to private feeds (wss://ws-auth.kraken.com) for
   'openOrders', 'ownTrades', etc., after retrieving a token from REST.
-- Offers methods to add/cancel orders in private feed.
-- Now includes an optional way to start directly in private-feed mode if
-  `start_in_private_feed=True` is passed, along with `private_token`.
 
-We run the async code in a background thread to avoid blocking
-the main thread in your `main.py`.
+Key Updates:
+------------
+1) We now maintain a reference to the active WebSocket connection (self._ws).
+2) send_order(...) and cancel_order(...) have been updated so they can
+   send JSON messages to the active private feed, if connected with a valid token.
+3) subscribe_private_feed(...) can also schedule a real subscription if
+   we have an active private feed connection.
 
 Usage example:
     from ws_data_feed import KrakenWSClient
@@ -24,19 +26,17 @@ Usage example:
         feed_type="ticker",
         api_key="YOUR_KEY",
         api_secret="YOUR_SECRET",
-        start_in_private_feed=True,          # optional
-        private_token="YOUR_REST_OBTAINED_TOKEN",  # optional
+        start_in_private_feed=True,
+        private_token="YOUR_REST_OBTAINED_TOKEN",
     )
     # Start in background thread
     client.start()
 
-    # The client will begin in private-feed mode if you provided a valid token
-    # and set start_in_private_feed=True. Otherwise, it begins in public mode.
+    # If you want to subscribe to private channels like "openOrders":
+    #    client.subscribe_private_feed("openOrders")
 
-    # You can also subscribe to private channels:
-    #   client.subscribe_private_feed("openOrders")
-    # Or place private orders once connected to the private feed:
-    #   client.send_order("XBT/USD", "buy", "limit", 0.01, 18000.0)
+    # Place a private order if connected:
+    #    client.send_order("XBT/USD", side="buy", ordertype="limit", volume=0.01, price=18000.0)
 
     # ...
     client.stop()
@@ -83,20 +83,24 @@ class KrakenWSClient:
         we begin in private mode from the start, connecting to wss://ws-auth.kraken.com.
       - Or, call `connect_private_feed(...)` after you have a token to switch from
         public to private feed next time we reconnect or if we're not running yet.
-      - Then you can subscribe to private channels (e.g. openOrders) or place orders.
+      - Then you can subscribe to private channels (e.g. openOrders) or place orders,
+        with the newly implemented `send_order(...)` and `cancel_order(...)` methods.
+
+    This code is now more production-ready for private feed usage, though further
+    error handling and confirmations might be desired.
 
     We run everything in a background thread so the main code is not blocked.
     """
 
     def __init__(
-        self,
-        pairs,
-        feed_type="trade",
-        api_key=None,
-        api_secret=None,
-        on_ticker_callback=None,
-        start_in_private_feed: bool = False,
-        private_token: str = None
+            self,
+            pairs,
+            feed_type="trade",
+            api_key=None,
+            api_secret=None,
+            on_ticker_callback=None,
+            start_in_private_feed: bool = False,
+            private_token: str = None
     ):
         """
         :param pairs: List of trading pairs, e.g. ["XBT/USD", "ETH/USD"].
@@ -122,11 +126,9 @@ class KrakenWSClient:
         self.api_key = api_key
         self.api_secret = api_secret
 
-        # We'll store the event loop & ssl context
         self.loop = None
         self.ssl_context = create_secure_ssl_context()
 
-        # If we want to start in private feed from the get-go:
         self.token = None
         if start_in_private_feed and private_token:
             logger.info("KrakenWSClient: Starting in PRIVATE feed mode.")
@@ -135,6 +137,9 @@ class KrakenWSClient:
         else:
             # Default to public feed
             self.url = self.url_public
+
+        # We'll store the active WebSocket so we can send commands to it
+        self._ws = None
 
         # For concurrency
         self.running = False
@@ -180,15 +185,17 @@ class KrakenWSClient:
             try:
                 logger.info(f"Connecting to {self.url} ...")
                 async with websockets.connect(self.url, ssl=self.ssl_context) as ws:
+                    self._ws = ws  # store the active ws
                     logger.info(f"WebSocket connected => feed_type={self.feed_type}, url={self.url}")
-                    # If it's the public feed => subscribe to feed_type
-                    # If private => we might do so differently
-                    await self._subscribe(ws)
 
-                    # continuously receive messages
+                    await self._subscribe(ws)
                     await self._consume_messages(ws)
+
+                    # Once the context manager exits, we lose our ws
+                    self._ws = None
             except Exception as e:
                 logger.exception(f"WebSocket error => {e}")
+                self._ws = None
                 if not self.running:
                     break
                 logger.info("WebSocket disconnected, reconnecting in 5s...")
@@ -202,7 +209,6 @@ class KrakenWSClient:
         If private, call private subscription logic if self.token is set.
         """
         if self.url == self.url_public:
-            # public subscription
             subscription_obj = {"name": self.feed_type}
             msg = {
                 "event": "subscribe",
@@ -214,9 +220,7 @@ class KrakenWSClient:
         else:
             # private feed => see if we have a token
             if self.token:
-                # default => subscribe to e.g. "openOrders" or none if you prefer
-                # or rely on user calls to `subscribe_private_feed(...)`
-                feed_name = "openOrders"
+                feed_name = "openOrders"  # or "ownTrades", or skip
                 await self._subscribe_private(ws, feed_name=feed_name)
 
     async def _consume_messages(self, ws):
@@ -245,7 +249,6 @@ class KrakenWSClient:
             logger.error(f"JSON parse error => {message}")
             return
 
-        # Could be dict => system events, or list => feed data
         if isinstance(data, dict):
             event_type = data.get("event")
             if event_type in ["subscribe", "subscriptionStatus", "heartbeat", "systemStatus"]:
@@ -297,9 +300,6 @@ class KrakenWSClient:
             logger.debug(f"Unrecognized system message => {data}")
 
     async def _handle_ticker(self, update_obj, pair):
-        """
-        For the 'ticker' feed => parse 'a','b','c','v', store to DB.
-        """
         ask_info = update_obj.get("a", [])
         bid_info = update_obj.get("b", [])
         last_trade_info = update_obj.get("c", [])
@@ -318,16 +318,10 @@ class KrakenWSClient:
             volume=volume
         )
 
-        # If we have a callback, call it
         if self.on_ticker_callback and last_price > 0:
             self.on_ticker_callback(pair, last_price)
 
     async def _handle_trade(self, trades_list, pair):
-        """
-        For the 'trade' feed => data is a list of trades.
-        Each trade => [price, volume, time, side, order_type, misc]
-        We'll store them in price_history with bid=ask=0.
-        """
         for trade in trades_list:
             price = float(trade[0])
             vol = float(trade[1])
@@ -365,14 +359,12 @@ class KrakenWSClient:
         """
         self.token = token
         self.url = self.url_private
-        # If we're already running => either wait for next reconnect or design a forced approach
         if self.running:
             logger.warning(
                 "Already running => we will reconnect to private feed on next cycle/disconnect. "
                 "Or you can call 'stop()' then 'start()' to force immediate switch."
             )
         else:
-            # not running => just start it in private mode
             self.start()
 
     async def _subscribe_private(self, ws, feed_name="openOrders"):
@@ -411,34 +403,88 @@ class KrakenWSClient:
                 logger.warning("No token => can't subscribe to private feed.")
                 return
             logger.info(f"Subscribing to private feed => {feed_name}")
-            # In a robust design, you'd have a reference to the current WebSocket.
-            # For now, we stub it out. This is where you'd call `_subscribe_private(ws, feed_name)`
-            # if you stored `ws` as a member variable.
-            pass
+
+            if self._ws is not None:
+                # Actually subscribe
+                await self._subscribe_private(self._ws, feed_name=feed_name)
+            else:
+                logger.warning(
+                    "No active WebSocket => cannot subscribe now. "
+                    "Will attempt on next connection if we remain in private mode."
+                )
 
         if self.loop:
-            # schedule the subscription on the event loop
             asyncio.run_coroutine_threadsafe(_sub(), self.loop)
         else:
-            logger.warning("No event loop found => cannot schedule private subscription right now.")
+            logger.warning("No event loop => cannot schedule private subscription now.")
 
     def send_order(self, pair: str, side: str, ordertype: str, volume: float, price: float = None):
         """
-        For the private feed => 'addOrder' event. We'll do a stub approach as well,
-        because we need an actual reference to the current websockets connection
-        in a more advanced design.
+        For the private feed => 'addOrder' event. Now properly implemented so that
+        we can send an "addOrder" message to the active private WS feed if connected.
+
+        Example usage:
+            client.send_order("XBT/USD", side="buy", ordertype="limit", volume=0.01, price=18000.0)
         """
-        logger.warning("send_order is a stub => in websockets approach, we need an open ws reference.")
-        # In a robust design, store 'ws' and do an async method for "addOrder" event with
-        # subscription token, e.g.:
-        # msg = {
-        #   "event": "addOrder",
-        #   "token": self.token,
-        #   ...
-        # }
+        if not self.token:
+            logger.warning("No token => cannot place order in private feed. Need a valid token.")
+            return
+        if self.url != self.url_private:
+            logger.warning("Currently connected to public feed => can't place order. Switch to private feed.")
+            return
+        if not self.running or not self._ws:
+            logger.warning("No active private WebSocket => cannot place order right now.")
+            return
+
+        async def _send():
+            msg = {
+                "event": "addOrder",
+                "token": self.token,
+                "pair": pair,
+                "ordertype": ordertype,
+                "type": side,
+                "volume": str(volume),
+            }
+            if price is not None:
+                msg["price"] = str(price)
+
+            logger.info(f"Sending addOrder => {msg}")
+            await self._ws.send(json.dumps(msg))
+
+        if self.loop:
+            asyncio.run_coroutine_threadsafe(_send(), self.loop)
+        else:
+            logger.warning("No event loop => cannot schedule send_order now.")
 
     def cancel_order(self, txids: list):
         """
-        For private feed => 'cancelOrder'. Also a stub, see same note as above.
+        For private feed => 'cancelOrder'. Cancels the orders with the given list of txids.
+
+        Example usage:
+            client.cancel_order(["O6S6CF-ABC123-XYZ987"])
+
+        We must have a valid token, be in private feed mode, and have an active ws.
         """
-        logger.warning("cancel_order is a stub => see above. We need direct ws access.")
+        if not self.token:
+            logger.warning("No token => cannot cancel order in private feed. Need a valid token.")
+            return
+        if self.url != self.url_private:
+            logger.warning("Currently connected to public feed => can't cancel orders. Switch to private feed.")
+            return
+        if not self.running or not self._ws:
+            logger.warning("No active private WebSocket => cannot cancel order right now.")
+            return
+
+        async def _cancel():
+            msg = {
+                "event": "cancelOrder",
+                "token": self.token,
+                "txid": txids
+            }
+            logger.info(f"Sending cancelOrder => {msg}")
+            await self._ws.send(json.dumps(msg))
+
+        if self.loop:
+            asyncio.run_coroutine_threadsafe(_cancel(), self.loop)
+        else:
+            logger.warning("No event loop => cannot schedule cancel_order now.")
