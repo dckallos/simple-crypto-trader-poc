@@ -79,6 +79,55 @@ LOG_CONFIG = {
     }
 }
 
+# ------------------------------------------------------------------------------
+# A small function to retrieve a Kraken WebSockets token
+# ------------------------------------------------------------------------------
+def get_ws_token(api_key, api_secret):
+    """
+    Retrieves a WebSockets authentication token from Kraken's REST API.
+    Example response:
+        {
+          "error": [],
+          "result": {
+            "expires": 900,
+            "token": "..."
+          }
+        }
+    Parse out 'result'->'token' as needed.
+
+    :param api_key: Your Kraken API key string (with permission to access WebSockets).
+    :param api_secret: Your Kraken API secret (base64-encoded string).
+    :return: The full JSON response or None if error.
+    """
+    url = "https://api.kraken.com/0/private/GetWebSocketsToken"
+    path = "/0/private/GetWebSocketsToken"
+    nonce = str(int(time.time() * 1000))
+
+    data = {"nonce": nonce}
+    postdata = f"nonce={nonce}"
+
+    sha256 = hashlib.sha256((nonce + postdata).encode("utf-8")).digest()
+    message = path.encode("utf-8") + sha256
+    secret = base64.b64decode(api_secret)
+
+    sig = hmac.new(secret, message, hashlib.sha512)
+    signature = base64.b64encode(sig.digest())
+
+    headers = {
+        "API-Key": api_key,
+        "API-Sign": signature.decode()
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, data=data, timeout=10)
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error retrieving WebSockets token: {e}")
+        return None
+
+    return resp.json()
+
+
 def main():
     logging.config.dictConfig(LOG_CONFIG)
     # requests & urllib3 logs at DEBUG, root at INFO below.
@@ -94,6 +143,14 @@ def main():
     TRADED_PAIRS = config.get("traded_pairs", [])
     DB_FILE = "trades.db"
     AGGREGATOR_INTERVAL_SECONDS = config.get("trade_interval_seconds", 60)
+
+    # We load the 'risk_controls' from config.yaml. If not found, we provide fallback defaults.
+    risk_controls = config.get("risk_controls", {
+        "initial_spending_account": 50.0,
+        "purchase_upper_limit_percent": 1.0,
+        "minimum_buy_amount": 10.0,
+        "max_position_value": 20.0
+    })
 
     load_dotenv()
     KRAKEN_API_KEY = os.getenv("KRAKEN_API_KEY", "FAKE_KEY")
@@ -113,14 +170,16 @@ def main():
 
     # 3) AIStrategy creation
     model_path = "trained_model.pkl" if os.path.exists("trained_model.pkl") else None
+
     ai_model = AIStrategy(
         pairs=TRADED_PAIRS,
         model_path=model_path,
         use_openai=ENABLE_GPT_INTEGRATION,
-        max_position_size=0.001,
+        max_position_size=0.001,  # clamp on trade quantity
         stop_loss_pct=0.05,
         take_profit_pct=0.01,
-        max_daily_drawdown=-0.02
+        max_daily_drawdown=-0.02,
+        risk_controls=risk_controls  # pass the risk controls from config
     )
     logger.info(f"AIStrategy loaded with pairs={TRADED_PAIRS}, GPT={ENABLE_GPT_INTEGRATION}")
 
@@ -178,14 +237,14 @@ def main():
         logger.info("Stopped WebSocket and main app.")
 
     # If you want private feed usage, you can do something like:
-    # token_json = get_ws_token(KRAKEN_API_KEY, KRAKEN_API_SECRET)
-    # if token_json and "result" in token_json and "token" in token_json["result"]:
-    #     token_str = token_json["result"]["token"]
-    #     logger.info(f"Retrieved token: {token_str}")
-    #     ws_client.connect_private_feed(token_str)
-    #     # subscribe private feed or send orders
-    # else:
-    #     logger.warning("Failed to retrieve token or parse it.")
+    token_json = get_ws_token(KRAKEN_API_KEY, KRAKEN_API_SECRET)
+    if token_json and "result" in token_json and "token" in token_json["result"]:
+        token_str = token_json["result"]["token"]
+        logger.info(f"Retrieved token: {token_str}")
+        ws_client.connect_private_feed(token_str)
+        # subscribe private feed or send orders
+    else:
+        logger.warning("Failed to retrieve token or parse it.")
 
 
 if __name__ == "__main__":
