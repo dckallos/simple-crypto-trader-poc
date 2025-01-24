@@ -141,7 +141,6 @@ def main():
         config = yaml.safe_load(f)
 
     ENABLE_TRAINING = config.get("enable_training", True)
-    ENABLE_LIVE_AI_INFERENCE = config.get("enable_live_ai_inference", True)
     ENABLE_GPT_INTEGRATION = config.get("enable_gpt_integration", True)
     TRADED_PAIRS = config.get("traded_pairs", [])
     AGGREGATOR_INTERVAL_SECONDS = config.get("trade_interval_seconds", 60)
