@@ -17,11 +17,16 @@ A production-ready AIStrategy that:
    (BUY, SELL, HOLD).
 
 Important:
-- The new openai Python library v1 often sets `choice.finish_reason` to
-  'stop', 'tool_calls', 'content_filter', etc. and places function call
-  data in `choice.message.function_call` if GPT calls a function.
-- We handle both function_call logic (post-validating GPT's size) and
-  fallback text logic.
+- The new openai Python library v1 uses `tools` and `tool_choice="auto"` (or "none")
+  when enabling function-calling. The model can return `finish_reason="tool_calls"`
+  if it decides to invoke a provided function. Inside `choice.message.tool_calls`,
+  you'll find `function.name` and `function.arguments`.
+- If GPT produces a normal text response (finish_reason="stop"), we parse text for
+  BUY/SELL/HOLD.
+- We also have an optional scikit model fallback (`_model_inference_realtime()`) and
+  a final fallback `_dummy_logic()` if no advanced logic is applicable.
+- We updated references to the message object so that they don't rely on `.get()`,
+  and changed `pd.read_sql_query` parameter passing to fix IDE warnings.
 """
 
 import logging
@@ -97,7 +102,7 @@ class AIStrategy:
         """
         :param pairs: e.g. ["XBT/USD", "ETH/USD"].
         :param model_path: Path to a .pkl scikit model if any.
-        :param use_openai: If True, attempt GPT-based inference.
+        :param use_openai: If True, attempt GPT-based inference with function-calling.
         :param max_position_size: For RiskManagerDB => clamp trade sizes.
         :param stop_loss_pct: e.g. 5% => auto-close if we drop that far.
         :param take_profit_pct: e.g. 10% => auto-close if we gain that much.
@@ -165,6 +170,10 @@ class AIStrategy:
         save_gpt_context_to_db(new_data)
 
     def _append_gpt_context(self, new_text: str) -> None:
+        """
+        Simple approach: just keep appending. A more advanced approach would
+        periodically summarize older messages to prevent context from ballooning.
+        """
         self.gpt_context += "\n" + new_text
         self._save_gpt_context(self.gpt_context)
 
@@ -245,7 +254,7 @@ class AIStrategy:
             return self._dummy_logic(market_data)
 
     # --------------------------------------------------------------------------
-    # GPT-based approach
+    # GPT-based approach with function calling
     # --------------------------------------------------------------------------
     def _openai_inference(self, market_data: dict):
         pair = market_data.get("pair", "UNKNOWN")
@@ -253,54 +262,89 @@ class AIStrategy:
         cpanic = market_data.get("cryptopanic_sentiment", 0.0)
         galaxy = market_data.get("galaxy_score", 0.0)
         alt_rank = market_data.get("alt_rank", 0)
-        base_rationale = f"GPT-based => {pair}, price={price}, cpanic={cpanic}, galaxy={galaxy}, alt={alt_rank}"
+        base_rationale = (
+            f"GPT-based => pair={pair}, price={price}, "
+            f"cryptopanic={cpanic}, galaxy={galaxy}, alt_rank={alt_rank}"
+        )
 
         # Summarize last trades
         summary = self._summarize_recent_trades(pair, limit=3)
 
-        # Build prompt with optional risk_controls from config
+        # Build system / user messages
         system_msg = {
             "role": "system",
             "content": (
                 "You are an advanced crypto trading assistant. The user provides aggregator data. "
-                "You may produce function calls or normal text to convey a trade decision. "
-                "Respect the user's numeric constraints for position sizing."
+                "You may produce a function call to finalize your trade decision. "
+                "Respect numeric constraints from the user for position sizing. "
+                "Possible actions: BUY, SELL, HOLD. If HOLD => size=0. "
+                "You can also respond with normal text if you prefer."
             )
         }
-
-        # We'll inject risk controls if present:
-        rc = self.risk_controls
         user_text = (
             f"GPT context:\n{self.gpt_context}\n\n"
             f"Aggregator:\n  pair={pair}, price={price}, cryptopanic={cpanic}, galaxy={galaxy}, alt_rank={alt_rank}\n"
-            f"Trades:\n{summary}\n"
+            f"Recent trades:\n{summary}\n"
         )
-        if rc:
+        # risk controls if present
+        if self.risk_controls:
+            rc = self.risk_controls
             user_text += (
                 "\nConstraints:\n"
                 f"  initial_spending_account={rc.get('initial_spending_account',0.0)}\n"
                 f"  purchase_upper_limit_percent={rc.get('purchase_upper_limit_percent',0.0)}\n"
                 f"  minimum_buy_amount={rc.get('minimum_buy_amount',0.0)}\n"
                 f"  max_position_value={rc.get('max_position_value',0.0)}\n"
-                "In other words, do not produce a BUY that costs more than (purchase_upper_limit_percent * initial_spending_account), "
-                "nor less than minimum_buy_amount, etc.\n"
+                "In other words, do not produce a BUY that exceeds these constraints.\n"
             )
+
         user_text += (
-            "\nDecide on a single action: BUY, SELL, or HOLD. If BUY => show 'size'. If SELL => show 'size'. "
-            "If HOLD => size=0.\n"
+            "\nPlease propose a single final action. If you want to call a function, use the 'trade_decision' function."
         )
 
         user_msg = {"role": "user", "content": user_text}
 
-        # Call openai
+        # Tools array - for function calling
+        # The example function: "trade_decision" => produce an action + size
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "trade_decision",
+                    "description": (
+                        "Propose an action among BUY, SELL, HOLD with a 'size' value."
+                        "If action=HOLD => size=0"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "enum": ["BUY","SELL","HOLD"]
+                            },
+                            "size": {
+                                "type": "number",
+                                "description": "Trade quantity or volume, e.g. 0.0005"
+                            }
+                        },
+                        "required": ["action","size"]
+                    },
+                }
+            }
+        ]
+
+        # Call OpenAI
         response = self.client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-o1-mini",
             messages=[system_msg, user_msg],
+            tools=tools,
+            tool_choice="auto",
             temperature=0.0,
-            max_tokens=400
+            max_completion_tokens=500
         )
         logger.debug(f"GPT response: {response}")
 
+        # Let's parse the first choice
         if not response.choices:
             rationale = f"No GPT choices => fallback. {base_rationale}"
             self._store_decision(pair, "HOLD", 0.0, rationale)
@@ -308,18 +352,23 @@ class AIStrategy:
 
         choice = response.choices[0]
         finish_reason = choice.finish_reason
-        msg = choice.message  # a ChatCompletionMessage
+        logger.info(f"GPT finish_reason={finish_reason}")
 
-        # If GPT tries function calls:
+        # If GPT used a tool call => parse .tool_calls
         if finish_reason in ("tool_calls", "function_call"):
-            fn_call = getattr(msg, "function_call", None)
-            if not fn_call:
-                # no actual call => fallback
-                rationale = f"No function_call => fallback. {base_rationale}"
+            # function_call is deprecated, but we check it in case the model uses it
+            tool_calls = choice.message.tool_calls or []
+            if not tool_calls:
+                # fallback if no actual function call
+                rationale = f"No tool_calls => fallback. {base_rationale}"
                 self._store_decision(pair, "HOLD", 0.0, rationale)
                 return ("HOLD", 0.0)
 
-            fn_args_str = fn_call.arguments
+            # We'll handle the first tool call
+            first_call = tool_calls[0]
+            fn_call = first_call.function
+            fn_args_str = fn_call.arguments if fn_call else "{}"
+
             try:
                 parsed_args = json.loads(fn_args_str)
             except json.JSONDecodeError:
@@ -332,23 +381,20 @@ class AIStrategy:
 
             # post-validate
             final_signal, final_size = self._post_validate_and_adjust(action, size_suggested, price)
-
-            # Then call DB
+            # risk manager
             final_signal, final_size = self.risk_manager_db.adjust_trade(
                 final_signal, final_size, pair, price
             )
-
-            # record final
-            full_rationale = f"GPT function_call => {fn_call.name}, {base_rationale}"
+            # store
+            full_rationale = f"GPT function_call => trade_decision => {base_rationale}"
             if final_signal in ("BUY", "SELL") and final_size > 0:
-                record_trade_in_db(final_signal, final_size, price, "GPT_DECISION", pair)
+                record_trade_in_db(final_signal, final_size, price, "GPT_DECISION_FUNC", pair)
             self._store_decision(pair, final_signal, final_size, full_rationale)
-            self._append_gpt_context(f"fn_call => {fn_call.name}, action={final_signal}, size={final_size}")
+            self._append_gpt_context(f"fn_call => action={final_signal}, size={final_size}")
             return (final_signal, final_size)
-
         else:
-            # normal text
-            content_text = msg.content or ""
+            # normal text => parse content
+            content_text = choice.message.content or ""
             if "BUY" in content_text.upper():
                 action = "BUY"
                 size_suggested = 0.0005
@@ -394,7 +440,7 @@ class AIStrategy:
 
         min_buy = rc.get("minimum_buy_amount", 0.0)
         upper_percent = rc.get("purchase_upper_limit_percent", 1.0)
-        account_total = rc.get("initial_spending_account", 9999999.0)
+        account_total = rc.get("initial_spending_account", 50.0)
         purchase_upper = account_total * upper_percent
 
         if action == "BUY":
@@ -404,17 +450,16 @@ class AIStrategy:
                 return ("HOLD", 0.0)
             # check max
             if cost > purchase_upper:
-                # clamp or hold
                 new_size = purchase_upper / max(current_price, 1e-9)
                 logger.info(
                     f"GPT suggests BUY => cost={cost} > {purchase_upper}, clamping size to {new_size}"
                 )
                 return ("BUY", new_size)
 
-        # For SELL, we might do a partial exit logic or let it pass
+        # For SELL, we do not enforce the same cost-based constraints, though you could if needed.
         return (action, size_suggested)
 
-    # --------------------------------------------------------------------------
+    # -----------------x    ---------------------------------------------------------
     # scikit approach
     # --------------------------------------------------------------------------
     def _model_inference_realtime(self, market_data: dict):
@@ -504,7 +549,7 @@ class AIStrategy:
     def _fetch_recent_price_data(self, pair: str, limit=50) -> pd.DataFrame:
         conn = sqlite3.connect(DB_FILE)
         try:
-            q = f"""
+            q = """
                 SELECT
                   timestamp, pair, bid_price, ask_price, last_price, volume
                 FROM price_history
@@ -512,7 +557,8 @@ class AIStrategy:
                 ORDER BY id DESC
                 LIMIT ?
             """
-            df = pd.read_sql_query(q, conn, params=(pair, limit))
+            # Use a list for params instead of tuple
+            df = pd.read_sql_query(q, conn, params=[pair, limit])
             # reverse so earliest is first
             df = df.iloc[::-1].reset_index(drop=True)
             return df
@@ -567,7 +613,6 @@ class AIStrategy:
             merged["corr_with_btc"] = merged["last_price"].rolling(30).corr(merged["btc_price"])
             df = merged
 
-        # fill
         df.ffill(inplace=True)
         df.bfill(inplace=True)
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
