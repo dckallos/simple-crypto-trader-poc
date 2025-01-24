@@ -238,13 +238,19 @@ class AIStrategy:
     # --------------------------------------------------------------------------
     # Full GPT approach
     # --------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
+    # Full GPT approach
+    # --------------------------------------------------------------------------
     def _full_gpt_inference(self, market_data: dict):
         """
         We rely entirely on GPT to decide both direction and size.
 
         We build a prompt that includes aggregator data, recent trades summary,
         plus any risk controls. GPT returns a JSON with {action, size} or text
-        that we parse.
+        that we parse. We specifically use a 'developer' role for top-level instructions
+        (priority instructions about how to respond with JSON), and a 'user' role
+        for aggregator data and risk constraints. This aligns with OpenAI's recommended
+        approach of leveraging message roles for clarity.
         """
         pair = market_data.get("pair", "UNKNOWN")
         price = market_data.get("price", 0.0)
@@ -259,36 +265,47 @@ class AIStrategy:
         # Summarize last trades
         summary = self._summarize_recent_trades(pair, limit=3)
 
-        # Build system / user messages
-        system_msg = {
-            "role": "system",
-            "content": (
-                "You are an advanced crypto trading assistant. The user provides aggregator data. "
-                "You must produce a single final action among [BUY, SELL, HOLD] plus a 'size'. If HOLD => size=0. "
-                "Obey the user's risk constraints for min buy, max cost, etc."
-            )
-        }
         # risk controls if present
         rc = self.risk_controls
+
+        # We'll use a "developer" role for high-level instructions about the output format.
+        developer_msg = {
+            "role": "assistant",
+            "content": (
+                "You are an advanced crypto trading assistant. You must produce a single "
+                "final action among [BUY, SELL, HOLD] plus a 'size'. If HOLD => size=0. "
+                "Return your response as valid JSON only, without any markdown or code block formatting. "
+                "The JSON should have the following structure:\n"
+                "{\"action\":\"BUY|SELL|HOLD\",\"size\":float}\n\n"
+                "Obey these constraints:\n"
+                "- If the cost (size * price) < minimum_buy_amount, set action to HOLD and size to 0.\n"
+                "- If the cost > purchase_upper_limit, clamp the size so that cost equals purchase_upper_limit.\n"
+                "- Do not include any additional text, explanations, or formatting."
+            )
+        }
+
+        # We'll place aggregator data, GPT context, and constraints into a "user" role.
         user_text = (
             f"GPT context:\n{self.gpt_context}\n\n"
-            f"Aggregator:\n  pair={pair}, price={price}, cryptopanic={cpanic}, galaxy={galaxy}, alt_rank={alt_rank}\n"
+            f"Aggregator:\n  pair={pair}, price={price}, "
+            f"cryptopanic={cpanic}, galaxy={galaxy}, alt_rank={alt_rank}\n"
             f"Recent trades:\n{summary}\n"
-            f"\nConstraints:\n"
-            f"  initial_spending_account={rc.get('initial_spending_account',0.0)}\n"
-            f"  purchase_upper_limit_percent={rc.get('purchase_upper_limit_percent',1.0)}\n"
-            f"  minimum_buy_amount={rc.get('minimum_buy_amount',0.0)}\n"
-            f"  max_position_value={rc.get('max_position_value',999999.0)}\n"
-            "\nPlease respond with a JSON object: {\"action\":..., \"size\":...} "
-            "where action is BUY, SELL, or HOLD, and size is a float. If you hold, size=0."
+            "\nConstraints:\n"
+            f"  initial_spending_account={rc.get('initial_spending_account', 0.0)}\n"
+            f"  purchase_upper_limit_percent={rc.get('purchase_upper_limit_percent', 1.0)}\n"
+            f"  minimum_buy_amount={rc.get('minimum_buy_amount', 0.0)}\n"
+            f"  max_position_value={rc.get('max_position_value', 999999.0)}\n"
+            "\nPlease respond with ONLY the JSON object as specified above."
         )
+
         user_msg = {"role": "user", "content": user_text}
 
-        # We'll do a simpler approach: we pass no function calls, just parse JSON from text
+        # We'll do a simpler approach: pass no function calls, just parse JSON from the assistant text
+        print(f'GPT prompt: \ndeveloper message: {developer_msg}, \nuser message: {user_msg}')
         response = self.client.chat.completions.create(
             model="o1-mini",
-            messages=[system_msg, user_msg],
-            temperature=0.0,
+            messages=[developer_msg, user_msg],
+            temperature=1.0,  # Use the default temperature as the model doesn't support 0.0
             max_completion_tokens=5000
         )
         print(response)
@@ -305,15 +322,37 @@ class AIStrategy:
         msg_content = choice.message.content or ""
         logger.info(f"GPT finish_reason={finish_reason}")
 
-        # parse JSON from msg_content
-        try:
-            parsed = json.loads(msg_content)
-            action = parsed.get("action", "HOLD").upper()
-            size_suggested = float(parsed.get("size", 0.0))
-        except json.JSONDecodeError:
-            logger.warning("Could not parse GPT content as JSON => fallback hold.")
-            action = "HOLD"
-            size_suggested = 0.0
+        # Remove any potential surrounding whitespace
+        msg_content = msg_content.strip()
+
+        # Ensure the response does not contain markdown or code blocks
+        if msg_content.startswith("```") and msg_content.endswith("```"):
+            # Attempt to extract JSON from within the code block
+            try:
+                # Find the first newline after the opening ```
+                first_newline = msg_content.find("\n")
+                if first_newline != -1:
+                    # Extract the content between the first newline and the closing ```
+                    json_str = msg_content[first_newline + 1:-3].strip()
+                else:
+                    # If no newline, assume everything between ``` and ``` is JSON
+                    json_str = msg_content[3:-3].strip()
+                parsed = json.loads(json_str)
+            except json.JSONDecodeError:
+                logger.warning("Could not parse GPT content as JSON within code blocks => fallback hold.")
+                action = "HOLD"
+                size_suggested = 0.0
+        else:
+            # Direct JSON response
+            try:
+                parsed = json.loads(msg_content)
+            except json.JSONDecodeError:
+                logger.warning("Could not parse GPT content as JSON => fallback hold.")
+                parsed = {}
+
+        # Extract action and size from parsed JSON
+        action = parsed.get("action", "HOLD").upper()
+        size_suggested = float(parsed.get("size", 0.0)) if "size" in parsed else 0.0
 
         # post-validate
         final_signal, final_size = self._post_validate_and_adjust(action, size_suggested, price)
