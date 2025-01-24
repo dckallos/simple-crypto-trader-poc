@@ -5,266 +5,104 @@
 main.py
 
 A mature application that:
-1) Initializes DB (including open_positions and ai_context tables).
-2) Optionally runs training if config says so.
-3) Starts a custom WebSocket feed for real-time data, storing it in price_history.
+1) Initializes the DB (init_db from db.py).
+2) Optionally runs training if config says so (fetch_cryptopanic, fetch_lunarcrush, then train_model).
+3) Starts a Kraken WebSocket feed for real-time data, storing it in price_history.
 4) Uses aggregator intervals to pass data to AIStrategy (with GPT or scikit).
-5) Forcibly closes positions if RiskManager triggers (like a -5% stop-loss) in real time.
+5) Forcibly closes sub-positions if RiskManager triggers stop-loss or take-profit.
+6) Demonstrates how to connect to the private feed for order management if desired.
 
-Requires:
- - db.py: with init_db(), open_positions logic, ai_context logic.
- - ai_strategy.py: your updated version with DB-based position storage and GPT context.
- - risk_manager.py, ws_data_feed.py, fetch_cryptopanic.py, fetch_lunarcrush.py, train_model.py, etc.
+Key Points:
+- We rely on 'ai_strategy.py' to store decisions in 'ai_decisions' for each final action.
+- We unify aggregator data so that 'market_data["price"]' is recognized by AIStrategy.
+- We remove any leftover snippet that might spam direct record_trade_in_db("BUY", ...).
 
-No lines omitted for brevity. You can copy/paste to replace your main.py.
+Everything else remains consistent with your multi-position logic,
+private feed placeholders, etc.
 """
 
 import time
+import requests
+import hashlib
+import hmac
+import base64
 import math
 import logging
-import sqlite3
-from datetime import datetime
+import logging.config
 import yaml
 import os
-
+import json
 from dotenv import load_dotenv
 
-import ai_strategy
-# --------------------------------------------------------------------------
-# Local imports
-# --------------------------------------------------------------------------
 from db import init_db
 from ai_strategy import AIStrategy
-from risk_manager import RiskManager
-from ws_data_feed import KrakenWSClient
-
-# optional training
 from fetch_cryptopanic import fetch_cryptopanic_data
 from fetch_lunarcrush import fetch_lunarcrush_data
 from train_model import main as training_main
-from ai_strategy import AIStrategy
+from ws_data_feed import KrakenWSClient
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-# Load environment
-load_dotenv()
-KRAKEN_API_KEY = os.getenv("KRAKEN_API_KEY", "FAKE_KEY")
-KRAKEN_API_SECRET = os.getenv("KRAKEN_SECRET_API_KEY", "FAKE_SECRET")
+LOG_CONFIG = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'standard': {
+            'format': '%(asctime)s %(levelname)s [%(name)s] %(message)s'
+        },
+    },
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'level': 'DEBUG',
+            'formatter': 'standard',
+            'stream': 'ext://sys.stdout'
+        },
+    },
+    'loggers': {
+        '': {  # root logger
+            'handlers': ['console'],
+            'level': 'INFO',
+            'propagate': False
+        },
+        'requests': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': True
+        },
+        'urllib3': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': True
+        },
+    }
+}
 
-# Read config
-CONFIG_FILE = "config.yaml"
-with open(CONFIG_FILE, "r") as f:
-    config = yaml.safe_load(f)
-
-TRADED_PAIRS = config.get("traded_pairs", [])
-ENABLE_TRAINING = config.get("enable_training", False)
-ENABLE_LIVE_AI_INFERENCE = config.get("enable_live_ai_inference", True)
-ENABLE_GPT_INTEGRATION = config.get("enable_gpt_integration", False)
-
-DB_FILE = "trades.db"
-DB_ENABLED = True
-
-# Aggregator approach: poll aggregator data every X seconds
-AGGREGATOR_INTERVAL_SECONDS = config.get("trade_interval_seconds", 300)
-
-MAX_POSITION_SIZE = 0.001
-
-# ------------------------------------------------------------------------------
-# A Hybrid approach that references AIStrategy for aggregator decisions
-# plus risk manager for forced exits, using a custom WebSocket
-# ------------------------------------------------------------------------------
-class HybridApp:
-    """
-    We maintain:
-    - AIStrategy (with DB-based positions)
-    - aggregator interval
-    - real-time forced exit checks in on_tick
-    """
-
-    def __init__(self, pairs, ai_strategy, aggregator_interval=300):
-        self.pairs = pairs
-        self.ai_strategy = ai_strategy
-        self.aggregator_interval = aggregator_interval
-        # track last aggregator call
-        self.last_call_ts = {p: 0 for p in pairs}
-
-    def on_tick(self, pair: str, last_price: float):
-        """
-        Called each time new ticker data arrives for 'pair'.
-        1) Possibly do forced exit if risk manager triggers
-           (the AIStrategy includes a risk manager check).
-           Typically you'd do that inside the AIStrategy or a separate check.
-        2) If aggregator interval elapsed, fetch aggregator data => call AIStrategy => place trades
-        """
-        # forced exit logic can be done in AIStrategy or separate.
-        # We'll do aggregator cycle check here:
-        now = time.time()
-        if (now - self.last_call_ts[pair]) >= self.aggregator_interval:
-            self._aggregator_cycle(pair)
-            self.last_call_ts[pair] = now
-
-    def _aggregator_cycle(self, pair: str):
-        """
-        1) gather aggregator data from the last aggregator_interval seconds
-        2) pass to AIStrategy
-        """
-        from db import store_price_history
-        aggregator_data = self._fetch_aggregated_data(pair, self.aggregator_interval)
-        if not aggregator_data or "avg_price" not in aggregator_data:
-            logger.warning(f"No aggregator data for {pair}, skipping aggregator cycle.")
-            return
-
-        # pass aggregator_data to AIStrategy
-        # AIStrategy's predict() will do partial or full updates
-        self.ai_strategy.predict(aggregator_data)
-
-    def _fetch_aggregated_data(self, pair: str, period_seconds: int):
-        """
-        Aggregates price data from last period_seconds
-        E.g. average price, min, max, total volume
-        Potentially merges aggregator daily sentiment from CryptoPanic,
-        or last known LunarCrush metrics.
-        """
-        import sqlite3
-        cutoff_ts = math.floor(time.time()) - period_seconds
-        conn = sqlite3.connect(DB_FILE)
-        try:
-            c = conn.cursor()
-            c.execute(f"""
-                SELECT
-                  AVG(last_price),
-                  MIN(last_price),
-                  MAX(last_price),
-                  SUM(volume)
-                FROM price_history
-                WHERE pair=? AND timestamp >= ?
-            """, (pair, cutoff_ts))
-            row = c.fetchone()
-            if not row or row[0] is None:
-                return {}
-            avg_p, min_p, max_p, vol_sum = row
-
-            # load aggregator fields from db if you want daily sentiment or recent LunarCrush
-            # for example, daily cryptopanic:
-            # we assume we have a function get_cryptopanic_sentiment_today() or so,
-            # or we can store it in aggregator_data directly.
-            # We'll do a simple approach:
-            cryptopanic_sent = self._fetch_daily_cryptopanic_sentiment()
-            galaxy_score, alt_rank = self._fetch_lunarcrush_metrics(pair)
-
-            return {
-                "avg_price": float(avg_p),
-                "min_price": float(min_p),
-                "max_price": float(max_p),
-                "total_volume": float(vol_sum),
-                "pair": pair,
-                "timestamp": time.time(),
-                "cryptopanic_sentiment": cryptopanic_sent,
-                "galaxy_score": galaxy_score,
-                "alt_rank": alt_rank
-            }
-        except Exception as e:
-            logger.exception(f"Error aggregator data for {pair}: {e}")
-            return {}
-        finally:
-            conn.close()
-
-    def _fetch_daily_cryptopanic_sentiment(self) -> float:
-        """
-        Example: fetch daily average from cryptopanic_news for today's date,
-        or just return 0 if none.
-        """
-        from datetime import datetime, timezone
-        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        conn = sqlite3.connect(DB_FILE)
-        try:
-            c = conn.cursor()
-            query = f"""
-                SELECT avg(sentiment_score)
-                FROM cryptopanic_news
-                WHERE DATE(timestamp, 'unixepoch') = '{today_str}'
-            """
-            row = c.execute(query).fetchone()
-            if row and row[0] is not None:
-                return float(row[0])
-            return 0.0
-        except Exception as e:
-            logger.exception(f"Error fetching daily cryptopanic sentiment: {e}")
-            return 0.0
-        finally:
-            conn.close()
-
-    def _fetch_lunarcrush_metrics(self, pair: str):
-        """
-        If your pair is "ETH/USD", symbol might be "ETH".
-        We'll just do a minimal approach returning galaxy_score and alt_rank from the last row.
-        """
-        symbol = pair.split("/")[0].upper()
-        conn = sqlite3.connect(DB_FILE)
-        try:
-            c = conn.cursor()
-            c.execute("""
-                SELECT galaxy_score, alt_rank
-                FROM lunarcrush_data
-                WHERE symbol=?
-                ORDER BY timestamp DESC
-                LIMIT 1
-            """, (symbol,))
-            row = c.fetchone()
-            if row:
-                return float(row[0] or 0.0), int(row[1] or 0)
-            return 0.0, 0
-        except Exception as e:
-            logger.exception(f"Error fetching lunarcrush for {symbol}: {e}")
-            return 0.0, 0
-        finally:
-            conn.close()
-
-# ------------------------------------------------------------------------------
-# Custom WebSocket client that calls app.on_tick
-# ------------------------------------------------------------------------------
-class CustomKrakenWSClient(KrakenWSClient):
-    def __init__(self, pairs, feed_type, app_ref):
-        super().__init__(pairs, feed_type)
-        self.app_ref = app_ref
-
-    async def _handle_message(self, message: str):
-        import json
-        try:
-            data = json.loads(message)
-            if isinstance(data, dict):
-                event_type = data.get("event")
-                if event_type in ["subscribe", "subscriptionStatus", "heartbeat", "systemStatus"]:
-                    logger.debug(f"WS event: {data}")
-                return
-
-            if isinstance(data, list) and len(data) >= 4:
-                feed_name = data[2]
-                pair = data[3]
-                if feed_name == "ticker":
-                    update_obj = data[1]
-                    last_trade_info = update_obj.get("c", [])
-                    if len(last_trade_info) > 0:
-                        last_price = float(last_trade_info[0])
-                        # call aggregator cycle if needed
-                        self.app_ref.on_tick(pair, last_price)
-                # store in DB anyway
-                await super()._handle_message(message)
-
-        except Exception as e:
-            logger.exception(f"Error in custom WS handle_message: {e}")
-
-# ------------------------------------------------------------------------------
-# Main function
-# ------------------------------------------------------------------------------
 def main():
-    logger.info("Starting advanced main app with aggregator approach + DB-based positions + GPT context.")
+    logging.config.dictConfig(LOG_CONFIG)
+    # requests & urllib3 logs at DEBUG, root at INFO below.
+
+    CONFIG_FILE = "config.yaml"
+    with open(CONFIG_FILE, "r") as f:
+        config = yaml.safe_load(f)
+
+    ENABLE_TRAINING = config.get("enable_training", True)
+    print(f"Loaded config: {config}")
+    ENABLE_LIVE_AI_INFERENCE = config.get("enable_live_ai_inference", True)
+    ENABLE_GPT_INTEGRATION = config.get("enable_gpt_integration", True)
+    TRADED_PAIRS = config.get("traded_pairs", [])
+    DB_FILE = "trades.db"
+    AGGREGATOR_INTERVAL_SECONDS = config.get("trade_interval_seconds", 60)
+
+    load_dotenv()
+    KRAKEN_API_KEY = os.getenv("KRAKEN_API_KEY", "FAKE_KEY")
+    KRAKEN_API_SECRET = os.getenv("KRAKEN_SECRET_API_KEY", "FAKE_SECRET")
 
     # 1) init DB
     init_db()
 
-    # 2) Possibly training
+    # 2) Possibly run training
     if ENABLE_TRAINING:
         fetch_cryptopanic_data()
         fetch_lunarcrush_data()
@@ -273,33 +111,62 @@ def main():
     else:
         logger.info("Skipping training step per config.")
 
-    # 3) Decide AI or dummy
-    if ENABLE_LIVE_AI_INFERENCE:
-        ai_model = ai_strategy.AIStrategy(
-            pairs=TRADED_PAIRS,
-            model_path="trained_model.pkl",
-            use_openai=ENABLE_GPT_INTEGRATION
-        )
-        logger.info(f"AIStrategy loaded with pairs: {TRADED_PAIRS}, GPT={ENABLE_GPT_INTEGRATION}")
-    else:
-        from ai_strategy import AIStrategy
-        class DummyStrategy:
-            def predict(self, market_data: dict):
-                return ("HOLD", 0.0)
-        ai_model = DummyStrategy()
-        logger.info("DummyStrategy, no AI inference used.")
+    # 3) AIStrategy creation
+    model_path = "trained_model.pkl" if os.path.exists("trained_model.pkl") else None
+    ai_model = AIStrategy(
+        pairs=TRADED_PAIRS,
+        model_path=model_path,
+        use_openai=ENABLE_GPT_INTEGRATION,
+        max_position_size=0.001,
+        stop_loss_pct=0.05,
+        take_profit_pct=0.01,
+        max_daily_drawdown=-0.02
+    )
+    logger.info(f"AIStrategy loaded with pairs={TRADED_PAIRS}, GPT={ENABLE_GPT_INTEGRATION}")
 
-    # 4) Create the aggregator-based HybridApp
+    # A Hybrid aggregator approach:
+    class HybridApp:
+        """
+        A minimal aggregator approach that calls AIStrategy after a certain time
+        has elapsed. Each new ticker update calls on_tick(...).
+        """
+        def __init__(self, pairs, strategy, aggregator_interval=60):
+            self.pairs = pairs
+            self.strategy = strategy
+            self.aggregator_interval = aggregator_interval
+            self.last_call_ts = {p: 0 for p in pairs}
+
+        def on_tick(self, pair: str, last_price: float):
+            now = time.time()
+            if (now - self.last_call_ts[pair]) >= self.aggregator_interval:
+                self._aggregator_cycle(pair, last_price)
+                self.last_call_ts[pair] = int(now)
+
+        def _aggregator_cycle(self, pair: str, last_price: float):
+            # If you want advanced aggregator merges from DB or cryptopanic,
+            # do that here. For demonstration, we pass a minimal dictionary with "price".
+            aggregator_data = {
+                "pair": pair,
+                "price": last_price
+            }
+            self.strategy.predict(aggregator_data)
+
     app = HybridApp(
         pairs=TRADED_PAIRS,
-        ai_strategy=ai_model,
+        strategy=ai_model,
         aggregator_interval=AGGREGATOR_INTERVAL_SECONDS
     )
 
-    # 5) Start a custom WebSocket
-    ws_client = CustomKrakenWSClient(TRADED_PAIRS, feed_type="ticker", app_ref=app)
-    ws_client.start()
+    logger.debug("Starting Kraken WebSocket for public data with websockets approach.")
+    ws_client = KrakenWSClient(
+        pairs=TRADED_PAIRS,
+        feed_type="ticker",
+        api_key=KRAKEN_API_KEY,
+        api_secret=KRAKEN_API_SECRET,
+        on_ticker_callback=app.on_tick
+    )
 
+    ws_client.start()
     logger.info("Press Ctrl+C to exit the main loop.")
     try:
         while True:
@@ -309,6 +176,16 @@ def main():
     finally:
         ws_client.stop()
         logger.info("Stopped WebSocket and main app.")
+
+    # If you want private feed usage, you can do something like:
+    # token_json = get_ws_token(KRAKEN_API_KEY, KRAKEN_API_SECRET)
+    # if token_json and "result" in token_json and "token" in token_json["result"]:
+    #     token_str = token_json["result"]["token"]
+    #     logger.info(f"Retrieved token: {token_str}")
+    #     ws_client.connect_private_feed(token_str)
+    #     # subscribe private feed or send orders
+    # else:
+    #     logger.warning("Failed to retrieve token or parse it.")
 
 
 if __name__ == "__main__":
