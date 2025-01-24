@@ -194,11 +194,7 @@ def main():
     else:
         logger.warning("Failed to retrieve token or parse it.")
 
-    # 5) If we want private feed usage right away, we can plan to connect below.
-    # We'll do it after we instantiate the public feed client. For example:
-    # (We'll show it commented out, so it's optional for you to enable)
-
-    # 6) A Hybrid aggregator approach:
+    # 5) A Hybrid aggregator approach:
     class HybridApp:
         """
         A minimal aggregator approach that calls AIStrategy after a certain time
@@ -217,8 +213,6 @@ def main():
                 self.last_call_ts[pair] = int(now)
 
         def _aggregator_cycle(self, pair: str, last_price: float):
-            # If you want advanced aggregator merges from DB or cryptopanic,
-            # do that here. For demonstration, we pass a minimal dictionary with "price".
             aggregator_data = {
                 "pair": pair,
                 "price": last_price
@@ -231,24 +225,20 @@ def main():
         aggregator_interval=AGGREGATOR_INTERVAL_SECONDS
     )
 
-    logger.debug("Starting Kraken WebSocket for public data with websockets approach.")
+    logger.debug("Starting Kraken WebSocket.")
+    # 6) If you want to start in private feed from the get-go, pass start_in_private_feed=True
+    #    and private_token=token_str if desired. If you prefer to start public, keep them default.
     ws_client = KrakenWSClient(
         pairs=TRADED_PAIRS,
         feed_type="ticker",
         api_key=KRAKEN_API_KEY,
         api_secret=KRAKEN_API_SECRET,
-        on_ticker_callback=app.on_tick
+        on_ticker_callback=app.on_tick,
+        start_in_private_feed=False,
+        private_token=token_str
     )
 
-    # If you want to connect private feed BEFORE the main loop, do so here:
-    # if token_str:
-    #     logger.info("Connecting private feed now, before main loop.")
-    #     ws_client.connect_private_feed(token_str)
-    #     # Possibly subscribe to private endpoints or send private orders here.
-
     # 7) Start the WebSocket feed
-    if token_str:
-        ws_client.connect_private_feed(token_str)
     ws_client.start()
     logger.info("Press Ctrl+C to exit the main loop.")
     try:
@@ -260,9 +250,11 @@ def main():
         ws_client.stop()
         logger.info("Stopped WebSocket and main app.")
 
-    # (Optional) If you wanted to connect private feed after the loop,
-    # you'd do it below, but then it might be too late if the user interrupts.
-
+    # (Optional) If you want to connect private feed after we are already running
+    # public feed and have a token, you could do:
+    #   ws_client.connect_private_feed(token_str)
+    # But that might not forcibly switch until the next reconnect, or you can
+    # stop() and start() again if you want an immediate switch.
 
 if __name__ == "__main__":
     main()
