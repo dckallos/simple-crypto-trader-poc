@@ -4,11 +4,10 @@ enable_gpt_integration: true
 trade_interval_seconds: 60
 
 risk_controls:
-  initial_spending_account: 10000.0   # total USD or fiat we have for all trades
-  purchase_upper_limit_percent: 0.01  # means 1% of that total for a single trade => 100.0 max
-  minimum_buy_amount: 20.0           # we refuse to buy under $20 worth
-  max_position_value: 5000.0         # we won't hold more than $5k in any single sub-position
-  # etc.
+  initial_spending_account: 50.0
+  purchase_upper_limit_percent: 1.0
+  minimum_buy_amount: 6.0
+  max_position_value: 20.0
 
 traded_pairs:
   - ETH/USD
