@@ -9,24 +9,30 @@ A production-ready AIStrategy that:
 2) Loads/stores GPT conversation context in DB (table 'ai_context') if desired,
    so we can keep memory beyond single calls.
 3) Incorporates aggregator data (CryptoPanic, LunarCrush, etc.) in:
-   - scikit model features
-   - GPT prompts with optional function calls
+   - GPT prompts (full GPT-based logic)
+   - A fallback/dummy logic if GPT fails or is disabled
 4) Supports partial entries/exits, cost-basis recalculation, flipping from
    long to short, all at the sub-position level stored in the DB.
 5) Records a short rationale in 'ai_decisions' each time it decides
    (BUY, SELL, HOLD).
 
 Important:
-- The new openai Python library v1 uses `tools` and `tool_choice="auto"` (or "none")
-  when enabling function-calling. The model can return `finish_reason="tool_calls"`
-  if it decides to invoke a provided function. Inside `choice.message.tool_calls`,
-  you'll find `function.name` and `function.arguments`.
-- If GPT produces a normal text response (finish_reason="stop"), we parse text for
-  BUY/SELL/HOLD.
-- We also have an optional scikit model fallback (`_model_inference_realtime()`) and
-  a final fallback `_dummy_logic()` if no advanced logic is applicable.
-- We updated references to the message object so that they don't rely on `.get()`,
-  and changed `pd.read_sql_query` parameter passing to fix IDE warnings.
+- We have removed the scikit-based approach from `_model_inference_realtime`
+  in favor of purely GPT-based logic. If you wish to reintroduce a scikit
+  path, you can do so, but here we focus on a fully GPT-driven strategy.
+- The `_openai_inference(...)` method is our main path for deciding both
+  the direction (BUY/SELL/HOLD) and the position size, delegating the logic
+  to GPT.
+- We still do fallback logic if GPT fails or returns nonsense.
+
+We also rely on:
+- `risk_controls` in a dictionary for min buy amounts, max position cost, etc.
+- `risk_manager.py` for sub-position DB logic (stop-loss, take-profit).
+
+Usage:
+    In `main.py`, create AIStrategy(use_openai=True, risk_controls={...}),
+    pass aggregator data as a dict with "price", "cryptopanic_sentiment", etc.
+    Then call `predict(market_data)`. The result is (action, size).
 """
 
 import logging
@@ -53,8 +59,9 @@ from risk_manager import RiskManagerDB
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.DEBUG)
 
-# If your scikit model was trained on certain features:
 TRAIN_FEATURE_COLS = [
+    # Kept only if you want to compute advanced indicators in the future
+    # For a purely GPT approach, these might not be used at all.
     "feature_price",
     "feature_ma_3",
     "feature_spread",
@@ -72,10 +79,7 @@ TRAIN_FEATURE_COLS = [
 class AIStrategy:
     """
     AIStrategy class that decides whether to BUY, SELL, or HOLD using
-    either:
-      - GPT-based inference (with optional function_call usage)
-      - A trained scikit model
-      - A fallback/dummy logic
+    GPT-based logic, with a fallback/dummy approach if GPT is unavailable.
 
     Sub-positions are managed in the DB via RiskManagerDB. We do not
     store position data in memory here.
@@ -89,7 +93,7 @@ class AIStrategy:
     def __init__(
         self,
         pairs=None,
-        model_path: Optional[str] = None,
+        model_path: Optional[str] = None,  # no longer used, but we keep the param for backward compatibility
         use_openai: bool = False,
         # risk_manager settings => pass to RiskManagerDB:
         max_position_size: float = 0.001,
@@ -101,46 +105,31 @@ class AIStrategy:
     ):
         """
         :param pairs: e.g. ["XBT/USD", "ETH/USD"].
-        :param model_path: Path to a .pkl scikit model if any.
-        :param use_openai: If True, attempt GPT-based inference with function-calling.
-        :param max_position_size: For RiskManagerDB => clamp trade sizes.
+        :param model_path: Previously used for scikit. Retained for backward compat, not used now.
+        :param use_openai: If True, attempt GPT-based inference with function-calling or text parsing.
+        :param max_position_size: For RiskManagerDB => clamp trade sizes in quantity terms if you wish.
         :param stop_loss_pct: e.g. 5% => auto-close if we drop that far.
         :param take_profit_pct: e.g. 10% => auto-close if we gain that much.
         :param max_daily_drawdown: e.g. -2% => skip new trades below that PnL.
         :param risk_controls: optional dict with user constraints, e.g.:
               {
-                "initial_spending_account": 10000.0,
-                "purchase_upper_limit_percent": 0.01,
-                "minimum_buy_amount": 20.0,
-                "max_position_value": 5000.0
+                "initial_spending_account": 50.0,
+                "purchase_upper_limit_percent": 1.0,
+                "minimum_buy_amount": 10.0,
+                "max_position_value": 50.0
               }
         """
         self.pairs = pairs if pairs else ["XBT/USD"]
         self.use_openai = use_openai
-        self.model = None
+        self.model = None  # scikit model is no longer used
         self.risk_controls = risk_controls or {}
 
-        # Attempt to load scikit model if provided
-        if model_path and os.path.exists(model_path):
-            try:
-                self.model = joblib.load(model_path)
-                logger.info(f"AIStrategy: Model loaded from '{model_path}'")
-            except Exception as e:
-                logger.exception(f"Error loading scikit model: {e}")
-        else:
-            if model_path:
-                logger.warning(f"No file at '{model_path}'. Using fallback logic.")
-            else:
-                logger.info("No model_path => fallback logic if GPT not used.")
-
-        # GPT setup
         load_dotenv()
         openai_api_key = os.getenv("OPENAI_API_KEY", "")
         from openai import OpenAI
         self.client = OpenAI(api_key=openai_api_key)
         logger.info("OpenAI client instantiated in AIStrategy.")
 
-        # RiskManager for DB-based sub-positions
         self.risk_manager_db = RiskManagerDB(
             db_path=DB_FILE,
             max_position_size=max_position_size,
@@ -221,8 +210,8 @@ class AIStrategy:
     def predict(self, market_data: dict):
         """
         Top-level method to produce a final (action, size).
-        Also forcibly calls check_stop_loss_take_profit for the given pair.
-        Then tries GPT, scikit, or fallback logic.
+        Also forcibly calls check_stop_loss_take_profit for the given pair
+        before or after the GPT logic. Then tries GPT or fallback logic.
         """
         pair = market_data.get("pair", self.pairs[-1])
         current_price = market_data.get("price", 0.0)
@@ -235,35 +224,35 @@ class AIStrategy:
         # forced closures first:
         self.risk_manager_db.check_stop_loss_take_profit(pair, current_price)
 
-        # GPT approach:
+        # GPT-based approach
         if self.use_openai:
             try:
-                return self._openai_inference(market_data)
+                return self._full_gpt_inference(market_data)
             except Exception as e:
                 logger.exception(f"OpenAI inference failed: {e}")
                 return self._dummy_logic(market_data)
-        # scikit approach:
-        elif self.model:
-            try:
-                return self._model_inference_realtime(market_data)
-            except Exception as e:
-                logger.exception(f"Scikit inference error: {e}")
-                return self._dummy_logic(market_data)
-        # fallback:
+        # fallback if use_openai=False
         else:
             return self._dummy_logic(market_data)
 
     # --------------------------------------------------------------------------
-    # GPT-based approach with function calling
+    # Full GPT approach
     # --------------------------------------------------------------------------
-    def _openai_inference(self, market_data: dict):
+    def _full_gpt_inference(self, market_data: dict):
+        """
+        We rely entirely on GPT to decide both direction and size.
+
+        We build a prompt that includes aggregator data, recent trades summary,
+        plus any risk controls. GPT returns a JSON with {action, size} or text
+        that we parse.
+        """
         pair = market_data.get("pair", "UNKNOWN")
         price = market_data.get("price", 0.0)
         cpanic = market_data.get("cryptopanic_sentiment", 0.0)
         galaxy = market_data.get("galaxy_score", 0.0)
         alt_rank = market_data.get("alt_rank", 0)
         base_rationale = (
-            f"GPT-based => pair={pair}, price={price}, "
+            f"Full GPT => pair={pair}, price={price}, "
             f"cryptopanic={cpanic}, galaxy={galaxy}, alt_rank={alt_rank}"
         )
 
@@ -275,250 +264,68 @@ class AIStrategy:
             "role": "system",
             "content": (
                 "You are an advanced crypto trading assistant. The user provides aggregator data. "
-                "You may produce a function call to finalize your trade decision. "
-                "Respect numeric constraints from the user for position sizing. "
-                "Possible actions: BUY, SELL, HOLD. If HOLD => size=0. "
-                "You can also respond with normal text if you prefer."
+                "You must produce a single final action among [BUY, SELL, HOLD] plus a 'size'. If HOLD => size=0. "
+                "Obey the user's risk constraints for min buy, max cost, etc."
             )
         }
+        # risk controls if present
+        rc = self.risk_controls
         user_text = (
             f"GPT context:\n{self.gpt_context}\n\n"
             f"Aggregator:\n  pair={pair}, price={price}, cryptopanic={cpanic}, galaxy={galaxy}, alt_rank={alt_rank}\n"
             f"Recent trades:\n{summary}\n"
+            f"\nConstraints:\n"
+            f"  initial_spending_account={rc.get('initial_spending_account',0.0)}\n"
+            f"  purchase_upper_limit_percent={rc.get('purchase_upper_limit_percent',1.0)}\n"
+            f"  minimum_buy_amount={rc.get('minimum_buy_amount',0.0)}\n"
+            f"  max_position_value={rc.get('max_position_value',999999.0)}\n"
+            "\nPlease respond with a JSON object: {\"action\":..., \"size\":...} "
+            "where action is BUY, SELL, or HOLD, and size is a float. If you hold, size=0."
         )
-        # risk controls if present
-        if self.risk_controls:
-            rc = self.risk_controls
-            user_text += (
-                "\nConstraints:\n"
-                f"  initial_spending_account={rc.get('initial_spending_account',0.0)}\n"
-                f"  purchase_upper_limit_percent={rc.get('purchase_upper_limit_percent',0.0)}\n"
-                f"  minimum_buy_amount={rc.get('minimum_buy_amount',0.0)}\n"
-                f"  max_position_value={rc.get('max_position_value',0.0)}\n"
-                "In other words, do not produce a BUY that exceeds these constraints.\n"
-            )
-
-        user_text += (
-            "\nPlease propose a single final action. If you want to call a function, use the 'trade_decision' function."
-        )
-
         user_msg = {"role": "user", "content": user_text}
 
-        # Tools array - for function calling
-        # The example function: "trade_decision" => produce an action + size
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "trade_decision",
-                    "description": (
-                        "Propose an action among BUY, SELL, HOLD with a 'size' value."
-                        "If action=HOLD => size=0"
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "action": {
-                                "type": "string",
-                                "enum": ["BUY","SELL","HOLD"]
-                            },
-                            "size": {
-                                "type": "number",
-                                "description": "Trade quantity or volume, e.g. 0.0005"
-                            }
-                        },
-                        "required": ["action","size"]
-                    },
-                }
-            }
-        ]
-
-        # Call OpenAI
+        # We'll do a simpler approach: we pass no function calls, just parse JSON from text
         response = self.client.chat.completions.create(
-            model="gpt-o1-mini",
+            model="o1-mini",
             messages=[system_msg, user_msg],
-            tools=tools,
-            tool_choice="auto",
             temperature=0.0,
-            max_completion_tokens=500
+            max_completion_tokens=5000
         )
+        print(response)
         logger.debug(f"GPT response: {response}")
 
-        # Let's parse the first choice
         if not response.choices:
+            # fallback => hold
             rationale = f"No GPT choices => fallback. {base_rationale}"
             self._store_decision(pair, "HOLD", 0.0, rationale)
             return ("HOLD", 0.0)
 
         choice = response.choices[0]
         finish_reason = choice.finish_reason
+        msg_content = choice.message.content or ""
         logger.info(f"GPT finish_reason={finish_reason}")
 
-        # If GPT used a tool call => parse .tool_calls
-        if finish_reason in ("tool_calls", "function_call"):
-            # function_call is deprecated, but we check it in case the model uses it
-            tool_calls = choice.message.tool_calls or []
-            if not tool_calls:
-                # fallback if no actual function call
-                rationale = f"No tool_calls => fallback. {base_rationale}"
-                self._store_decision(pair, "HOLD", 0.0, rationale)
-                return ("HOLD", 0.0)
-
-            # We'll handle the first tool call
-            first_call = tool_calls[0]
-            fn_call = first_call.function
-            fn_args_str = fn_call.arguments if fn_call else "{}"
-
-            try:
-                parsed_args = json.loads(fn_args_str)
-            except json.JSONDecodeError:
-                rationale = f"Cannot parse function args => fallback. {base_rationale}"
-                self._store_decision(pair, "HOLD", 0.0, rationale)
-                return ("HOLD", 0.0)
-
-            action = parsed_args.get("action", "HOLD").upper()
-            size_suggested = float(parsed_args.get("size", 0.0))
-
-            # post-validate
-            final_signal, final_size = self._post_validate_and_adjust(action, size_suggested, price)
-            # risk manager
-            final_signal, final_size = self.risk_manager_db.adjust_trade(
-                final_signal, final_size, pair, price
-            )
-            # store
-            full_rationale = f"GPT function_call => trade_decision => {base_rationale}"
-            if final_signal in ("BUY", "SELL") and final_size > 0:
-                record_trade_in_db(final_signal, final_size, price, "GPT_DECISION_FUNC", pair)
-            self._store_decision(pair, final_signal, final_size, full_rationale)
-            self._append_gpt_context(f"fn_call => action={final_signal}, size={final_size}")
-            return (final_signal, final_size)
-        else:
-            # normal text => parse content
-            content_text = choice.message.content or ""
-            if "BUY" in content_text.upper():
-                action = "BUY"
-                size_suggested = 0.0005
-            elif "SELL" in content_text.upper():
-                action = "SELL"
-                size_suggested = 0.0005
-            else:
-                action = "HOLD"
-                size_suggested = 0.0
-
-            # post-validate
-            final_signal, final_size = self._post_validate_and_adjust(action, size_suggested, price)
-
-            # risk manager
-            final_signal, final_size = self.risk_manager_db.adjust_trade(
-                final_signal, final_size, pair, price
-            )
-
-            rationale = f"GPT text => action={final_signal}, size={final_size}. {base_rationale}"
-            if final_signal in ("BUY", "SELL") and final_size > 0:
-                record_trade_in_db(final_signal, final_size, price, "GPT_DECISION_TEXT", pair)
-            self._store_decision(pair, final_signal, final_size, rationale)
-            self._append_gpt_context(f"GPT text => action={final_signal}, size={final_size}")
-            return (final_signal, final_size)
-
-    def _post_validate_and_adjust(self, action: str, size_suggested: float, current_price: float):
-        """
-        Ensures GPT suggestion doesn't exceed or drop below constraints
-        from self.risk_controls. For example, do not allow trade cost < minimum_buy_amount
-        or > purchase_upper_limit. Return the final (action, size).
-        """
-        if action not in ("BUY", "SELL"):
-            # For HOLD or unknown => size=0
-            return ("HOLD", 0.0)
-
-        cost = size_suggested * current_price
-        rc = self.risk_controls
-
-        # If risk_controls is empty, skip
-        if not rc:
-            # no constraints => pass through
-            return (action, size_suggested)
-
-        min_buy = rc.get("minimum_buy_amount", 0.0)
-        upper_percent = rc.get("purchase_upper_limit_percent", 1.0)
-        account_total = rc.get("initial_spending_account", 50.0)
-        purchase_upper = account_total * upper_percent
-
-        if action == "BUY":
-            # check min
-            if cost < min_buy:
-                logger.info(f"GPT suggests BUY => cost={cost} < {min_buy}, forcing HOLD instead.")
-                return ("HOLD", 0.0)
-            # check max
-            if cost > purchase_upper:
-                new_size = purchase_upper / max(current_price, 1e-9)
-                logger.info(
-                    f"GPT suggests BUY => cost={cost} > {purchase_upper}, clamping size to {new_size}"
-                )
-                return ("BUY", new_size)
-
-        # For SELL, we do not enforce the same cost-based constraints, though you could if needed.
-        return (action, size_suggested)
-
-    # -----------------x    ---------------------------------------------------------
-    # scikit approach
-    # --------------------------------------------------------------------------
-    def _model_inference_realtime(self, market_data: dict):
-        pair = market_data.get("pair", self.pairs[-1])
-        snap_price = market_data.get("price", 0.0)
-        if snap_price <= 0.0:
-            rationale = f"No valid price => scikit fallback => HOLD for {pair}"
-            self._store_decision(pair, "HOLD", 0.0, rationale)
-            return ("HOLD", 0.0)
-
-        df_recent = self._fetch_recent_price_data(pair, limit=50)
-        if df_recent.empty:
-            rationale = f"No data => scikit => HOLD for {pair}"
-            self._store_decision(pair, "HOLD", 0.0, rationale)
-            return ("HOLD", 0.0)
-
-        # Optionally load BTC for correlation
-        btc_df = None
-        if pair != "XBT/USD":
-            btc_df = self._fetch_recent_price_data("XBT/USD", limit=50)
-
-        df_ind = self._compute_indicators(df_recent, btc_df)
-        df_ind["avg_sentiment"] = market_data.get("cryptopanic_sentiment", 0.0)
-
-        latest = df_ind.iloc[[-1]].copy()
-        for col in TRAIN_FEATURE_COLS:
-            if col not in latest.columns:
-                latest[col] = 0.0
-
-        X_in = latest[TRAIN_FEATURE_COLS]
-        prob_up = 0.5
-        if hasattr(self.model, "predict_proba"):
-            p = self.model.predict_proba(X_in)[0]
-            if len(p) > 1:
-                prob_up = p[1]
-        else:
-            label = self.model.predict(X_in)[0]
-            prob_up = 1.0 if label == 1 else 0.0
-
-        rationale = f"scikit => prob_up={prob_up:.2f} for {pair}"
-        action = "HOLD"
-        size_suggested = 0.0
-        if prob_up > 0.6:
-            action = "BUY"
-            size_suggested = 0.0005
-        elif prob_up < 0.4:
-            action = "SELL"
-            size_suggested = 0.0005
+        # parse JSON from msg_content
+        try:
+            parsed = json.loads(msg_content)
+            action = parsed.get("action", "HOLD").upper()
+            size_suggested = float(parsed.get("size", 0.0))
+        except json.JSONDecodeError:
+            logger.warning("Could not parse GPT content as JSON => fallback hold.")
+            action = "HOLD"
+            size_suggested = 0.0
 
         # post-validate
-        final_signal, final_size = self._post_validate_and_adjust(action, size_suggested, snap_price)
+        final_signal, final_size = self._post_validate_and_adjust(action, size_suggested, price)
         final_signal, final_size = self.risk_manager_db.adjust_trade(
-            final_signal, final_size, pair, snap_price
+            final_signal, final_size, pair, price
         )
 
         if final_signal in ("BUY", "SELL") and final_size > 0:
-            record_trade_in_db(final_signal, final_size, snap_price, "MODEL_DECISION", pair)
-        rationale += f" => final={final_signal}, size={final_size}"
+            record_trade_in_db(final_signal, final_size, price, "GPT_DECISION", pair)
+        rationale = f"GPT => final={final_signal}, size={final_size}. {base_rationale}"
         self._store_decision(pair, final_signal, final_size, rationale)
+        self._append_gpt_context(f"GPT => action={final_signal}, size={final_size}")
         return (final_signal, final_size)
 
     # --------------------------------------------------------------------------
@@ -532,8 +339,12 @@ class AIStrategy:
         pair = market_data.get("pair", self.pairs[-1])
         px = market_data.get("price", 0.0)
         if px < 20000:
-            final_signal, final_size = self.risk_manager_db.adjust_trade("BUY", 0.0005, pair, px)
-            rationale = f"Dummy => BUY for price < 20000 => {final_size}"
+            # We do a final clamp
+            final_signal, final_size = self._post_validate_and_adjust("BUY", 0.0005, px)
+            final_signal, final_size = self.risk_manager_db.adjust_trade(
+                final_signal, final_size, pair, px
+            )
+            rationale = f"Dummy => price < 20000 => {final_signal}, size={final_size}"
             if final_signal == "BUY" and final_size > 0:
                 record_trade_in_db(final_signal, final_size, px, "DUMMY_DECISION", pair)
             self._store_decision(pair, final_signal, final_size, rationale)
@@ -544,22 +355,73 @@ class AIStrategy:
             return ("HOLD", 0.0)
 
     # --------------------------------------------------------------------------
-    # Data / Indicators
+    # validate & adjust
     # --------------------------------------------------------------------------
-    def _fetch_recent_price_data(self, pair: str, limit=50) -> pd.DataFrame:
+    def _post_validate_and_adjust(self, action: str, size_suggested: float, current_price: float):
+        """
+        Ensures GPT suggestion or fallback suggestion doesn't exceed or drop
+        below constraints from self.risk_controls. For example, do not allow
+        trade cost < minimum_buy_amount or > purchase_upper_limit. Return final.
+
+        If action is not in ("BUY", "SELL"), we do ("HOLD", 0.0).
+        """
+        if action not in ("BUY", "SELL"):
+            return ("HOLD", 0.0)
+
+        cost = size_suggested * current_price
+        rc = self.risk_controls
+
+        if not rc:  # no constraints => pass through
+            return (action, size_suggested)
+
+        min_buy = rc.get("minimum_buy_amount", 0.0)
+        upper_percent = rc.get("purchase_upper_limit_percent", 1.0)
+        account_total = rc.get("initial_spending_account", 9999999.0)
+        purchase_upper = account_total * upper_percent
+
+        # If BUY => check min
+        if action == "BUY":
+            if cost < min_buy:
+                logger.info(f"GPT suggests BUY => cost={cost} < min_buy={min_buy}, forcing HOLD.")
+                return ("HOLD", 0.0)
+            if cost > purchase_upper:
+                new_size = purchase_upper / max(current_price, 1e-9)
+                logger.info(
+                    f"GPT suggests BUY => cost={cost} > purchase_upper={purchase_upper}, clamping size={new_size}"
+                )
+                return ("BUY", new_size)
+
+        # For SELL, or if no violation => pass
+        return (action, size_suggested)
+
+    # --------------------------------------------------------------------------
+    # Data / Indicators (optional if you want advanced aggregator or indicator usage)
+    # --------------------------------------------------------------------------
+    def _fetch_recent_price_data(self, pair: str, limit: int = 50) -> pd.DataFrame:
+        """
+        Fetch up to `limit` rows of the most recent price data for `pair` from the
+        'price_history' table, then return them in ascending order by timestamp.
+
+        Using named placeholders (:pair, :limit) can address certain IDE warnings
+        about param typing in pd.read_sql_query.
+        """
         conn = sqlite3.connect(DB_FILE)
         try:
-            q = """
+            query = """
                 SELECT
-                  timestamp, pair, bid_price, ask_price, last_price, volume
+                  timestamp,
+                  pair,
+                  bid_price,
+                  ask_price,
+                  last_price,
+                  volume
                 FROM price_history
-                WHERE pair=?
+                WHERE pair = :pair
                 ORDER BY id DESC
-                LIMIT ?
+                LIMIT :limit
             """
-            # Use a list for params instead of tuple
-            df = pd.read_sql_query(q, conn, params=[pair, limit])
-            # reverse so earliest is first
+            # Using a dictionary for params can help IDEs understand the param types
+            df = pd.read_sql_query(query, conn, params={"pair": pair, "limit": limit})
             df = df.iloc[::-1].reset_index(drop=True)
             return df
         except Exception as e:
@@ -569,6 +431,10 @@ class AIStrategy:
             conn.close()
 
     def _compute_indicators(self, df: pd.DataFrame, df_btc: pd.DataFrame = None) -> pd.DataFrame:
+        """
+        We keep this function if you want advanced indicators to pass to GPT in aggregator data,
+        or to store them for debugging. But the current code doesn't necessarily use them for logic.
+        """
         if df.empty or "last_price" not in df.columns:
             return pd.DataFrame()
 
