@@ -7,10 +7,12 @@ main.py
 A mature application that:
 1) Initializes the DB (init_db from db.py).
 2) Optionally runs training if config says so (fetch_cryptopanic, fetch_lunarcrush, then train_model).
-3) Starts a Kraken WebSocket feed for real-time data, storing it in price_history.
-4) Uses aggregator intervals to pass data to AIStrategy (with GPT or scikit).
-5) Forcibly closes sub-positions if RiskManager triggers stop-loss or take-profit.
-6) Demonstrates how to connect to the private feed for order management if desired.
+3) Retrieves a Kraken WebSockets token (if desired), enabling private feed usage.
+4) Starts a Kraken WebSocket feed for real-time data, storing it in price_history.
+5) Uses aggregator intervals to pass data to AIStrategy (with GPT or scikit).
+6) Forcibly closes sub-positions if RiskManager triggers stop-loss or take-profit.
+7) Demonstrates how to connect to the private feed for order management if desired,
+   before any user interruption (Ctrl+C) occurs.
 
 Key Points:
 - We rely on 'ai_strategy.py' to store decisions in 'ai_decisions' for each final action.
@@ -46,6 +48,7 @@ import pandas as pd
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
+# Suppress SettingWithCopyWarning from pandas
 warnings.simplefilter(action="ignore", category=pd.errors.SettingWithCopyWarning)
 
 LOG_CONFIG = {
@@ -83,9 +86,7 @@ LOG_CONFIG = {
     }
 }
 
-# ------------------------------------------------------------------------------
-# A small function to retrieve a Kraken WebSockets token
-# ------------------------------------------------------------------------------
+
 def get_ws_token(api_key, api_secret):
     """
     Retrieves a WebSockets authentication token from Kraken's REST API.
@@ -171,7 +172,6 @@ def main():
 
     # 3) AIStrategy creation
     model_path = "trained_model.pkl" if os.path.exists("trained_model.pkl") else None
-
     ai_model = AIStrategy(
         pairs=TRADED_PAIRS,
         model_path=model_path,
@@ -184,7 +184,21 @@ def main():
     )
     logger.info(f"AIStrategy loaded with pairs={TRADED_PAIRS}, GPT={ENABLE_GPT_INTEGRATION}")
 
-    # A Hybrid aggregator approach:
+    # 4) (Optional) Retrieve the Kraken WebSockets token BEFORE main loop, to ensure
+    # it's accessible prior to any user interruption.
+    token_json = get_ws_token(KRAKEN_API_KEY, KRAKEN_API_SECRET)
+    token_str = None
+    if token_json and "result" in token_json and "token" in token_json["result"]:
+        token_str = token_json["result"]["token"]
+        logger.info(f"Retrieved token: {token_str}")
+    else:
+        logger.warning("Failed to retrieve token or parse it.")
+
+    # 5) If we want private feed usage right away, we can plan to connect below.
+    # We'll do it after we instantiate the public feed client. For example:
+    # (We'll show it commented out, so it's optional for you to enable)
+
+    # 6) A Hybrid aggregator approach:
     class HybridApp:
         """
         A minimal aggregator approach that calls AIStrategy after a certain time
@@ -226,6 +240,15 @@ def main():
         on_ticker_callback=app.on_tick
     )
 
+    # If you want to connect private feed BEFORE the main loop, do so here:
+    # if token_str:
+    #     logger.info("Connecting private feed now, before main loop.")
+    #     ws_client.connect_private_feed(token_str)
+    #     # Possibly subscribe to private endpoints or send private orders here.
+
+    # 7) Start the WebSocket feed
+    if token_str:
+        ws_client.connect_private_feed(token_str)
     ws_client.start()
     logger.info("Press Ctrl+C to exit the main loop.")
     try:
@@ -237,16 +260,8 @@ def main():
         ws_client.stop()
         logger.info("Stopped WebSocket and main app.")
 
-
-    # If you want private feed usage, you can do something like:
-    token_json = get_ws_token(KRAKEN_API_KEY, KRAKEN_API_SECRET)
-    if token_json and "result" in token_json and "token" in token_json["result"]:
-        token_str = token_json["result"]["token"]
-        logger.info(f"Retrieved token: {token_str}")
-        # ws_client.connect_private_feed(token_str)
-        # subscribe private feed or send orders
-    else:
-        logger.warning("Failed to retrieve token or parse it.")
+    # (Optional) If you wanted to connect private feed after the loop,
+    # you'd do it below, but then it might be too late if the user interrupts.
 
 
 if __name__ == "__main__":
