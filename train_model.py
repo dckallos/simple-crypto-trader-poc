@@ -76,7 +76,7 @@ THRESHOLD_UP = 0.001  # +1%
 # ----------------------------------------------------------------------
 # Memory-limiting measure: limit maximum rows per pair
 # ----------------------------------------------------------------------
-MAX_ROWS_PER_PAIR = 500_000  # Adjust as needed to limit memory usage
+MAX_ROWS_PER_PAIR = 50_000  # Adjust as needed to limit memory usage
 
 
 # ------------------------------------------------------------------------------
@@ -827,4 +827,5 @@ def main():
 
 
 if __name__ == "__main__":
+    print(f'{__file__} is being run directly')
     main()

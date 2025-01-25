@@ -61,7 +61,6 @@ logging.basicConfig(level=logging.DEBUG)
 
 TRAIN_FEATURE_COLS = [
     # Kept only if you want to compute advanced indicators in the future
-    # For a purely GPT approach, these might not be used at all.
     "feature_price",
     "feature_ma_3",
     "feature_spread",
@@ -97,8 +96,8 @@ class AIStrategy:
         use_openai: bool = False,
         # risk_manager settings => pass to RiskManagerDB:
         max_position_size: float = 0.001,
-        stop_loss_pct: float = 0.05,
-        take_profit_pct: float = 0.10,
+        stop_loss_pct: float = 0.04,
+        take_profit_pct: float = 0.01,
         max_daily_drawdown: float = -0.02,
         # optional dict of user-defined risk controls for GPT prompt & post-validate
         risk_controls: Optional[Dict[str, Any]] = None
@@ -109,7 +108,7 @@ class AIStrategy:
         :param use_openai: If True, attempt GPT-based inference with function-calling or text parsing.
         :param max_position_size: For RiskManagerDB => clamp trade sizes in quantity terms if you wish.
         :param stop_loss_pct: e.g. 5% => auto-close if we drop that far.
-        :param take_profit_pct: e.g. 10% => auto-close if we gain that much.
+        :param take_profit_pct: e.g. 10% => auto-close if we gain that far.
         :param max_daily_drawdown: e.g. -2% => skip new trades below that PnL.
         :param risk_controls: optional dict with user constraints, e.g.:
               {
@@ -238,9 +237,6 @@ class AIStrategy:
     # --------------------------------------------------------------------------
     # Full GPT approach
     # --------------------------------------------------------------------------
-    # --------------------------------------------------------------------------
-    # Full GPT approach
-    # --------------------------------------------------------------------------
     def _full_gpt_inference(self, market_data: dict):
         """
         We rely entirely on GPT to decide both direction and size.
@@ -257,7 +253,6 @@ class AIStrategy:
         cpanic = market_data.get("cryptopanic_sentiment", 0.0)
         galaxy = market_data.get("galaxy_score", 0.0)
         alt_rank = market_data.get("alt_rank", 0)
-        print(market_data)
         base_rationale = (
             f"Full GPT => pair={pair}, price={price}, "
             f"cryptopanic={cpanic}, galaxy={galaxy}, alt_rank={alt_rank}"
@@ -269,23 +264,16 @@ class AIStrategy:
         # risk controls if present
         rc = self.risk_controls
 
-        # We'll use a "developer" role for high-level instructions about the output format.
+        # We'll use a "developer" role for instructions about output format.
         developer_msg = {
             "role": "assistant",
             "content": (
                 "You are an advanced crypto trading assistant. You must produce a single "
                 "final action among [BUY, SELL, HOLD] plus a 'size'. If HOLD => size=0. "
-                "Return your response as valid JSON only, without any markdown or code block formatting. "
-                "The JSON should have the following structure:\n"
-                "{\"action\":\"BUY|SELL|HOLD\",\"size\":float}\n\n"
-                "Obey these constraints:\n"
-                "- If the cost (size * price) < minimum_buy_amount, set action to HOLD and size to 0.\n"
-                "- If the cost > purchase_upper_limit, clamp the size so that cost equals purchase_upper_limit.\n"
-                "- Do not include any additional text, explanations, or formatting."
+                "Return your response as valid JSON only, e.g.: {\"action\":\"BUY\",\"size\":0.001}."
             )
         }
 
-        # We'll place aggregator data, GPT context, and constraints into a "user" role.
         user_text = (
             f"GPT context:\n{self.gpt_context}\n\n"
             f"Aggregator:\n  pair={pair}, price={price}, "
@@ -298,15 +286,14 @@ class AIStrategy:
             f"  max_position_value={rc.get('max_position_value', 999999.0)}\n"
             "\nPlease respond with ONLY the JSON object as specified above."
         )
-
         user_msg = {"role": "user", "content": user_text}
 
-        # We'll do a simpler approach: pass no function calls, just parse JSON from the assistant text
         print(f'GPT prompt: \ndeveloper message: {developer_msg}, \nuser message: {user_msg}')
         response = self.client.chat.completions.create(
             model="o1-mini",
             messages=[developer_msg, user_msg],
-            max_completion_tokens=5000
+            temperature=1.0,
+            max_completion_tokens=7000
         )
         print(response)
         logger.debug(f"GPT response: {response}")
@@ -322,35 +309,15 @@ class AIStrategy:
         msg_content = choice.message.content or ""
         logger.info(f"GPT finish_reason={finish_reason}")
 
-        # Remove any potential surrounding whitespace
         msg_content = msg_content.strip()
 
-        # Ensure the response does not contain markdown or code blocks
-        if msg_content.startswith("```") and msg_content.endswith("```"):
-            # Attempt to extract JSON from within the code block
-            try:
-                # Find the first newline after the opening ```
-                first_newline = msg_content.find("\n")
-                if first_newline != -1:
-                    # Extract the content between the first newline and the closing ```
-                    json_str = msg_content[first_newline + 1:-3].strip()
-                else:
-                    # If no newline, assume everything between ``` and ``` is JSON
-                    json_str = msg_content[3:-3].strip()
-                parsed = json.loads(json_str)
-            except json.JSONDecodeError:
-                logger.warning("Could not parse GPT content as JSON within code blocks => fallback hold.")
-                action = "HOLD"
-                size_suggested = 0.0
-        else:
-            # Direct JSON response
-            try:
-                parsed = json.loads(msg_content)
-            except json.JSONDecodeError:
-                logger.warning("Could not parse GPT content as JSON => fallback hold.")
-                parsed = {}
+        # Attempt to parse JSON
+        try:
+            parsed = json.loads(msg_content)
+        except json.JSONDecodeError:
+            logger.warning("Could not parse GPT content as JSON => fallback hold.")
+            parsed = {}
 
-        # Extract action and size from parsed JSON
         action = parsed.get("action", "HOLD").upper()
         size_suggested = float(parsed.get("size", 0.0)) if "size" in parsed else 0.0
 
@@ -378,7 +345,6 @@ class AIStrategy:
         pair = market_data.get("pair", self.pairs[-1])
         px = market_data.get("price", 0.0)
         if px < 20000:
-            # We do a final clamp
             final_signal, final_size = self._post_validate_and_adjust("BUY", 0.0005, px)
             final_signal, final_size = self.risk_manager_db.adjust_trade(
                 final_signal, final_size, pair, px
@@ -440,9 +406,6 @@ class AIStrategy:
         """
         Fetch up to `limit` rows of the most recent price data for `pair` from the
         'price_history' table, then return them in ascending order by timestamp.
-
-        Using named placeholders (:pair, :limit) can address certain IDE warnings
-        about param typing in pd.read_sql_query.
         """
         conn = sqlite3.connect(DB_FILE)
         try:
@@ -459,7 +422,6 @@ class AIStrategy:
                 ORDER BY id DESC
                 LIMIT :limit
             """
-            # Using a dictionary for params can help IDEs understand the param types
             df = pd.read_sql_query(query, conn, params={"pair": pair, "limit": limit})
             df = df.iloc[::-1].reset_index(drop=True)
             return df

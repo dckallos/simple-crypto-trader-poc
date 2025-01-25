@@ -6,21 +6,11 @@ main.py
 
 A mature application that:
 1) Initializes the DB (init_db from db.py).
-2) Optionally runs training if config says so (fetch_cryptopanic, fetch_lunarcrush, then train_model).
+2) Optionally runs training if config says so.
 3) Retrieves a Kraken WebSockets token (if desired), enabling private feed usage.
 4) Starts a Kraken WebSocket feed for real-time data, storing it in price_history.
 5) Uses aggregator intervals to pass data to AIStrategy (with GPT or scikit).
-6) Forcibly closes sub-positions if RiskManager triggers stop-loss or take-profit.
-7) Demonstrates how to connect to the private feed for order management if desired,
-   before any user interruption (Ctrl+C) occurs.
-
-Key Points:
-- We rely on 'ai_strategy.py' to store decisions in 'ai_decisions' for each final action.
-- We unify aggregator data so that 'market_data["price"]' is recognized by AIStrategy.
-- We remove any leftover snippet that might spam direct record_trade_in_db("BUY", ...).
-
-Everything else remains consistent with your multi-position logic,
-private feed placeholders, etc.
+6) If the AIStrategy says BUY/SELL, calls send_order(...) on the private feed to place real trades.
 """
 
 import time
@@ -45,10 +35,9 @@ from ws_data_feed import KrakenWSClient
 import warnings
 import pandas as pd
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Suppress SettingWithCopyWarning from pandas
 warnings.simplefilter(action="ignore", category=pd.errors.SettingWithCopyWarning)
 
 LOG_CONFIG = {
@@ -68,10 +57,10 @@ LOG_CONFIG = {
         },
     },
     'loggers': {
-        '': {  # root logger
+        '': {
             'handlers': ['console'],
-            'level': 'INFO',
-            'propagate': False
+            'level': 'DEBUG',
+            'propagate': True
         },
         'requests': {
             'handlers': ['console'],
@@ -98,11 +87,6 @@ def get_ws_token(api_key, api_secret):
             "token": "..."
           }
         }
-    Parse out 'result'->'token' as needed.
-
-    :param api_key: Your Kraken API key string (with permission to access WebSockets).
-    :param api_secret: Your Kraken API secret (base64-encoded string).
-    :return: The full JSON response or None if error.
     """
     url = "https://api.kraken.com/0/private/GetWebSocketsToken"
     path = "/0/private/GetWebSocketsToken"
@@ -147,7 +131,7 @@ def main():
 
     # load risk_controls from config if present
     risk_controls = config.get("risk_controls", {
-        "initial_spending_account": 50.0,
+        "initial_spending_account": 40.0,
         "purchase_upper_limit_percent": 1.0,
         "minimum_buy_amount": 10.0,
         "max_position_value": 20.0
@@ -160,7 +144,7 @@ def main():
     # 1) init DB
     init_db()
 
-    # 2) Possibly run training
+    # 2) Optionally do training if configured (omitted in example)
     if ENABLE_TRAINING:
         fetch_cryptopanic_data()
         fetch_lunarcrush_data()
@@ -183,8 +167,7 @@ def main():
     )
     logger.info(f"AIStrategy loaded with pairs={TRADED_PAIRS}, GPT={ENABLE_GPT_INTEGRATION}")
 
-    # 4) (Optional) Retrieve the Kraken WebSockets token BEFORE main loop, to ensure
-    # it's accessible prior to any user interruption.
+    # 4) Retrieve the Kraken WebSockets token BEFORE main loop
     token_json = get_ws_token(KRAKEN_API_KEY, KRAKEN_API_SECRET)
     token_str = None
     if token_json and "result" in token_json and "token" in token_json["result"]:
@@ -193,17 +176,14 @@ def main():
     else:
         logger.warning("Failed to retrieve token or parse it.")
 
-    # 5) A Hybrid aggregator approach:
+    # 5) Define a small aggregator that calls AIStrategy and (if BUY/SELL) places orders
     class HybridApp:
-        """
-        A minimal aggregator approach that calls AIStrategy after a certain time
-        has elapsed. Each new ticker update calls on_tick(...).
-        """
-        def __init__(self, pairs, strategy, aggregator_interval=60):
+        def __init__(self, pairs, strategy, aggregator_interval=60, ws_client=None):
             self.pairs = pairs
             self.strategy = strategy
             self.aggregator_interval = aggregator_interval
             self.last_call_ts = {p: 0 for p in pairs}
+            self.ws_client = ws_client
 
         def on_tick(self, pair: str, last_price: float):
             now = time.time()
@@ -216,30 +196,53 @@ def main():
                 "pair": pair,
                 "price": last_price
             }
-            self.strategy.predict(aggregator_data)
+            # AIStrategy => produce final action/size
+            final_action, final_size = self.strategy.predict(aggregator_data)
 
+            # If AIStrategy says BUY/SELL => place real order on Kraken
+            if final_action in ("BUY", "SELL") and final_size > 0.0:
+                side_str = "buy" if final_action == "BUY" else "sell"
+                logger.info(
+                    f"Placing real order on Kraken => side={side_str}, volume={final_size}, pair={pair}"
+                )
+                if self.ws_client is not None:
+                    self.ws_client.send_order(
+                        pair=pair,
+                        side=side_str,
+                        ordertype="market",
+                        volume=final_size
+                    )
+                else:
+                    logger.warning("No ws_client available to place real order.")
+
+    # 6) Create aggregator app
     app = HybridApp(
         pairs=TRADED_PAIRS,
         strategy=ai_model,
-        aggregator_interval=AGGREGATOR_INTERVAL_SECONDS
+        aggregator_interval=AGGREGATOR_INTERVAL_SECONDS,
+        ws_client=None
     )
 
-    logger.debug("Starting Kraken WebSocket.")
-    # 6) If you want to start in private feed from the get-go, pass start_in_private_feed=True
-    #    and private_token=token_str if desired. If you prefer to start public, keep them default.
+    # 7) Construct the WS client, hooking up on_ticker_callback=app.on_tick
     ws_client = KrakenWSClient(
         pairs=TRADED_PAIRS,
         feed_type="ticker",
         api_key=KRAKEN_API_KEY,
         api_secret=KRAKEN_API_SECRET,
         on_ticker_callback=app.on_tick,
-        start_in_private_feed=False,
+        start_in_private_feed=True,
         private_token=token_str
     )
 
-    # 7) Start the WebSocket feed
+    # Assign ws_client into app, so the aggregator can place orders
+    app.ws_client = ws_client
+
+    # 8) Start the WS feed
     ws_client.start()
     logger.info("Press Ctrl+C to exit the main loop.")
+
+    # We'll idle here, because the feed runs in a background thread
+    # and calls 'app.on_tick(...)' each time new ticker data arrives.
     try:
         while True:
             time.sleep(1)
@@ -248,12 +251,3 @@ def main():
     finally:
         ws_client.stop()
         logger.info("Stopped WebSocket and main app.")
-
-    # (Optional) If you want to connect private feed after we are already running
-    # public feed and have a token, you could do:
-    #   ws_client.connect_private_feed(token_str)
-    # But that might not forcibly switch until the next reconnect, or you can
-    # stop() and start() again if you want an immediate switch.
-
-if __name__ == "__main__":
-    main()
