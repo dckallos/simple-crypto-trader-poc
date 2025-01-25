@@ -257,6 +257,7 @@ class AIStrategy:
         cpanic = market_data.get("cryptopanic_sentiment", 0.0)
         galaxy = market_data.get("galaxy_score", 0.0)
         alt_rank = market_data.get("alt_rank", 0)
+        print(market_data)
         base_rationale = (
             f"Full GPT => pair={pair}, price={price}, "
             f"cryptopanic={cpanic}, galaxy={galaxy}, alt_rank={alt_rank}"
@@ -305,7 +306,6 @@ class AIStrategy:
         response = self.client.chat.completions.create(
             model="o1-mini",
             messages=[developer_msg, user_msg],
-            temperature=1.0,  # Use the default temperature as the model doesn't support 0.0
             max_completion_tokens=5000
         )
         print(response)
