@@ -85,7 +85,7 @@ def main():
     logger.info("[MultiFilter] Done fetching for multiple filters.")
 
     # 3) Possibly do a 'spot-check' => pick top coins from lunarcrush => fetch cryptopanic for them
-    fetcher.backfill_for_top_lunarcrush_coins(limit_coins=5)
+    fetcher.backfill_for_top_lunarcrush_coins(limit_coins=10)
 
     # 4) synergy-based recommended pairs
     new_pairs = fetcher.recommend_new_pairs()

@@ -1,17 +1,58 @@
+#!/usr/bin/env python3
 # ==============================================================================
 # FILE: main.py
 # ==============================================================================
 """
 main.py
 
-A mature application that:
-1) Initializes the DB (init_db from db.py).
-2) Optionally runs training if config says so.
-3) Retrieves a Kraken WebSockets token (if desired), enabling private feed usage.
-4) Starts a Kraken WebSocket feed for real-time data, storing it in price_history.
-5) Uses enriched data (sentiment and price trends) to pass to AIStrategy (with GPT or fallback).
-6) Skips trading pairs without sufficient data.
-7) Places real orders via Kraken WebSocket when AIStrategy indicates BUY/SELL.
+Demonstration of consuming both the PUBLIC and PRIVATE Kraken websockets feeds,
+using the classes defined in ws_data_feed.py:
+
+- KrakenPublicWSClient: for public data like ticker/trade
+- KrakenPrivateWSClient: for private data like openOrders, placing/canceling orders
+
+We store each incoming ticker/trade in 'price_history', and call an AIStrategy
+for each aggregator cycle to decide whether to place trades. Orders are placed
+on the private feed if we have a valid token.
+
+ASCII Flow:
+
+    +-------------------+
+    |  Public WS Feed   | (KrakenPublicWSClient)
+    |  (ticker events)  |
+    +-------------------+
+              |
+              v
+    aggregator_app.on_tick()  -- every N secs --> aggregator_app._aggregator_cycle()
+              |
+              v
+    +------------------------+
+    |   AIStrategy decides  |
+    |   (BUY / SELL / HOLD) |
+    +------------------------+
+              |
+       if "BUY"/"SELL" + size
+              |
+              v
+ +----------------------------------+
+ |  Private WS Feed (KrakenPrivate) |
+ |  => placeOrder => real trades    |
+ +----------------------------------+
+
+Usage:
+    python main.py
+
+Environment:
+    - KRAKEN_API_KEY
+    - KRAKEN_SECRET_API_KEY
+      (Used by get_ws_token to get a token for private WS feed)
+    - OPENAI_API_KEY (if using GPT logic in AIStrategy)
+
+See config.yaml for:
+  - enable_training
+  - traded_pairs
+  - trade_interval_seconds
+  - risk_controls
 """
 
 import time
@@ -26,19 +67,20 @@ import os
 import json
 from dotenv import load_dotenv
 import warnings
-
 import sqlite3
 import pandas as pd
+from typing import Optional
 
-from db import init_db, DB_FILE
-from ai_strategy import AIStrategy
-from ws_data_feed import KrakenWSClient
+from db import init_db, DB_FILE, record_trade_in_db
+from ai_strategy import AIStrategy  # assume your AIStrategy is in ai_strategy.py
+from ws_data_feed import KrakenPublicWSClient, KrakenPrivateWSClient
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 warnings.simplefilter(action="ignore", category=pd.errors.SettingWithCopyWarning)
 
+# Optional: read from a LOG_CONFIG dict to set advanced logs
 LOG_CONFIG = {
     'version': 1,
     'disable_existing_loggers': False,
@@ -75,17 +117,14 @@ LOG_CONFIG = {
 }
 
 
-def get_ws_token(api_key, api_secret):
+def get_ws_token(api_key: str, api_secret: str) -> Optional[dict]:
     """
     Retrieves a WebSockets authentication token from Kraken's REST API.
-    Example response:
-        {
-          "error": [],
-          "result": {
-            "expires": 900,
-            "token": "..."
-          }
-        }
+    That token is used for the private feed (wss://ws-auth.kraken.com).
+
+    :param api_key: Your Kraken API Key string
+    :param api_secret: Your Kraken API Secret string
+    :return: parsed JSON response if success, or None if error
     """
     url = "https://api.kraken.com/0/private/GetWebSocketsToken"
     path = "/0/private/GetWebSocketsToken"
@@ -94,10 +133,10 @@ def get_ws_token(api_key, api_secret):
     data = {"nonce": nonce}
     postdata = f"nonce={nonce}"
 
+    # Build signature
     sha256 = hashlib.sha256((nonce + postdata).encode("utf-8")).digest()
     message = path.encode("utf-8") + sha256
     secret = base64.b64decode(api_secret)
-
     sig = hmac.new(secret, message, hashlib.sha512)
     signature = base64.b64encode(sig.digest())
 
@@ -109,14 +148,140 @@ def get_ws_token(api_key, api_secret):
     try:
         resp = requests.post(url, headers=headers, data=data, timeout=10)
         resp.raise_for_status()
+        return resp.json()
     except requests.exceptions.RequestException as e:
-        logger.error(f"Error retrieving WebSockets token: {e}")
+        logger.error(f"Error retrieving WS token from Kraken: {e}")
         return None
 
-    return resp.json()
+
+class HybridApp:
+    """
+    A combined aggregator that:
+      1) Receives live ticker from public WS => every aggregator_interval, do aggregator cycle
+      2) aggregator cycle => fetch recent price data => AIStrategy => decide (BUY/SELL/HOLD)
+      3) If final_action=BUY/SELL => we call private_ws_client.send_order() => real trade
+    """
+
+    def __init__(
+        self,
+        pairs,
+        strategy: AIStrategy,
+        aggregator_interval=60,
+        private_ws_client: Optional[KrakenPrivateWSClient] = None
+    ):
+        """
+        :param pairs: e.g. ["ETH/USD","XBT/USD"]
+        :param strategy: AIStrategy instance
+        :param aggregator_interval: run aggregator cycle every N seconds per pair
+        :param private_ws_client: pass your KrakenPrivateWSClient if you want real orders
+        """
+        self.pairs = pairs
+        self.strategy = strategy
+        self.aggregator_interval = aggregator_interval
+        self.ws_private = private_ws_client
+        self.last_call_ts = {p: 0 for p in pairs}
+
+    def on_tick(self, pair: str, last_price: float):
+        """
+        Called by the public feed on every new ticker event. We only run aggregator
+        if aggregator_interval has passed.
+        """
+        now = time.time()
+        if (now - self.last_call_ts[pair]) >= self.aggregator_interval:
+            self._aggregator_cycle(pair, last_price)
+            self.last_call_ts[pair] = int(now)
+
+    def _aggregator_cycle(self, pair: str, last_price: float):
+        """
+        1) fetch recent price_history => e.g. 100 bars
+        2) pass to AIStrategy => final_action, final_size
+        3) If final_action=BUY/SELL => call send_order + record in DB
+        """
+        px_stats = self._fetch_recent_price_trends(pair)
+        if not px_stats:
+            logger.info(f"[Aggregator] skip {pair}, insufficient data in price_history.")
+            return
+
+        aggregator_data = {
+            "pair": pair,
+            "price": last_price,
+            **px_stats
+        }
+        # AIStrategy => final action/size
+        final_action, final_size = self.strategy.predict(aggregator_data)
+
+        if final_action in ("BUY", "SELL") and final_size > 0:
+            # We have a real trade to place
+            side_str = "buy" if final_action == "BUY" else "sell"
+            logger.info(f"[Aggregator] => place real order => {pair}, side={side_str}, volume={final_size:.6f}, px={last_price}")
+
+            if self.ws_private:
+                # Actually send to Kraken
+                self.ws_private.send_order(
+                    pair=pair,
+                    side=side_str,
+                    ordertype="market",
+                    volume=final_size
+                )
+
+                # Also record in DB so we can see it in trades table
+                # We don't have the real Kraken TXID yet; we'll store a placeholder.
+                record_trade_in_db(
+                    final_action,
+                    final_size,
+                    last_price,
+                    "PENDING_KRAKEN_TXID",
+                    pair
+                )
+            else:
+                logger.warning("[Aggregator] no private WS => cannot place real order.")
+        else:
+            logger.debug(f"[Aggregator] => no trade => action={final_action}, size={final_size:.6f}")
+
+    def _fetch_recent_price_trends(self, pair: str) -> dict:
+        """
+        Read last ~100 last_price from 'price_history', compute ma_10 + volatility
+        Return a dict or {}
+        """
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            q = """
+                SELECT last_price
+                FROM price_history
+                WHERE pair=?
+                ORDER BY timestamp DESC
+                LIMIT 100
+            """
+            df = pd.read_sql_query(q, conn, params=[pair])
+        except Exception as e:
+            logger.exception(f"[Aggregator] DB error => {e}")
+            return {}
+        finally:
+            conn.close()
+
+        if df.empty:
+            return {}
+
+        df = df.iloc[::-1].reset_index(drop=True)
+        df["ma_10"] = df["last_price"].rolling(10).mean()
+        df["volatility"] = df["last_price"].pct_change().std()
+        last_row = df.iloc[-1]
+        return {
+            "price_ma_10": last_row["ma_10"],
+            "price_volatility": last_row["volatility"]
+        }
 
 
 def main():
+    """
+    The main runner:
+      1) load config
+      2) init_db
+      3) create AIStrategy
+      4) get private token
+      5) build aggregator => pass it to a public feed => aggregator calls AIStrategy
+         => if buy/sell => calls private feed => real order
+    """
     logging.config.dictConfig(LOG_CONFIG)
 
     CONFIG_FILE = "config.yaml"
@@ -124,193 +289,96 @@ def main():
         config = yaml.safe_load(f)
 
     ENABLE_TRAINING = config.get("enable_training", True)
-    ENABLE_GPT_INTEGRATION = config.get("enable_gpt_integration", True)
+    ENABLE_GPT = config.get("enable_gpt_integration", True)
     TRADED_PAIRS = config.get("traded_pairs", [])
-    AGGREGATOR_INTERVAL_SECONDS = config.get("trade_interval_seconds", 120)
+    AGG_INTERVAL = config.get("trade_interval_seconds", 300)
 
-    # Load risk controls from config if present
+    # risk controls from config
     risk_controls = config.get("risk_controls", {
         "initial_spending_account": 40.0,
-        "purchase_upper_limit_percent": 1.0,
+        "purchase_upper_limit_percent": 50.0,
         "minimum_buy_amount": 10.0,
         "max_position_value": 20.0
     })
 
     load_dotenv()
-    KRAKEN_API_KEY = os.getenv("KRAKEN_API_KEY", "FAKE_KEY")
-    KRAKEN_API_SECRET = os.getenv("KRAKEN_SECRET_API_KEY", "FAKE_SECRET")
+    KRAKEN_API_KEY = os.getenv("KRAKEN_API_KEY","FAKE_KEY")
+    KRAKEN_API_SECRET = os.getenv("KRAKEN_SECRET_API_KEY","FAKE_SECRET")
 
-    # 1) Initialize the DB
+    # 1) init DB
     init_db()
 
-    # 2) Optionally perform training/aggregator setup (skipped in this demo)
+    # 2) (Optional) training step
     if ENABLE_TRAINING:
-        logger.info("Training step would go here. Skipping for brevity.")
-    else:
-        logger.info("Skipping training step per config.")
+        logger.info("[Main] Training step would go here (omitted).")
 
-    # 3) Create the AIStrategy instance
-    model_path = "trained_model.pkl" if os.path.exists("trained_model.pkl") else None
+    # 3) create AIStrategy
     ai_model = AIStrategy(
         pairs=TRADED_PAIRS,
-        model_path=model_path,
-        use_openai=ENABLE_GPT_INTEGRATION,
-        max_position_size=0.001,
+        model_path=None,       # or "trained_model.pkl"
+        use_openai=ENABLE_GPT,
+        max_position_size=1,
         stop_loss_pct=0.05,
         take_profit_pct=0.01,
         max_daily_drawdown=-0.02,
         risk_controls=risk_controls
     )
-    logger.info(f"AIStrategy loaded with pairs={TRADED_PAIRS}, GPT integration={ENABLE_GPT_INTEGRATION}")
+    logger.info(f"[Main] AIStrategy => pairs={TRADED_PAIRS}, GPT={ENABLE_GPT}")
 
-    # 4) Retrieve the Kraken WebSockets token
+    # 4) get private token
     token_json = get_ws_token(KRAKEN_API_KEY, KRAKEN_API_SECRET)
     token_str = None
     if token_json and "result" in token_json and "token" in token_json["result"]:
         token_str = token_json["result"]["token"]
-        logger.info(f"Retrieved WebSocket token: {token_str}")
+        logger.info(f"[Main] Got private WS token => {token_str[:10]}... (truncated)")
     else:
-        logger.warning("Failed to retrieve WebSocket token.")
+        logger.warning("[Main] Could not retrieve token => private feed disabled")
 
-    # 5) Define the hybrid aggregator
-    class HybridApp:
-        def __init__(self, pairs, strategy, aggregator_interval=60, ws_client=None):
-            self.pairs = pairs
-            self.strategy = strategy
-            self.aggregator_interval = aggregator_interval
-            self.last_call_ts = {p: 0 for p in pairs}
-            self.ws_client = ws_client
-
-        def on_tick(self, pair: str, last_price: float):
-            now = time.time()
-            if (now - self.last_call_ts[pair]) >= self.aggregator_interval:
-                self._aggregator_cycle(pair, last_price)
-                self.last_call_ts[pair] = int(now)
-
-        def _aggregator_cycle(self, pair: str, last_price: float):
-            # Fetch sentiment trends and price trends
-            sentiment_stats = self._fetch_cryptopanic_sentiment_trends(pair)
-            price_stats = self._fetch_recent_price_trends(pair)
-
-            # Skip if we lack sufficient data
-            if not sentiment_stats or not price_stats:
-                logger.info(f"Skipping {pair}: Insufficient sentiment or trend data.")
-                return
-
-            # Prepare enriched aggregator data
-            aggregator_data = {
-                "pair": pair,
-                "price": last_price,
-                **sentiment_stats,  # Include sentiment trends
-                **price_stats       # Include price trends/statistics
-            }
-
-            # Predict action/size using AIStrategy
-            final_action, final_size = self.strategy.predict(aggregator_data)
-
-            # Place orders if action is BUY or SELL
-            if final_action in ("BUY", "SELL") and final_size > 0.0:
-                side_str = "buy" if final_action == "BUY" else "sell"
-                logger.info(f"Placing real order: {pair}, {side_str}, size={final_size}")
-                self.ws_client.send_order(
-                    pair=pair,
-                    side=side_str,
-                    ordertype="market",
-                    volume=final_size
-                )
-
-        def _fetch_cryptopanic_sentiment_trends(self, pair: str) -> dict:
-            conn = sqlite3.connect(DB_FILE)
-            try:
-                symbol = pair.split("/")[0]
-                query = """
-                    SELECT timestamp, sentiment_score
-                    FROM cryptopanic_news
-                    WHERE symbol = ?
-                    AND timestamp >= strftime('%s', 'now', '-30 days')
-                    ORDER BY timestamp ASC
-                """
-                df = pd.read_sql_query(query, conn, params=[symbol])
-                if df.empty:
-                    return {}
-
-                # Calculate rolling averages and volatility
-                df["datetime"] = pd.to_datetime(df["timestamp"], unit="s")
-                df.set_index("datetime", inplace=True)
-                df["sentiment_ma_7d"] = df["sentiment_score"].rolling("7D").mean()
-                df["sentiment_ma_14d"] = df["sentiment_score"].rolling("14D").mean()
-                df["sentiment_volatility"] = df["sentiment_score"].rolling("14D").std()
-
-                return {
-                    "sentiment_score": df["sentiment_score"].iloc[-1],          # Latest sentiment
-                    "sentiment_ma_7d": df["sentiment_ma_7d"].iloc[-1],          # 7-day average
-                    "sentiment_ma_14d": df["sentiment_ma_14d"].iloc[-1],        # 14-day average
-                    "sentiment_volatility": df["sentiment_volatility"].iloc[-1] # Sentiment volatility
-                }
-            except Exception as e:
-                logger.exception(f"Error fetching sentiment trends for {pair}: {e}")
-                return {}
-            finally:
-                conn.close()
-
-        def _fetch_recent_price_trends(self, pair: str) -> dict:
-            conn = sqlite3.connect(DB_FILE)
-            try:
-                query = """
-                    SELECT last_price
-                    FROM price_history
-                    WHERE pair = ?
-                    ORDER BY timestamp DESC
-                    LIMIT 100
-                """
-                df = pd.read_sql_query(query, conn, params=[pair])
-                if df.empty:
-                    return {}
-
-                # Compute trends
-                df["moving_avg_10"] = df["last_price"].rolling(10).mean().iloc[-1]
-                df["moving_avg_30"] = df["last_price"].rolling(30).mean().iloc[-1]
-                df["volatility"] = df["last_price"].pct_change().std()
-
-                return {
-                    "moving_avg_10": df["moving_avg_10"],
-                    "moving_avg_30": df["moving_avg_30"],
-                    "volatility": df["volatility"]
-                }
-            except Exception as e:
-                logger.exception(f"Error fetching price trends for {pair}: {e}")
-                return {}
-            finally:
-                conn.close()
-
-    # 6) Create the WebSocket client with the aggregator
-    app = HybridApp(
+    # 5) create aggregator app
+    aggregator_app = HybridApp(
         pairs=TRADED_PAIRS,
         strategy=ai_model,
-        aggregator_interval=AGGREGATOR_INTERVAL_SECONDS
+        aggregator_interval=AGG_INTERVAL,
+        private_ws_client=None  # we will set this after we create the priv_client
     )
-    ws_client = KrakenWSClient(
+
+    # 6) Build public feed
+    pub_client = KrakenPublicWSClient(
         pairs=TRADED_PAIRS,
         feed_type="ticker",
-        api_key=KRAKEN_API_KEY,
-        api_secret=KRAKEN_API_SECRET,
-        on_ticker_callback=app.on_tick,
-        start_in_private_feed=True,
-        private_token=token_str
+        on_ticker_callback=aggregator_app.on_tick,
     )
-    app.ws_client = ws_client
 
-    # 7) Start the WebSocket feed
-    ws_client.start()
-    logger.info("Press Ctrl+C to exit the main loop.")
+    # 7) private feed
+    priv_client = None
+    if token_str:
+        def on_private_event(evt_dict):
+            # If you want to see addOrderStatus or openOrders
+            logger.debug(f"[PrivateWS] Event => {evt_dict}")
+
+        priv_client = KrakenPrivateWSClient(
+            token=token_str,
+            on_private_event_callback=on_private_event
+        )
+        aggregator_app.ws_private = priv_client
+
+    # start them
+    pub_client.start()
+    if priv_client:
+        priv_client.start()
+
+    logger.info("[Main] Running. Press Ctrl+C to exit.")
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        logger.info("Exiting main loop due to KeyboardInterrupt.")
+        logger.info("[Main] user exit => stopping.")
     finally:
-        ws_client.stop()
-        logger.info("Stopped WebSocket and main app.")
+        pub_client.stop()
+        if priv_client:
+            priv_client.stop()
+        logger.info("[Main] aggregator halted.")
+
 
 if __name__ == "__main__":
     main()

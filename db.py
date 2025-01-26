@@ -9,15 +9,14 @@ SQLite database utilities for:
 2) Storing price history in 'price_history'.
 3) Collecting aggregator data in 'cryptopanic_news' and 'lunarcrush_data'.
 4) Maintaining GPT context in 'ai_context'.
+5) Storing advanced time-series data in 'lunarcrush_timeseries'.
+6) Logging final AI decisions in 'ai_decisions'.
 
-Note: The new sub-positions approach is now handled entirely in
-      `risk_manager.py` and its `RiskManagerDB` class, which creates and manages
-      the 'sub_positions' table. We've removed all references to the old
-      'open_positions' table logic, as that no longer "fits" the multi-position
-      design.
+For multi-sub-position logic, sub_positions is handled in `risk_manager.py` (RiskManagerDB).
 
 Usage:
-    - Call init_db() once on startup to ensure main tables exist.
+    - Call init_db() once on startup (or run this file directly) to ensure all tables exist.
+    - Use store_*() helpers to insert or update data as needed.
     - For sub-positions, see `RiskManagerDB.initialize()` in risk_manager.py.
 """
 
@@ -31,12 +30,17 @@ DB_FILE = "trades.db"
 
 def init_db():
     """
-    Creates the 'trades', 'price_history', 'cryptopanic_news', and 'lunarcrush_data'
-    tables if they do not exist. Also creates the 'ai_context' table.
-
-    If you are using the multi-sub-position approach, you should initialize the
-    'sub_positions' table from `risk_manager.py` via RiskManagerDB.initialize().
+    Creates all needed tables:
+      - trades
+      - price_history
+      - cryptopanic_news
+      - lunarcrush_data
+      - ai_context
+      - ai_decisions
+      - lunarcrush_timeseries
+    If sub_positions are needed, see `risk_manager.py => RiskManagerDB.initialize()`.
     """
+
     conn = sqlite3.connect(DB_FILE)
     try:
         c = conn.cursor()
@@ -75,12 +79,23 @@ def init_db():
         # 3) 'cryptopanic_news' table
         # ----------------------------------------------------------------------
         c.execute("""
-            CREATE TABLE IF NOT EXISTS cryptopanic_news (
+            CREATE TABLE IF NOT EXISTS cryptopanic_posts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp INTEGER,
+                post_id TEXT,
                 title TEXT,
                 url TEXT,
+                domain TEXT,
+                published_at TEXT,
+                tags TEXT,
+                negative_votes INTEGER,
+                positive_votes INTEGER,
+                liked_votes INTEGER,
+                disliked_votes INTEGER,
                 sentiment_score REAL
+                image TEXT,
+                description TEXT,
+                panic_score REAL,
+                created_at INTEGER
             )
         """)
 
@@ -120,6 +135,44 @@ def init_db():
             CREATE TABLE IF NOT EXISTS ai_context (
                 id INTEGER PRIMARY KEY,
                 context TEXT
+            )
+        """)
+
+        # ----------------------------------------------------------------------
+        # 6) 'ai_decisions' table
+        # ----------------------------------------------------------------------
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS ai_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER,
+                pair TEXT,
+                action TEXT,
+                size REAL,
+                rationale TEXT
+            )
+        """)
+
+        # ----------------------------------------------------------------------
+        # 7) 'lunarcrush_timeseries' table
+        # ----------------------------------------------------------------------
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS lunarcrush_timeseries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                coin_id TEXT,
+                timestamp INTEGER,
+                open_price REAL,
+                close_price REAL,
+                high_price REAL,
+                low_price REAL,
+                volume_24h REAL,
+                market_cap REAL,
+                sentiment REAL,
+                spam REAL,
+                galaxy_score REAL,
+                alt_rank INTEGER,
+                volatility REAL,
+                interactions REAL,
+                social_dominance REAL
             )
         """)
 
@@ -269,60 +322,7 @@ def store_lunarcrush_data(
     import time
     from db import DB_FILE, logger
 
-    conn = sqlite3.connect(DB_FILE)
-    try:
-        c = conn.cursor()
-        c.execute("""
-            INSERT INTO lunarcrush_data (
-                timestamp,
-                symbol,
-                name,
-                price,
-                market_cap,
-                volume_24h,
-                volatility,
-                percent_change_1h,
-                percent_change_24h,
-                percent_change_7d,
-                percent_change_30d,
-                social_volume_24h,
-                interactions_24h,
-                social_dominance,
-                galaxy_score,
-                alt_rank,
-                sentiment,
-                categories,
-                topic,
-                logo
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            int(time.time()),
-            symbol,
-            name,
-            price,
-            market_cap,
-            volume_24h,
-            volatility,
-            percent_change_1h,
-            percent_change_24h,
-            percent_change_7d,
-            percent_change_30d,
-            social_volume_24h,
-            interactions_24h,
-            social_dominance,
-            galaxy_score,
-            alt_rank,
-            sentiment,
-            categories,
-            topic,
-            logo
-        ))
-        conn.commit()
-    except Exception as e:
-        logger.exception(f"Error storing LunarCrush data: {e}")
-    finally:
-        conn.close()
+    import fetch_lunarcrush.init_lunarcrush as init_lunarcrush
 
 
 def create_ai_context_table():
@@ -348,9 +348,9 @@ def create_ai_context_table():
 
 def load_gpt_context_from_db():
     """
-    Returns the 'context' field from ai_context WHERE id=1, or an empty string if none found.
+    Returns the 'context' field from ai_context WHERE id=1, or "" if none.
 
-    :return: str - the stored GPT context, or "" if not found.
+    :return: str
     """
     conn = sqlite3.connect(DB_FILE)
     try:
@@ -370,8 +370,6 @@ def load_gpt_context_from_db():
 def save_gpt_context_to_db(context_str: str):
     """
     Upsert the single row in 'ai_context' with id=1, storing context_str.
-
-    :param context_str: The string representing GPT memory or conversation context.
     """
     conn = sqlite3.connect(DB_FILE)
     try:
@@ -386,3 +384,11 @@ def save_gpt_context_to_db(context_str: str):
         logger.exception(f"Error saving GPT context: {e}")
     finally:
         conn.close()
+
+
+if __name__ == "__main__":
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    logger.info("Running init_db() from db.py directly.")
+    init_db()
+    logger.info("DB initialization complete.")

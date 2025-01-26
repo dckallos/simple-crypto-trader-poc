@@ -171,7 +171,7 @@ class LunarCrushFetcher:
         """
         Creates or ensures 'lunarcrush_data' if not exists.
         """
-        conn = sqlite3.connect(self.db_file)
+        conn = sqlite3.connect(DB_FILE)
         try:
             c = conn.cursor()
             c.execute("""
@@ -379,7 +379,7 @@ class LunarCrushFetcher:
                 logger.info(f"[TIMESERIES] coin_id={coin_id}, got {len(recs)} records")
 
                 if recs:
-                    self._init_lunarcrush_timeseries_table()
+                    self.init_lunarcrush_timeseries_table()
                     self._store_timeseries_records(coin_id, recs)
                 break
             except requests.exceptions.HTTPError as e:
@@ -393,8 +393,9 @@ class LunarCrushFetcher:
         else:
             logger.error(f"[TIMESERIES] All attempts fail => coin_id={coin_id}")
 
-    def _init_lunarcrush_timeseries_table(self):
-        conn=sqlite3.connect(self.db_file)
+    @staticmethod
+    def init_lunarcrush_timeseries_table():
+        conn = sqlite3.connect(DB_FILE)
         try:
             c=conn.cursor()
             c.execute("""
@@ -471,7 +472,8 @@ class LunarCrushFetcher:
     # ==========================================================================
     # (A) Spot-check entire market: "spot_check_entire_market"
     # ==========================================================================
-    def spot_check_entire_market(self, top_n: int=10) -> List[Tuple[str,float]]:
+    @staticmethod
+    def spot_check_entire_market(top_n: int=10) -> List[Tuple[str,float]]:
         """
         This method does NOT rely on 'filter_symbols'. It expects you to have
         run fetch_snapshot_data_all_coins(...) so 'lunarcrush_data' has all coins.
@@ -482,7 +484,8 @@ class LunarCrushFetcher:
 
         Returns => list of (coin_id, rank_score).
         """
-        conn = sqlite3.connect(self.db_file)
+
+        conn = sqlite3.connect(DB_FILE)
         out=[]
         try:
             c=conn.cursor()
@@ -550,7 +553,7 @@ class LunarCrushFetcher:
             logger.info("[BACKFILL-TOPN] no top coins => skip.")
             return
 
-        self._init_lunarcrush_timeseries_table()
+        self.init_lunarcrush_timeseries_table()
 
         for idx, (cid, rs) in enumerate(top_coins, start=1):
             logger.info(f"[BACKFILL-TOPN] {idx}/{len(top_coins)} => coin_id={cid}, rank_score={rs}")
@@ -571,12 +574,13 @@ if __name__=="__main__":
 
     # 1) Option A => fetch snapshot data with filters
     # fetcher.fetch_snapshot_data_filtered(limit=100)
+    fetcher.init_lunarcrush_timeseries_table()
 
     # or Option B => fetch entire market
-    # fetcher.fetch_snapshot_data_all_coins(limit=500)
+    fetcher.fetch_snapshot_data_all_coins(limit=100)
 
     # 2) Now we have 'lunarcrush_data' filled. Let's spot-check entire market:
-    top_n_coins = fetcher.spot_check_entire_market(top_n=10)
+    top_n_coins = fetcher.spot_check_entire_market(top_n=30)
     logger.info(f"Top 10 across entire market => {top_n_coins}")
 
     # 3) We'll backfill just those top 10 coins:
