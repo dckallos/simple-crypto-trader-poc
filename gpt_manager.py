@@ -1,61 +1,88 @@
 """
 gpt_manager.py
 
-A production-ready module to handle GPT-based inference for trading decisions,
-now allowing the user to control how much trade history is included (via a numeric parameter).
+A production-ready module to handle GPT-based inference for **multi-coin** trading decisions
+in a single GPT call. This version offers an advanced approach:
+  - Instead of calling GPT for each coin individually, we pass a single combined prompt
+    containing aggregator data for all tracked coins at once.
+  - GPT can then compare them holistically, picking the best actions from the sum of all choices.
+  - This includes references to open positions across multiple coins, letting GPT
+    decide whether to hold, buy, sell, or swap positions in multiple coins.
 
 Key Features:
-    1) Centralizes GPT logic in one class, GPTManager.
-    2) Provides flexible configuration (model, temperature, etc.).
-    3) Parses JSON from GPT responses, with fallback if JSON parse fails.
-    4) Strips triple backticks/code blocks to avoid malformed JSON.
-    5) Accepts a trade_history list and a max_trades integer to limit how many trades we supply to GPT.
+    1) `generate_multi_trade_decision()` method that:
+       - Accepts a list of aggregator data dicts for each coin.
+       - Accepts a consolidated 'open_positions' referencing positions in multiple coins.
+       - Returns a single JSON with decisions for each coin, e.g.:
+         {
+           "decisions": [
+             {"pair":"XBT/USD","action":"BUY","size":0.001},
+             {"pair":"ETH/USD","action":"SELL","size":0.002}
+           ]
+         }
+    2) Single GPT call => GPT sees the entire market at once, so it can produce
+       a *global* best set of trades from the sum of all choices.
+    3) Strict JSON response with an array of decisions. If GPT fails to parse
+       or returns invalid JSON, we fallback to an empty or hold-based approach.
+    4) The rest of the file remains a "production-ready" GPT manager, with advanced prompt
+       engineering, fallback logic, code-fence stripping, etc.
 
 Usage Example:
     from gpt_manager import GPTManager
 
-    # Suppose you store the last N trades in a list of strings:
-    # e.g. trade_history = [
-    #   "2025-01-20 10:15 BUY 0.001@25000",
-    #   "2025-01-21 11:20 SELL 0.001@25500",
-    #   ...
-    # ]
-
     gpt = GPTManager(
-        api_key="sk-...",       # or rely on OPENAI_API_KEY env var
-        model="gpt-4o-mini",    # your chosen model
+        api_key="sk-...",
+        model="gpt-4o",
         temperature=0.8,
-        max_tokens=500
+        max_tokens=1000
     )
 
-    result_dict = gpt.generate_trade_decision(
+    # aggregator_list is e.g. a list of:
+    # [
+    #   {
+    #     "pair":"ETH/USD",
+    #     "aggregator_data":"rsi=44, price=1850, galaxy_score=60, alt_rank=200, ...
+    #   },
+    #   {
+    #     "pair":"XBT/USD",
+    #     "aggregator_data":"rsi=50, price=28000, galaxy_score=65, alt_rank=150, ...
+    #   }
+    # ]
+
+    # open_positions is a list of strings describing all active positions across coins
+    # e.g. ["ETH/USD LONG 0.002, entry=1860", "XBT/USD SHORT 0.001, entry=29500"]
+
+    result_dict = gpt.generate_multi_trade_decision(
         conversation_context="Summarized conversation so far.",
-        aggregator_text="rsi=44.2, boll_upper=1910.5, price=1870",
-        trade_history=[
-            "2025-01-20 10:15 BUY 0.001@25000",
-            "2025-01-21 11:20 SELL 0.001@25500",
-            "2025-01-22 09:00 BUY 0.0005@24500",
-            "2025-01-23 12:40 BUY 0.0007@24800"
-        ],
-        max_trades=3,  # supply only the last 3 trades
+        aggregator_list=aggregator_list,
+        open_positions=open_positions,
+        trade_history=["2025-01-20 10:15 BUY ETH 0.001@25000", "...", "..."],
+        max_trades=5,
         risk_controls={
-            "initial_spending_account": 40.0,
-            "purchase_upper_limit_percent": 50.0,
+            "initial_spending_account": 100.0,
+            "purchase_upper_limit_percent": 10.0,
             "minimum_buy_amount": 10.0,
             ...
         }
     )
-    # result_dict => {"action": "BUY", "size": 0.001}, etc.
+    # example output => {
+    #   "decisions": [
+    #     {"pair":"ETH/USD","action":"BUY","size":0.001},
+    #     {"pair":"XBT/USD","action":"HOLD","size":0.0}
+    #   ]
+    # }
 
 Testing:
-    - Mock or patch gpt.client.chat.completions.create(...) to simulate GPT responses.
-    - Verify the truncated trade history is used in the prompt, and JSON parse fallback logic works.
+    - In your tests, you can patch `self.client.chat.completions.create(...)` to return
+      a mock response with `choices[0].message.content` set to a structured JSON that has
+      "decisions" as an array. Then confirm your code decodes it properly.
 """
 
 import os
 import json
 import logging
 from typing import Any, Dict, List, Optional
+from dotenv import load_dotenv
 
 try:
     from openai import OpenAI
@@ -70,11 +97,10 @@ logger = logging.getLogger(__name__)
 
 class GPTManager:
     """
-    GPTManager orchestrates:
-      - Building system/user prompts for trade decisions.
-      - Calling the OpenAI chat completion API.
-      - Parsing the JSON outcome {"action":..., "size":...}, with a fallback to HOLD if parse fails.
-      - Letting the caller control how many lines of trade history to supply (max_trades).
+    GPTManager orchestrates GPT logic for advanced multi-coin trading decisions.
+    By calling `generate_multi_trade_decision(...)`, you can pass aggregator data
+    for multiple coins in a single GPT call. GPT returns a JSON array of
+    {"pair":"...","action":"BUY|SELL|HOLD","size":float} decisions.
     """
 
     def __init__(
@@ -86,15 +112,14 @@ class GPTManager:
         **client_options
     ):
         """
-        Constructor for GPTManager.
-
-        :param api_key:        Override for OPENAI_API_KEY env var if desired.
-        :param model:          Which GPT model to use, e.g. "gpt-4o-mini".
-        :param temperature:    The GPT temperature.
-        :param max_tokens:     Max tokens in GPT response.
-        :param client_options: Additional kwargs for the openai.OpenAI constructor
-                               (e.g., timeout, max_retries, proxies, etc.).
+        :param api_key:        Optionally override the OPENAI_API_KEY env var.
+        :param model:          GPT model name, e.g. "gpt-4o-mini".
+        :param temperature:    GPT temperature.
+        :param max_tokens:     Maximum tokens in GPT response.
+        :param client_options: Additional arguments for the openai.OpenAI constructor
+                               (e.g. timeout, max_retries, proxies).
         """
+        load_dotenv()
         self.api_key = api_key or os.getenv("OPENAI_API_KEY", "")
         if not self.api_key:
             logger.warning(
@@ -102,59 +127,94 @@ class GPTManager:
                 "variable or explicit api_key is set."
             )
 
-        # Instantiate the OpenAI client
         self.client = OpenAI(api_key=self.api_key, **client_options)
-
-        # Config
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
 
-    def generate_trade_decision(
+    def generate_multi_trade_decision(
         self,
         conversation_context: str,
-        aggregator_text: str,
+        aggregator_list: List[Dict[str, Any]],
+        open_positions: List[str],
         trade_history: List[str],
         max_trades: int,
-        risk_controls: Dict[str, Any],
+        risk_controls: Dict[str, Any]
     ) -> Dict[str, Any]:
         """
-        Generates a trading decision using GPT chat completion.
+        In a single GPT call, pass aggregator data for multiple coins so GPT
+        can produce a global best decision across them. We expect a JSON result:
 
-        :param conversation_context: A string representing prior GPT conversation or summary.
-        :param aggregator_text:      A short string summarizing market indicators/aggregators.
-        :param trade_history:        A list of trade history strings (e.g. ["2025-01-20 10:15 BUY 0.001@25000", ...]).
-        :param max_trades:          How many of the most recent trades to include in the prompt.
-        :param risk_controls:        A dict for relevant risk control parameters.
+            {
+              "decisions": [
+                {"pair":"ETH/USD", "action":"BUY|SELL|HOLD", "size":0.001},
+                {"pair":"XBT/USD", "action":"BUY|SELL|HOLD", "size":0.0005}
+                ...
+              ]
+            }
 
-        :return: {"action": <BUY|SELL|HOLD>, "size": <float>}
+        :param conversation_context: str => prior GPT conversation or summary.
+        :param aggregator_list: A list, each item is e.g.
+               {"pair":"ETH/USD","aggregator_data":"rsi=44,price=1850,sentiment=0.4,galaxy=65,..."}
+        :param open_positions: list of strings describing all open trades across coins
+               e.g. ["ETH/USD LONG 0.002, entry=1860", "XBT/USD SHORT 0.001, entry=29500"]
+        :param trade_history: A list of past trade strings; we'll show the last N
+        :param max_trades: how many of the last trades from trade_history to pass
+        :param risk_controls: dict with relevant constraints
+
+        :return => a dictionary with "decisions" => a list of decision objects,
+                   or fallback => {"decisions": []} on parse error
         """
+        # Summarize aggregator_data
+        # aggregator_list might have e.g. N coins => build a text block for each coin
+        aggregator_text_block = []
+        for idx, item in enumerate(aggregator_list, start=1):
+            pair_name = item.get("pair","UNK")
+            data_str = item.get("aggregator_data","")
+            aggregator_text_block.append(f"{idx}) {pair_name} => {data_str}")
 
-        # Build a short summary of the last N trades
-        if trade_history:
-            recent_trades = trade_history[-max_trades:]
-            trade_summary = "\n".join(recent_trades)
+        aggregator_text_joined = "\n".join(aggregator_text_block)
+
+        # Summarize open_positions
+        if open_positions:
+            open_positions_str = "\n".join(open_positions)
         else:
-            trade_summary = "No trades found."
+            open_positions_str = "No open positions."
 
-        # 1) System message => strict JSON
+        # Summarize trade history (the last max_trades lines)
+        if trade_history:
+            truncated = trade_history[-max_trades:]
+            trade_summary = "\n".join(truncated)
+        else:
+            trade_summary = "No past trades found."
+
+        # 1) System message => we want an array of decisions in JSON
         system_msg = {
             "role": "assistant",
             "content": (
-                "You are an advanced crypto trading assistant. "
-                "Return ONLY valid JSON in the form: "
-                "{\"action\":\"BUY|SELL|HOLD\",\"size\":0.0005}. "
-                "No code blocks or markdown."
+                "You are a specialized multi-coin crypto trading assistant. "
+                "You see aggregator data for multiple coins at once, plus open positions. "
+                "You MUST return a single JSON object of the form:\n"
+                "{\n"
+                "  \"decisions\": [\n"
+                "    {\"pair\":\"COIN_PAIR\",\"action\":\"BUY|SELL|HOLD\",\"size\":0.001},\n"
+                "    ...\n"
+                "  ]\n"
+                "}\n\n"
+                "No extra text or code blocks. If you want to close or swap an existing position, "
+                "use 'SELL' with an appropriate 'size'."
             )
         }
 
-        # 2) User prompt
+        # 2) Build user prompt
         user_prompt = (
             f"Conversation so far:\n{conversation_context}\n\n"
-            f"Aggregators => {aggregator_text}\n"
-            f"Recent trades =>\n{trade_summary}\n"
-            f"Risk controls => {risk_controls}\n"
-            "Output strictly JSON => {\"action\":\"BUY|SELL|HOLD\",\"size\":float}\n"
+            f"Aggregators for all coins =>\n{aggregator_text_joined}\n\n"
+            f"Open positions =>\n{open_positions_str}\n\n"
+            f"Recent trades =>\n{trade_summary}\n\n"
+            f"Risk controls => {risk_controls}\n\n"
+            "IMPORTANT: Return strictly JSON => {\"decisions\":[...]}\n"
+            "Decisions array might have multiple objects, each with pair/action/size."
         )
         user_msg = {"role": "user", "content": user_prompt}
 
@@ -167,34 +227,48 @@ class GPTManager:
                 max_completion_tokens=self.max_tokens
             )
         except Exception as e:
-            logger.exception("Error contacting GPT => fallback => HOLD")
-            return {"action": "HOLD", "size": 0.0}
+            logger.exception("[GPT-Multi] Error contacting GPT => fallback => empty decisions")
+            return {"decisions": []}
 
         if not response.choices:
-            logger.warning("No GPT choices => fallback => HOLD")
-            return {"action": "HOLD", "size": 0.0}
+            logger.warning("[GPT-Multi] No GPT choices => fallback => empty decisions")
+            return {"decisions": []}
 
         choice = response.choices[0]
         raw_text = choice.message.content or ""
         finish_reason = choice.finish_reason
-        logger.debug(f"[GPT] raw={raw_text}, finish_reason={finish_reason}")
+        logger.debug(f"[GPT-Multi] raw={raw_text}, finish_reason={finish_reason}")
 
-        # 4) Cleanup any code fences
+        # 4) strip code fences
         cleaned = raw_text.replace("```json", "").replace("```", "").strip()
 
-        # 5) JSON parse
+        # 5) parse JSON
         try:
             parsed = json.loads(cleaned)
         except json.JSONDecodeError:
-            logger.warning("Could not parse GPT response => fallback => HOLD")
-            return {"action": "HOLD", "size": 0.0}
+            logger.warning("[GPT-Multi] Could not parse GPT response => fallback => empty decisions")
+            return {"decisions": []}
 
         if not isinstance(parsed, dict):
-            logger.warning("Parsed GPT response is not a dict => fallback => HOLD")
-            return {"action": "HOLD", "size": 0.0}
+            logger.warning("[GPT-Multi] JSON was not a dict => fallback => empty decisions")
+            return {"decisions": []}
 
-        # Provide defaults
-        action = str(parsed.get("action", "HOLD")).upper()
-        size = float(parsed.get("size", 0.0))
+        # ensure we have 'decisions' => a list
+        decisions_list = parsed.get("decisions", [])
+        if not isinstance(decisions_list, list):
+            logger.warning("[GPT-Multi] 'decisions' is not a list => fallback => empty decisions")
+            return {"decisions": []}
 
-        return {"action": action, "size": size}
+        # We can do some basic validation => each item => must have 'pair','action','size'
+        # We'll do a naive approach:
+        final_out = []
+        for d in decisions_list:
+            if not isinstance(d, dict):
+                logger.warning(f"[GPT-Multi] invalid item => {d}")
+                continue
+            pair_name = str(d.get("pair","UNK"))
+            action = str(d.get("action","HOLD")).upper()
+            size = float(d.get("size",0.0))
+            final_out.append({"pair": pair_name, "action": action, "size": size})
+
+        return {"decisions": final_out}
