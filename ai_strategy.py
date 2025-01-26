@@ -31,6 +31,7 @@ import time
 import json
 import sqlite3
 from typing import Optional, Dict, Any, List, Tuple, Union
+from dotenv import load_dotenv
 
 # We assume these modules exist in your codebase:
 from db import (
@@ -57,14 +58,14 @@ class AIStrategy:
         self,
         pairs: List[str] = None,
         use_openai: bool = False,
-        max_position_size: float = 0.001,
+        max_position_size: float = 3,
         stop_loss_pct: float = 0.05,
         take_profit_pct: float = 0.01,
         max_daily_drawdown: float = -0.02,
         risk_controls: Optional[Dict[str, Any]] = None,
         gpt_model: str = "gpt-4o",
-        gpt_temperature: float = 0.7,
-        gpt_max_tokens: int = 500,
+        gpt_temperature: float = 1.0,
+        gpt_max_tokens: int = 2000,
         **gpt_client_options
     ):
         """
@@ -86,6 +87,7 @@ class AIStrategy:
         self.risk_controls = risk_controls or {}
 
         # Create a GPTManager if needed
+        load_dotenv()
         self.gpt_manager = None
         if self.use_openai:
             self.gpt_manager = GPTManager(
@@ -172,7 +174,7 @@ class AIStrategy:
             conversation_context=self.gpt_context,
             aggregator_text=aggregator_text,
             trade_history=trade_history_list,
-            max_trades=3,
+            max_trades=20,
             risk_controls=self.risk_controls
         )
         action = result.get("action", "HOLD").upper()
@@ -438,7 +440,7 @@ if __name__ == "__main__":
         pairs=["ETH/USD", "XBT/USD"],
         use_openai=True,
         risk_controls={
-            "initial_spending_account": 100.0,
+            "initial_spending_account": 40.0,
             "minimum_buy_amount": 5.0,
             "purchase_upper_limit_percent": 0.1,
         },
