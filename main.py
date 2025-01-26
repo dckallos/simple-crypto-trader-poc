@@ -15,6 +15,10 @@ We store each incoming ticker/trade in 'price_history', and call an AIStrategy
 for each aggregator cycle to decide whether to place trades. Orders are placed
 on the private feed if we have a valid token.
 
+Added Enhancement:
+    - A method to fetch LunarCrush sentiment data for a given symbol,
+      so we can pass that to AIStrategy (and ultimately to GPT).
+
 ASCII Flow:
 
     +-------------------+
@@ -47,6 +51,7 @@ Environment:
     - KRAKEN_SECRET_API_KEY
       (Used by get_ws_token to get a token for private WS feed)
     - OPENAI_API_KEY (if using GPT logic in AIStrategy)
+    - LUNARCRUSH_API_KEY (optional, if you want real-time sentiment from LunarCrush)
 
 See config.yaml for:
   - enable_training
@@ -69,7 +74,7 @@ from dotenv import load_dotenv
 import warnings
 import sqlite3
 import pandas as pd
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from db import init_db, DB_FILE, record_trade_in_db
 from ai_strategy import AIStrategy  # assume your AIStrategy is in ai_strategy.py
@@ -92,7 +97,7 @@ LOG_CONFIG = {
     'handlers': {
         'console': {
             'class': 'logging.StreamHandler',
-            'level': 'DEBUG',
+            'level': 'INFO',
             'formatter': 'standard',
             'stream': 'ext://sys.stdout'
         },
@@ -100,21 +105,98 @@ LOG_CONFIG = {
     'loggers': {
         '': {
             'handlers': ['console'],
-            'level': 'DEBUG',
+            'level': 'INFO',
             'propagate': True
         },
         'requests': {
             'handlers': ['console'],
-            'level': 'DEBUG',
+            'level': 'INFO',
             'propagate': True
         },
         'urllib3': {
             'handlers': ['console'],
-            'level': 'DEBUG',
+            'level': 'INFO',
             'propagate': True
         },
     }
 }
+
+def load_lunarcrush_sentiment_history(symbol: str, limit: int = 3) -> str:
+    """
+    Loads the last 'limit' rows of sentiment (or other metrics) from 'lunarcrush_timeseries'
+    for the given symbol, returning a short text to convey changes over time.
+
+    Example usage:
+        hist_str = load_lunarcrush_sentiment_history("ETH", limit=5)
+        # -> "1) ts=1693400000, sentiment=0.2; 2) ts=1693403600, sentiment=0.22; ..."
+
+    Adjust as needed for your schema or fields (like galaxy_score, alt_rank, etc.).
+    """
+    import sqlite3
+    from db import DB_FILE
+    import logging
+    logger = logging.getLogger(__name__)
+
+    # Step 1) find coin_id from symbol in 'lunarcrush_data'
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    coin_id = None
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT lunarcrush_id
+            FROM lunarcrush_data
+            WHERE UPPER(symbol)=?
+            ORDER BY id DESC
+            LIMIT 1
+        """, (symbol.upper(),))
+        row = c.fetchone()
+        if row and row["lunarcrush_id"]:
+            coin_id = str(row["lunarcrush_id"])
+    except Exception as e:
+        logger.exception(f"[SentimentHistory] error finding coin_id => {e}")
+    finally:
+        conn.close()
+
+    if not coin_id:
+        return f"No coin_id for {symbol} in DB."
+
+    # Step 2) retrieve last 'limit' rows from 'lunarcrush_timeseries' where coin_id=?
+    # We want them in descending order so we can see the most recent first, or ascending for chronological changes
+    history_text = []
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT timestamp, sentiment, galaxy_score, alt_rank
+            FROM lunarcrush_timeseries
+            WHERE coin_id=?
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """, (coin_id, limit))
+        rows = c.fetchall()
+        if not rows:
+            return f"No sentiment data found for coin_id={coin_id}."
+
+        # Step 3) Build a short text summarizing these rows
+        rows = rows[::-1]  # reverse to chronological if you want oldest->newest
+        idx = 1
+        for r in rows:
+            ts = r["timestamp"]
+            sent = r["sentiment"] if r["sentiment"] else 0.0
+            gscore = r["galaxy_score"] if r["galaxy_score"] else 0.0
+            arank = r["alt_rank"] if r["alt_rank"] is not None else 999999
+            history_text.append(
+                f"{idx}) ts={ts}, sentiment={sent}, galaxy_score={gscore}, alt_rank={arank}"
+            )
+            idx += 1
+    except Exception as e:
+        logger.exception(f"[SentimentHistory] error retrieving rows => {e}")
+    finally:
+        conn.close()
+
+    return "; ".join(history_text)
 
 
 def get_ws_token(api_key: str, api_secret: str) -> Optional[dict]:
@@ -152,6 +234,52 @@ def get_ws_token(api_key: str, api_secret: str) -> Optional[dict]:
     except requests.exceptions.RequestException as e:
         logger.error(f"Error retrieving WS token from Kraken: {e}")
         return None
+
+
+def fetch_lunarcrush_sentiment(symbol: str) -> float:
+    """
+    Fetches sentiment data from LunarCrush for the given symbol, or returns 0.0 if unavailable.
+
+    This function is a simplified placeholder. In a real scenario:
+      1) You would have a LUNARCRUSH_API_KEY and make a request to the LunarCrush API.
+      2) Possibly parse 'galaxy_score' or 'alt_rank' or a custom sentiment metric.
+      3) Or you may read from a local DB (lunarcrush_data) if you store snapshot data.
+
+    Example usage in aggregator cycle => aggregator_data["lunarcrush_sentiment"] = fetch_lunarcrush_sentiment("ETH")
+
+    :param symbol: e.g. "ETH" or "BTC" or similar
+    :return: float representing sentiment or 0.0 if not found
+    """
+    # We'll do a quick demonstration call. Replace with your real endpoint/params:
+    # NOTE: This is purely illustrative. The actual LunarCrush endpoint and response may differ.
+    LUNARCRUSH_API_KEY = os.getenv("LUNARCRUSH_API_KEY", "")
+    if not LUNARCRUSH_API_KEY:
+        logger.warning("No LUNARCRUSH_API_KEY set => returning 0.0 for sentiment.")
+        return 0.0
+
+    base_url = "https://lunarcrush.com/api4/public/coins/list/v2"
+    params = {
+        "key": LUNARCRUSH_API_KEY,
+        "symbol": symbol.upper()
+    }
+    try:
+        r = requests.get(base_url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        # Suppose we find the coin in data["data"] with a "galaxy_score" or something
+        # We'll do a naive approach => if "data" array not empty => parse "galaxy_score"
+        coins = data.get("data", [])
+        if not coins:
+            return 0.0
+        # The first coin might match our symbol
+        coin = coins[0]
+        galaxy_score = coin.get("galaxy_score", 0.0)
+        sentiment = float(galaxy_score) / 100.0  # e.g. scale 0..1
+        logger.info(f"LunarCrush => {symbol}, galaxy_score={galaxy_score}, => sentiment={sentiment}")
+        return sentiment
+    except Exception as e:
+        logger.exception(f"Error fetching LunarCrush for {symbol} => {e}")
+        return 0.0
 
 
 class HybridApp:
@@ -194,17 +322,25 @@ class HybridApp:
     def _aggregator_cycle(self, pair: str, last_price: float):
         """
         1) fetch recent price_history => e.g. 100 bars
-        2) pass to AIStrategy => final_action, final_size
-        3) If final_action=BUY/SELL => call send_order + record in DB
+        2) fetch LunarCrush sentiment => aggregator_data["lunarcrush_sentiment"]
+        3) pass aggregator_data to AIStrategy => final_action, final_size
+        4) If final_action=BUY/SELL => call send_order + record in DB
         """
         px_stats = self._fetch_recent_price_trends(pair)
         if not px_stats:
             logger.info(f"[Aggregator] skip {pair}, insufficient data in price_history.")
             return
 
+        # Suppose pair is e.g. "ETH/USD", we want "ETH" for LunarCrush:
+        base_symbol = pair.split("/")[0].upper()  # "ETH", "XBT"
+
+        # 2) fetch sentiment from LunarCrush
+        lunarcrush_value = load_lunarcrush_sentiment_history(base_symbol, limit=5)
+
         aggregator_data = {
             "pair": pair,
             "price": last_price,
+            "lunarcrush_sentiment": lunarcrush_value,
             **px_stats
         }
         # AIStrategy => final action/size
@@ -238,10 +374,10 @@ class HybridApp:
         else:
             logger.debug(f"[Aggregator] => no trade => action={final_action}, size={final_size:.6f}")
 
-    def _fetch_recent_price_trends(self, pair: str) -> dict:
+    def _fetch_recent_price_trends(self, pair: str) -> Dict[str, Any]:
         """
         Read last ~100 last_price from 'price_history', compute ma_10 + volatility
-        Return a dict or {}
+        Return a dict or empty if insufficient data
         """
         try:
             conn = sqlite3.connect(DB_FILE)
@@ -295,7 +431,7 @@ def main():
 
     # risk controls from config
     risk_controls = config.get("risk_controls", {
-        "initial_spending_account": 40.0,
+        "initial_spending_account": 55.0,
         "purchase_upper_limit_percent": 50.0,
         "minimum_buy_amount": 10.0,
         "max_position_value": 20.0
@@ -310,18 +446,20 @@ def main():
 
     # 2) (Optional) training step
     if ENABLE_TRAINING:
-        logger.info("[Main] Training step would go here (omitted).")
+        logger.info("[Main] Training step would go here (omitted for brevity).")
 
     # 3) create AIStrategy
-    ai_model = AIStrategy(
+    ai_strategy = AIStrategy(
         pairs=TRADED_PAIRS,
-        model_path=None,       # or "trained_model.pkl"
         use_openai=ENABLE_GPT,
-        max_position_size=1,
+        max_position_size=3,
         stop_loss_pct=0.05,
         take_profit_pct=0.01,
         max_daily_drawdown=-0.02,
-        risk_controls=risk_controls
+        risk_controls=risk_controls,
+        gpt_model="gpt-4o-mini",
+        gpt_temperature=1.0,
+        gpt_max_tokens=2000
     )
     logger.info(f"[Main] AIStrategy => pairs={TRADED_PAIRS}, GPT={ENABLE_GPT}")
 
@@ -337,9 +475,9 @@ def main():
     # 5) create aggregator app
     aggregator_app = HybridApp(
         pairs=TRADED_PAIRS,
-        strategy=ai_model,
+        strategy=ai_strategy,
         aggregator_interval=AGG_INTERVAL,
-        private_ws_client=None  # we will set this after we create the priv_client
+        private_ws_client=None  # we will set this after we create priv_client
     )
 
     # 6) Build public feed
