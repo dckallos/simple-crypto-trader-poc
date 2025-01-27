@@ -15,27 +15,8 @@ per pair in 'sub_positions'. Each sub-position has:
 
 We also track daily realized PnL; if it's below 'max_daily_drawdown', then new
 trades are forced to HOLD. Additionally, 'max_position_size' clamps the
-per-trade size, and an optional 'max_position_value' can clamp cost in USD.
-
-Usage:
-    rm = RiskManagerDB(
-        db_path="trades.db",
-        max_position_size=0.002,
-        stop_loss_pct=0.05,
-        take_profit_pct=0.10,
-        max_daily_drawdown=-0.02,
-        max_position_value=5000.0
-    )
-    rm.initialize()
-
-    # Adjust a new trade:
-    final_signal, final_size = rm.adjust_trade(
-        signal="BUY",
-        suggested_size=0.01,
-        pair="ETH/USD",
-        current_price=1500.0
-    )
-    # Possibly => 'BUY', 0.002 if 0.01 was above max_position_size
+per-trade size, an optional 'max_position_value' can clamp cost in USD, and now
+`initial_spending_account` ensures we don't exceed a total allocated capital.
 """
 
 import logging
@@ -56,12 +37,13 @@ class RiskManagerDB:
       - daily drawdown limit => if daily realized PnL < max_daily_drawdown => force HOLD
       - clamp trade size by max_position_size
       - optionally clamp cost (size * price) by max_position_value
+      - ensures total used capital doesn't exceed `initial_spending_account`
       - optionally auto-close sub-positions in check_stop_loss_take_profit() if
         stop_loss_pct or take_profit_pct are set.
 
     A typical flow:
       - AIStrategy calls: final_signal, final_size = adjust_trade("BUY", 0.01, "ETH/USD", 2000)
-      - We do daily check => if okay, clamp size => insert sub-position row => return final.
+      - We do daily check => if okay, clamp size => ensure we don't exceed capital => insert sub-position => return final.
     """
 
     def __init__(
@@ -72,6 +54,7 @@ class RiskManagerDB:
         take_profit_pct: float = None,
         max_daily_drawdown: float = None,
         max_position_value: float = None,
+        initial_spending_account: float = 40.0
     ):
         """
         :param db_path: path to your trades.db
@@ -80,6 +63,7 @@ class RiskManagerDB:
         :param take_profit_pct: e.g. 0.10 => auto-close if +10%.
         :param max_daily_drawdown: e.g. -0.02 => skip new trades if daily realized < -2%.
         :param max_position_value: optional clamp on cost => trade_size * price <= this.
+        :param initial_spending_account: total allowed capital for all open buy positions.
         """
         self.db_path = db_path
         self.max_position_size = max_position_size
@@ -87,6 +71,7 @@ class RiskManagerDB:
         self.take_profit_pct = take_profit_pct
         self.max_daily_drawdown = max_daily_drawdown
         self.max_position_value = max_position_value
+        self.initial_spending_account = initial_spending_account
 
     def initialize(self) -> None:
         """
@@ -124,25 +109,24 @@ class RiskManagerDB:
         current_price: float
     ) -> (str, float):
         """
-        Adjust an AI-proposed trade to comply with risk constraints, and if still valid,
+        Adjust an AI-proposed trade to comply with risk constraints, and if valid,
         open a sub-position in the DB.
 
         Steps:
           1) If daily realized PnL <= max_daily_drawdown => force HOLD
           2) If signal not in ("BUY","SELL") => return HOLD
           3) clamp size by self.max_position_size
-          4) if self.max_position_value => clamp cost in USD
-          5) insert sub-position row => side= "long" or "short"
-          6) return final_signal, final_size
-
-        :return: (final_signal, final_size)
+          4) if signal=BUY => check total spent so far, ensure (spent + cost) <= initial_spending_account
+          5) if self.max_position_value => clamp cost in USD
+          6) insert sub-position row => side= "long" or "short"
+          7) return final_signal, final_size
         """
         # 1) daily drawdown check
         if self.max_daily_drawdown is not None:
             daily_pnl = self.get_daily_realized_pnl()
             if daily_pnl <= self.max_daily_drawdown:
                 logger.warning(
-                    f"Daily drawdown limit reached => realizedPnL={daily_pnl:.4f} <= {self.max_daily_drawdown}, forcing HOLD."
+                    f"Daily drawdown limit => realizedPnL={daily_pnl:.4f} <= {self.max_daily_drawdown}, forcing HOLD."
                 )
                 return ("HOLD", 0.0)
 
@@ -155,39 +139,49 @@ class RiskManagerDB:
         if final_size <= 0:
             return ("HOLD", 0.0)
 
-        # 4) clamp cost in USD if max_position_value is set
+        cost = final_size * current_price
+
+        # 4) If signal is BUY => check total spent
+        if signal == "BUY":
+            spent_so_far = self._sum_open_buy_positions()
+            if spent_so_far + cost > self.initial_spending_account:
+                logger.info(
+                    f"[RiskManager] Not enough capital => spent_so_far={spent_so_far:.2f}, "
+                    f"new_cost={cost:.2f}, limit={self.initial_spending_account:.2f}"
+                )
+                return ("HOLD", 0.0)
+
+        # 5) clamp cost in USD if max_position_value is set
         if self.max_position_value and self.max_position_value > 0:
-            cost = final_size * current_price
             if cost > self.max_position_value:
                 new_size = self.max_position_value / max(current_price, 1e-9)
                 logger.info(
-                    f"Clamping trade => cost {cost} > max_position_value={self.max_position_value}, new size={new_size}"
+                    f"[RiskManager] Clamping trade => cost {cost:.2f} > max_position_value={self.max_position_value}, "
+                    f"new size={new_size:.6f}"
                 )
                 final_size = new_size
+                if final_size <= 0:
+                    return ("HOLD", 0.0)
+                cost = final_size * current_price
 
-        if final_size <= 0:
-            return ("HOLD", 0.0)
-
-        # 5) Insert new sub-position row => side= "long" or "short" from signal
+        # insert sub-position => side= "long" or "short"
         side_str = "long" if signal == "BUY" else "short"
         self._insert_sub_position(pair, side_str, current_price, final_size)
         logger.info(
-            f"Opened new sub-position => {pair}, side={side_str}, entry_price={current_price}, size={final_size}"
+            f"[RiskManager] Opened new sub-position => pair={pair}, side={side_str}, "
+            f"entry_price={current_price:.2f}, size={final_size:.6f}, cost={cost:.2f}"
         )
 
-        # 6) return
         return (signal, final_size)
 
     def check_stop_loss_take_profit(self, pair: str, current_price: float) -> None:
         """
         Optionally close sub-positions if they cross stop_loss_pct or take_profit_pct.
-        In the simplest form, for each open sub-position:
+        For each open sub-position:
            - if side=long => unrealized % = (current_price - entry_price)/entry_price
            - if side=short => unrealized % = (entry_price - current_price)/entry_price
            If unrealized <= -stop_loss_pct => close
            If unrealized >= take_profit_pct => close
-
-        This snippet is minimal. You can expand it to partial closes or more advanced logic.
         """
         if not self.stop_loss_pct and not self.take_profit_pct:
             return
@@ -221,7 +215,7 @@ class RiskManagerDB:
                 realized = self._compute_realized_pnl(side, entry, current_price, size)
                 self._close_sub_position(pos_id, current_price, realized)
                 logger.info(
-                    f"Closed sub-position id={pos_id} for {pair} => {reason}, realized_pnl={realized:.4f}"
+                    f"[RiskManager] Closed sub-position id={pos_id}, {pair} => {reason}, realized_pnl={realized:.4f}"
                 )
 
     def get_daily_realized_pnl(self, date_str: str = None) -> float:
@@ -256,6 +250,31 @@ class RiskManagerDB:
     # --------------------------------------------------------------------------
     # DB sub-positions
     # --------------------------------------------------------------------------
+    def _sum_open_buy_positions(self) -> float:
+        """
+        Returns the total cost of all open BUY sub-positions, i.e. sum(entry_price * size).
+        This helps ensure we don't exceed initial_spending_account.
+        """
+        conn = sqlite3.connect(self.db_path)
+        try:
+            c = conn.cursor()
+            query = f"""
+                SELECT IFNULL(SUM(entry_price * size), 0.0)
+                FROM {SUB_POSITIONS_TABLE}
+                WHERE closed_at IS NULL
+                  AND side IN ('long','BUY')
+            """
+            c.execute(query)
+            row = c.fetchone()
+            if row and row[0]:
+                return float(row[0])
+            return 0.0
+        except Exception as e:
+            logger.exception(f"Error summing open buy positions => {e}")
+            return 0.0
+        finally:
+            conn.close()
+
     def _insert_sub_position(self, pair: str, side: str, entry_price: float, size: float):
         conn = sqlite3.connect(self.db_path)
         try:
@@ -327,7 +346,7 @@ class RiskManagerDB:
           if side=long => (exit_price - entry_price) * size
           if side=short => (entry_price - exit_price) * size
         """
-        if side == "long":
+        if side.lower() in ("long","buy"):
             return (exit_price - entry_price) * size
         else:
             return (entry_price - exit_price) * size

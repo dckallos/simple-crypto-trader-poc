@@ -11,18 +11,18 @@ using the classes defined in ws_data_feed.py:
 - KrakenPublicWSClient: for public data like ticker/trade
 - KrakenPrivateWSClient: for private data like openOrders, placing/canceling orders
 
-We store each incoming ticker/trade in 'price_history'. Then at a fixed interval,
-we gather aggregator data for ALL tracked coin pairs (e.g. sentiment, volatility,
-moving averages, etc.) in a single pass. We pass it to AIStrategy => predict_multi_coins(...)
-for a single GPT invocation that can decide collectively on each coin:
- - BUY / SELL / HOLD
- - Possibly close/swap an existing trade for a better opportunity.
+At a fixed interval, we gather aggregator data for ALL tracked coin pairs (including
+recent price, sentiment, volatility, etc.) in a single pass. Before doing so, we also
+call the Kraken "Balance" endpoint to check available funds. Then we pass everything
+to AIStrategy => predict_multi_coins(...) for a single GPT invocation. GPT can
+output buy/sell/hold decisions for each coin in one shot, including swapping trades
+if it sees a better opportunity.
 
-We do keep single-coin logic in AIStrategy for optional usage in the future,
-but this aggregator calls the multi-coin approach by default now.
+We keep single-coin logic in AIStrategy for optional usage later, but this aggregator
+calls the multi-coin approach by default.
 
 Environment:
-    - KRAKEN_API_KEY, KRAKEN_SECRET_API_KEY for private feed usage
+    - KRAKEN_API_KEY, KRAKEN_SECRET_API_KEY for private feed usage (balance queries & real trades)
     - OPENAI_API_KEY if GPT is used in AIStrategy
     - config.yaml for aggregator settings (pairs, intervals, risk_controls, etc.)
 
@@ -34,18 +34,20 @@ ASCII Flow:
     +-------------------+
               |
               v
-    aggregator_app.on_ticker()  => store in DB => aggregator_app tries aggregator_cycle_all_coins()
+    aggregator_app.on_ticker() => store in DB => aggregator_app tries aggregator_cycle_all_coins()
                   (every aggregator_interval seconds)
               |
               v
-    +------------------------+
-    |   AIStrategy (multi)  |
-    |   (GPT sees all coins)|
-    +------------------------+
+    +---------------------------------+
+    | aggregator_cycle_all_coins()   |
+    | => _fetch_kraken_balance()     |
+    | => build aggregator data       |
+    | => AIStrategy => GPT (multi)   |
+    +---------------------------------+
               |
        "decisions":[
-         {"pair":"ETH/USD","action":"BUY","size":...},
-         {"pair":"XBT/USD","action":"SELL","size":...}
+         {"pair":"ETH/USD","action":"BUY","size":0.001},
+         {"pair":"XBT/USD","action":"SELL","size":0.002}
        ]
               |
               v
@@ -78,7 +80,7 @@ from db import init_db, DB_FILE, record_trade_in_db
 from ai_strategy import AIStrategy
 from ws_data_feed import KrakenPublicWSClient, KrakenPrivateWSClient
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 warnings.simplefilter(action="ignore", category=pd.errors.SettingWithCopyWarning)
@@ -94,7 +96,7 @@ LOG_CONFIG = {
     'handlers': {
         'console': {
             'class': 'logging.StreamHandler',
-            'level': 'INFO',
+            'level': 'DEBUG',
             'formatter': 'standard',
             'stream': 'ext://sys.stdout'
         },
@@ -102,17 +104,17 @@ LOG_CONFIG = {
     'loggers': {
         '': {
             'handlers': ['console'],
-            'level': 'INFO',
+            'level': 'DEBUG',
             'propagate': True
         },
         'requests': {
             'handlers': ['console'],
-            'level': 'INFO',
+            'level': 'DEBUG',
             'propagate': True
         },
         'urllib3': {
             'handlers': ['console'],
-            'level': 'INFO',
+            'level': 'DEBUG',
             'propagate': True
         },
     }
@@ -151,6 +153,51 @@ def get_ws_token(api_key: str, api_secret: str) -> Optional[dict]:
         return None
 
 
+def fetch_kraken_balance(api_key: str, api_secret: str) -> Dict[str, float]:
+    """
+    Calls Kraken's /0/private/Balance endpoint to retrieve all cash balances (e.g. "ZUSD", "ZEUR", "XXBT", etc.).
+    Returns a dict of {asset: float_balance} or empty if error.
+
+    API Key Permissions Required: Funds permissions => Query
+    """
+    url = "https://api.kraken.com/0/private/Balance"
+    path = "/0/private/Balance"
+    nonce_val = int(time.time() * 1000)  # or monotonically increasing int
+
+    postdata = f"nonce={nonce_val}"
+    sha256 = hashlib.sha256((str(nonce_val) + postdata).encode("utf-8")).digest()
+    message = path.encode("utf-8") + sha256
+    secret = base64.b64decode(api_secret)
+    sig = hmac.new(secret, message, hashlib.sha512)
+    signature = base64.b64encode(sig.digest())
+
+    headers = {
+        'API-Key': api_key,
+        'API-Sign': signature.decode(),
+        'Content-Type': 'application/x-www-form-urlencoded'
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, data=postdata, timeout=10)
+        resp.raise_for_status()
+        j = resp.json()
+        if j.get("error"):
+            logger.error(f"[Balance] Kraken returned error => {j['error']}")
+            return {}
+        result = j.get("result", {})
+        # parse each asset => float
+        out = {}
+        for k,v in result.items():
+            try:
+                out[k] = float(v)
+            except:
+                out[k] = 0.0
+        return out
+    except requests.exceptions.RequestException as e:
+        logger.exception(f"[Balance] Error fetching kraken balance => {e}")
+        return {}
+
+
 class HybridApp:
     """
     A combined aggregator that:
@@ -158,6 +205,8 @@ class HybridApp:
       2) At aggregator_interval => aggregator_cycle_all_coins => gather aggregator data for ALL pairs
          => AIStrategy => single GPT call => produce decisions for each coin in one shot
       3) If final_action=BUY/SELL => place real trades on private feed.
+      4) Now also calls fetch_kraken_balance() before aggregator logic to ensure we have funds
+         info that we can pass to GPT in AIStrategy.
     """
 
     def __init__(
@@ -165,25 +214,30 @@ class HybridApp:
         pairs: List[str],
         strategy: AIStrategy,
         aggregator_interval: int = 300,
-        private_ws_client: Optional[KrakenPrivateWSClient] = None
+        private_ws_client: Optional[KrakenPrivateWSClient] = None,
+        kraken_api_key: str = "",
+        kraken_api_secret: str = ""
     ):
         """
         :param pairs: e.g. ["ETH/USD","XBT/USD"] => tracked coins
         :param strategy: AIStrategy instance
         :param aggregator_interval: time in seconds between aggregator cycles
         :param private_ws_client: optional => private feed for real trades
+        :param kraken_api_key: for fetch_kraken_balance calls
+        :param kraken_api_secret: for fetch_kraken_balance calls
         """
         self.pairs = pairs
         self.strategy = strategy
         self.aggregator_interval = aggregator_interval
         self.ws_private = private_ws_client
+        self.kraken_api_key = kraken_api_key
+        self.kraken_api_secret = kraken_api_secret
 
-        # For storing last ticker price in memory
+        # For storing last ticker price
         self.latest_prices: Dict[str, float] = {}
         for p in pairs:
             self.latest_prices[p] = 0.0
 
-        # For tracking last aggregator time
         self.last_agg_ts = 0
 
     def on_ticker(self, pair: str, last_price: float):
@@ -199,42 +253,55 @@ class HybridApp:
 
     def aggregator_cycle_all_coins(self):
         """
-        Gather aggregator data for ALL pairs => single GPT call => multi-coin decisions.
-        aggregator_list => e.g. [
-           {
-             "pair":"ETH/USD",
-             "price":..., # from self.latest_prices or DB
-             "aggregator_data":"rsi=...,price=...,vol=...,sentiment=..."
-           },
-           ...
-        ]
-        Then calls self.strategy.predict_multi_coins(...).
-        Then places trades if final action is buy/sell.
+        Steps:
+          1) fetch kraken account balance => e.g. {'ZUSD':..., 'XXBT':..., ...}
+          2) gather aggregator data for all pairs => aggregator_list
+          3) gather global trade_history => open_positions => pass with aggregator_list + account_balance
+             to AIStrategy => predict_multi_coins => single GPT call
+          4) place trades if final action=BUY/SELL
         """
-        logger.info("[Aggregator] aggregator_cycle_all_coins => building aggregator_list for all pairs")
+        logger.info("[Aggregator] aggregator_cycle_all_coins => Checking Kraken balance first...")
+
+        # 1) fetch balances
+        balance_info = {}
+        if self.kraken_api_key and self.kraken_api_secret:
+            balance_info = fetch_kraken_balance(self.kraken_api_key, self.kraken_api_secret)
+            logger.info(f"[Aggregator] Current Kraken Balances => {balance_info}")
+        else:
+            logger.warning("[Aggregator] No kraken_api_key/secret => skipping balance check.")
+
+        # 2) aggregator_list
         aggregator_list: List[Dict[str,Any]] = []
-
-        # We'll also gather global trade history if we like
-        trade_history = self._build_global_trade_history(limit=10)
-        # If you have open_positions in sub_positions, we can build a textual representation:
-        open_positions_txt = self._build_open_positions_list()
-
         for pair in self.pairs:
-            pair_data = self._build_aggregator_for_pair(pair)
-            aggregator_list.append(pair_data)
+            aggregator_list.append(self._build_aggregator_for_pair(pair))
+
+        # 3) build trade history + open positions
+        trade_history = self._build_global_trade_history(limit=10)
+        open_positions_txt = self._build_open_positions_list()
 
         logger.info("[Aggregator] aggregator_list => %s", aggregator_list)
 
-        # Now call AIStrategy => multi approach
+        # 4) AIStrategy => multi coin approach
+        # We'll pass the 'balance_info' as a special aggregator item or we can pass
+        # it in risk_controls. We'll do a simpler approach => AIStrategy can parse it from aggregator data
+        # or we can add a new param. For demonstration, we'll embed it as "account_balance"
+        # in the aggregator's multi approach. We'll do so by adding a special aggregator item
+        # or we can add it as risk_controls extension. Let's do a dedicated param for AIStrategy.
+        # We'll do it by just adding a "balance_info" key in aggregator_list item 0? or something else?
+        # For clarity, let's do it in AIStrategy => We'll add a param "account_balance" in the method.
+
+        # We'll store it in the strategy temporarily so GPT sees it:
+        self.strategy.current_account_balance = balance_info  # We'll add an attribute in AIStrategy dynamically
+
         decisions = self.strategy.predict_multi_coins(
             aggregator_list=aggregator_list,
             trade_history=trade_history,
-            max_trades=10,
+            max_trades=2,
             open_positions=open_positions_txt
         )
         logger.info("[Aggregator] GPT decisions => %s", decisions)
 
-        # For each coin => if action=buy/sell => place trades
+        # 5) place trades if needed
         for p, (action, size) in decisions.items():
             if action in ("BUY","SELL") and size>0:
                 side_str = "buy" if action=="BUY" else "sell"
@@ -257,30 +324,21 @@ class HybridApp:
                 else:
                     logger.warning("[Aggregator] no private feed or no valid price => cannot place real order.")
 
-    # --------------------------------------------------------------------------
-    # BUILD aggregator data for each pair
-    # --------------------------------------------------------------------------
     def _build_aggregator_for_pair(self, pair: str) -> Dict[str, Any]:
         """
         Return => {
           "pair":"ETH/USD",
           "price":1850.0,
-          "aggregator_data":"rsi=44, price=1850, vol=0.02, sentiment=someVal, ma_10=..., etc."
+          "aggregator_data":"price=1850, vol=0.02, ma10=..., sentiment=..., etc."
         }
-        We'll fetch from price_history, compute vol/ma, also load sentiment from DB, etc.
         """
-        # current price from memory or DB
         last_price = self.latest_prices.get(pair, 0.0)
-
-        # fetch short-term stats from DB
         px_stats = self._fetch_recent_price_trends(pair)
         vol = px_stats.get("price_volatility",0.0)
         ma10 = px_stats.get("price_ma_10",0.0)
 
-        # load local sentiment => e.g. a short text or numeric
         base_symbol = pair.split("/")[0].upper()
         sentiment_text = self._load_sentiment_for_symbol(base_symbol)
-
         aggregator_str = f"price={last_price}, vol={vol}, ma10={ma10}, {sentiment_text}"
 
         return {
@@ -290,9 +348,6 @@ class HybridApp:
         }
 
     def _fetch_recent_price_trends(self, pair: str) -> Dict[str, Any]:
-        """
-        Query 'price_history' => last 100 => compute ma_10 + vol
-        """
         try:
             conn = sqlite3.connect(DB_FILE)
             q = """
@@ -323,34 +378,27 @@ class HybridApp:
     def _load_sentiment_for_symbol(self, symbol: str) -> str:
         """
         Return e.g. "sentiment=..., galaxy=..., alt_rank=..."
-        We'll do a short text from lunarcrush_timeseries or data.
-        We'll just reference a function that returns a textual aggregator.
+        We'll do a single-row aggregator approach from lunarcrush_timeseries
         """
-        from db import DB_FILE
-        # We'll do a short approach => pick last row from lunarcrush_timeseries
-        # or we can do your 'load_lunarcrush_sentiment_history' if you like a multi-row summary:
-        # We'll do a single-row aggregator approach for brevity:
-        conn = sqlite3.connect(DB_FILE)
-        conn.row_factory = sqlite3.Row
         out="sentiment=0.0, galaxy=0.0, alt_rank=999999"
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory=sqlite3.Row
         try:
             c = conn.cursor()
-            # find coin_id
             c.execute("SELECT lunarcrush_id FROM lunarcrush_data WHERE UPPER(symbol)=? ORDER BY id DESC LIMIT 1",(symbol.upper(),))
             row = c.fetchone()
             if row and row["lunarcrush_id"]:
                 coin_id = str(row["lunarcrush_id"])
             else:
-                return "sentiment=0.0, galaxy=0.0, alt_rank=999999"
+                return out
 
-            # find last row
             c.execute("""
                 SELECT sentiment, galaxy_score, alt_rank
                 FROM lunarcrush_timeseries
                 WHERE coin_id=?
                 ORDER BY timestamp DESC
                 LIMIT 1
-            """, (coin_id,))
+            """,(coin_id,))
             row2 = c.fetchone()
             if row2:
                 s = row2["sentiment"] if row2["sentiment"] else 0.0
@@ -361,28 +409,15 @@ class HybridApp:
             logger.exception(f"[Aggregator] error loading sentiment => {e}")
         finally:
             conn.close()
-
         return out
 
     def _lookup_price_for_pair(self, pair: str, aggregator_list: List[Dict[str,Any]]) -> float:
-        """
-        Helper to find the 'price' field from aggregator_list for the given pair,
-        or fallback if missing.
-        """
         for item in aggregator_list:
             if item["pair"]==pair:
                 return item.get("price",0.0)
         return 0.0
 
-    # --------------------------------------------------------------------------
-    # Build a global trade history (the last N trades across all pairs), if desired
-    # --------------------------------------------------------------------------
     def _build_global_trade_history(self, limit=10) -> List[str]:
-        """
-        Return a list of up to 'limit' lines describing the most recent trades
-        across all pairs. e.g. "2025-01-21 10:15 BUY ETH/USD 0.001@2500"
-        Sorted by ID desc for demonstration.
-        """
         lines=[]
         conn = sqlite3.connect(DB_FILE)
         try:
@@ -396,12 +431,12 @@ class HybridApp:
             rows = c.fetchall()
             if not rows:
                 return []
-            rows=rows[::-1]  # chronological
+            rows=rows[::-1]
             for r in rows:
-                t, p, side, qty, px = r
+                t, p, sd, qty, px = r
                 import datetime
                 dt_s = datetime.datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M")
-                line = f"{dt_s} {side} {p} {qty}@{px}"
+                line = f"{dt_s} {sd} {p} {qty}@{px}"
                 lines.append(line)
         except Exception as e:
             logger.exception(f"[Aggregator] error building global trade history => {e}")
@@ -409,14 +444,9 @@ class HybridApp:
             conn.close()
         return lines
 
-    # --------------------------------------------------------------------------
-    # Build textual list of open positions from sub_positions
-    # --------------------------------------------------------------------------
     def _build_open_positions_list(self) -> List[str]:
         """
-        Query sub_positions for all open positions => return strings like
-        "ETH/USD LONG 0.002, entry=1860"
-        So GPT can see if we have trades it might want to close/swap.
+        Return textual list of open sub_positions so GPT can see them.
         """
         lines=[]
         conn = sqlite3.connect(DB_FILE)
@@ -443,14 +473,6 @@ class HybridApp:
 
 
 def main():
-    """
-    The main runner:
-      1) load config
-      2) init_db
-      3) create AIStrategy (use_openai => multi-coin approach)
-      4) get private feed token
-      5) aggregator => pass aggregator_data => AIStrategy => multi GPT decisions
-    """
     logging.config.dictConfig(LOG_CONFIG)
 
     CONFIG_FILE = "config.yaml"
@@ -463,10 +485,10 @@ def main():
     AGG_INTERVAL = config.get("trade_interval_seconds", 300)
 
     risk_controls = config.get("risk_controls", {
-        "initial_spending_account": 50.0,
+        "initial_spending_account": 30.0,
         "purchase_upper_limit_percent": 50.0,
         "minimum_buy_amount": 10.0,
-        "max_position_value": 20.0
+        "max_position_value": 25.0
     })
 
     load_dotenv()
@@ -476,11 +498,11 @@ def main():
     # 1) init DB
     init_db()
 
-    # 2) (Optional) training step
+    # 2) Optional training
     if ENABLE_TRAINING:
         logger.info("[Main] Potential training step here. Omitted for brevity.")
 
-    # 3) create AIStrategy => includes single+multi coin logic
+    # 3) create AIStrategy => multi-coin GPT approach
     ai_strategy = AIStrategy(
         pairs=TRADED_PAIRS,
         use_openai=ENABLE_GPT,
@@ -491,11 +513,11 @@ def main():
         risk_controls=risk_controls,
         gpt_model="o1-mini",          # Example model name
         gpt_temperature=1.0,
-        gpt_max_tokens=2000
+        gpt_max_tokens=25000
     )
     logger.info(f"[Main] AIStrategy => multi-coin GPT => pairs={TRADED_PAIRS}, GPT={ENABLE_GPT}")
 
-    # 4) get private token
+    # 4) get private token => we might do balance calls, etc. if we want
     token_json = get_ws_token(KRAKEN_API_KEY, KRAKEN_API_SECRET)
     token_str = None
     if token_json and "result" in token_json and "token" in token_json["result"]:
@@ -504,20 +526,20 @@ def main():
     else:
         logger.warning("[Main] Could not retrieve token => private feed disabled")
 
-    # 5) Build aggregator app => calls aggregator_cycle_all_coins
+    # 5) aggregator with multi-coin approach + ability to fetch balance
     aggregator_app = HybridApp(
         pairs=TRADED_PAIRS,
         strategy=ai_strategy,
         aggregator_interval=AGG_INTERVAL,
-        private_ws_client=None  # attach after creation if we have token
+        private_ws_client=None,
+        kraken_api_key=KRAKEN_API_KEY,
+        kraken_api_secret=KRAKEN_API_SECRET
     )
 
-    # Build public feed
+    # Build public feed => pass aggregator_app.on_ticker => aggregator interval => aggregator_cycle_all_coins
     pub_client = KrakenPublicWSClient(
         pairs=TRADED_PAIRS,
         feed_type="ticker",
-        # We'll define on_ticker_callback => aggregator_app.on_ticker to store last price,
-        # then aggregator_app tries aggregator_cycle_all_coins every aggregator_interval
         on_ticker_callback=aggregator_app.on_ticker
     )
 
@@ -538,7 +560,7 @@ def main():
     if priv_client:
         priv_client.start()
 
-    logger.info("[Main] Running multi-coin aggregator approach. Press Ctrl+C to exit.")
+    logger.info("[Main] Running multi-coin aggregator approach with balance checks. Press Ctrl+C to exit.")
     try:
         while True:
             time.sleep(1)

@@ -86,8 +86,7 @@ class LunarCrushFetcher:
 
         base_url = "https://lunarcrush.com/api4/public/coins/list/v2"
         params = {
-            "key": self.API_KEY,
-            "limit": limit
+            "key": self.API_KEY
         }
 
         attempt=0

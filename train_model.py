@@ -1,831 +1,603 @@
-# ==============================================================================
+#!/usr/bin/env python3
+# =============================================================================
 # FILE: train_model.py
-# ==============================================================================
+# =============================================================================
 """
 train_model.py
 
-1) Reads historical price data from the 'price_history' table in 'trades.db'
-   for multiple pairs.
-2) Constructs advanced features (Volume changes, RSI, MACD, Bollinger, correlation, etc.).
-3) Optionally merges aggregator data from:
-   - CryptoPanic (daily sentiment)
-   - LunarCrush (galaxy_score, alt_rank, etc.)
-4) Combines all pairs' data into one dataset, trains a scikit-learn model, saves to disk.
-5) Optionally logs performance metrics (accuracy, F1, etc.) to "training_metrics.csv".
+A script that trains a scikit-learn model primarily from LunarCrush time-series data,
+optionally merging aggregator data from:
+  - CryptoPanic (daily aggregator) => now stored in 'cryptopanic_posts'
+  - LunarCrush snapshot => 'lunarcrush_data' (e.g. galaxy_score, alt_rank, etc.)
 
-NEW ADDITION: An ADVANCED Backtest Logic
-- Replaces the naive SHIFT_BARS approach with:
-  (a) Position tracking (long/short/flat)
-  (b) Slippage & fees
-  (c) Stop-loss & take-profit
-  (d) Partial exits
-  (e) Advanced metrics (max drawdown, Sharpe, etc.)
-
-We also introduce a simple memory-limiting measure:
-  - `MAX_ROWS_PER_PAIR` to truncate the data read from the DB for each pair,
-    so that enormous datasets do not exceed reasonable memory.
+Enhancements:
+  - We **gracefully skip** coins with minimal time-series. A new 'MIN_DATA_ROWS'
+    threshold ensures we only train on coins that have enough valid rows
+    after building features.
+  - We read 'cryptopanic_posts' to compute daily averages of sentiment
+    (instead of referencing the old 'cryptopanic_news').
+  - If all coins are skipped, we log a warning instead of forcibly
+    preventing the script from continuing.
+  - We produce final training/backtest stats in a "model_info.json".
 
 Usage:
     python train_model.py
+
+Config or Hardcoded:
+    - SHIFT_BARS: how many bars forward we look for a future price jump
+    - THRESHOLD_UP: how large a % jump to label "up"
+    - MIN_DATA_ROWS: minimal rows needed for a coin to remain in training
+    - These can come from config.yaml or default constants.
+
+Environment:
+    - DB_FILE => 'trades.db', or set it here.
+    - If config.yaml is present => we read traded_pairs, min_data_rows, etc.
 """
 
 import os
-import sqlite3
 import logging
-import numpy as np
+import sqlite3
+import json
 import pandas as pd
+import numpy as np
 import yaml
 import joblib
-from typing import Tuple
 import warnings
+from typing import Tuple, Dict, Optional, List
+from datetime import datetime
 
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
 from sklearn.metrics import (
     accuracy_score,
-    confusion_matrix,
     balanced_accuracy_score,
+    confusion_matrix,
     f1_score,
     classification_report
 )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 warnings.filterwarnings("ignore", category=RuntimeWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 # ------------------------------------------------------------------------------
-# Configuration
+# Config & Constants
 # ------------------------------------------------------------------------------
-DB_FILE = "trades.db"                    # The same DB as main.py uses
-MODEL_OUTPUT_PATH = "trained_model.pkl"  # Where we save the scikit model
-METRICS_OUTPUT_FILE = "training_metrics.csv"
+DB_FILE            = "trades.db"
+MODEL_OUTPUT_PATH  = "trained_model.pkl"
+METRICS_OUTPUT_FILE= "training_metrics.csv"
+MODEL_INFO_FILE    = "model_info.json"
 
-# If you want correlation with BTC, define the pair used in 'price_history' for BTC
-BTC_PAIR = "XBT/USD"
+SHIFT_BARS         = 24       # how many bars forward we look for future price jump
+THRESHOLD_UP       = 0.02     # +2% => label "price up"
+MIN_DATA_ROWS      = 100      # minimal data rows after building features
 
-# Load pairs from config.yaml
-with open("config.yaml", "r") as file:
-    config = yaml.safe_load(file)
-TRADED_PAIRS = config.get("traded_pairs", [])
-
-# SHIFT_BARS and THRESHOLD_UP are used to define how we label "up"
-SHIFT_BARS = 25
-THRESHOLD_UP = 0.001  # +1%
-
-# ----------------------------------------------------------------------
-# Memory-limiting measure: limit maximum rows per pair
-# ----------------------------------------------------------------------
-MAX_ROWS_PER_PAIR = 50_000  # Adjust as needed to limit memory usage
-
+# If config.yaml => override
+if os.path.exists("config.yaml"):
+    with open("config.yaml","r") as f:
+        config = yaml.safe_load(f)
+    TRADED_PAIRS    = config.get("traded_pairs", [])
+    MIN_DATA_ROWS   = config.get("min_data_rows", 200)
+else:
+    logger.warning("No config.yaml => defaulting.")
+    TRADED_PAIRS    = []
+    MIN_DATA_ROWS   = 200
 
 # ------------------------------------------------------------------------------
-# Step 1: Load Data from DB, but limit to MAX_ROWS_PER_PAIR
-# ------------------------------------------------------------------------------
-def load_data_for_pair(db_file: str, pair: str) -> pd.DataFrame:
-    """
-    Loads data from 'price_history' for a single pair, returning columns:
-        [timestamp, pair, bid_price, ask_price, last_price, volume].
-    Sorted ascending by timestamp. Empty if no data or error.
-
-    If the number of rows is larger than MAX_ROWS_PER_PAIR, we truncate to
-    the most recent MAX_ROWS_PER_PAIR rows. This helps prevent enormous
-    memory usage with large tables.
-    """
-    if not os.path.exists(db_file):
-        logger.error(f"Database file {db_file} not found.")
-        return pd.DataFrame()
-
-    conn = sqlite3.connect(db_file)
-    try:
-        # We'll do a first pass to see how many total rows exist,
-        # then either read all or read partial.
-        total_rows_query = f"""
-            SELECT COUNT(*) FROM price_history WHERE pair='{pair}'
-        """
-        c = conn.cursor()
-        c.execute(total_rows_query)
-        rowcount = c.fetchone()[0] or 0
-
-        if rowcount == 0:
-            logger.warning(f"No rows in price_history for pair={pair}")
-            return pd.DataFrame()
-
-        if rowcount > MAX_ROWS_PER_PAIR:
-            # We'll read only the last MAX_ROWS_PER_PAIR rows by timestamp
-            logger.info(
-                f"Pair={pair} has {rowcount} rows; reading only the last {MAX_ROWS_PER_PAIR} to limit memory usage."
-            )
-            # We can do a subquery approach:
-            query_limited = f"""
-                SELECT timestamp, pair, bid_price, ask_price, last_price, volume
-                FROM (
-                    SELECT *
-                    FROM price_history
-                    WHERE pair='{pair}'
-                    ORDER BY timestamp DESC
-                    LIMIT {MAX_ROWS_PER_PAIR}
-                )
-                ORDER BY timestamp ASC
-            """
-            df = pd.read_sql_query(query_limited, conn)
-        else:
-            query = f"""
-                SELECT timestamp, pair, bid_price, ask_price, last_price, volume
-                FROM price_history
-                WHERE pair='{pair}'
-                ORDER BY timestamp ASC
-            """
-            df = pd.read_sql_query(query, conn)
-
-        return df
-    except Exception as e:
-        logger.exception(f"Error reading from DB for pair={pair}: {e}")
-        return pd.DataFrame()
-    finally:
-        conn.close()
-
-
-def load_data_for_btc(db_file: str, btc_pair: str = BTC_PAIR) -> pd.DataFrame:
-    """
-    A convenience function to load BTC data if you want correlation.
-    Same logic as load_data_for_pair but singled out for clarity.
-    We'll also limit to MAX_ROWS_PER_PAIR if it exceeds that.
-    """
-    if not btc_pair:
-        return pd.DataFrame()
-    return load_data_for_pair(db_file, btc_pair)
-
-
-# ------------------------------------------------------------------------------
-# Step 2: CryptoPanic Aggregator (Daily) - Merging
+# CryptoPanic aggregator => from 'cryptopanic_posts'
 # ------------------------------------------------------------------------------
 def fetch_cryptopanic_aggregated(db_file: str) -> pd.DataFrame:
     """
-    Example aggregator that returns daily average sentiment from the
-    'cryptopanic_news' table. If you have a different aggregator table, adapt.
-    We'll produce columns: [news_date, avg_sentiment].
+    Loads daily aggregator from 'cryptopanic_posts' => [news_date, avg_sentiment].
+
+    Implementation:
+      SELECT
+        DATE(created_at, 'unixepoch') as news_date,
+        AVG(sentiment_score) as avg_sentiment
+      FROM cryptopanic_posts
+      GROUP BY news_date
+      ORDER BY news_date
+
+    If the table or data is missing => returns empty DataFrame,
+    so we can skip aggregator merges gracefully.
     """
     if not os.path.exists(db_file):
-        logger.error(f"Database file {db_file} not found.")
+        logger.error(f"DB file not found => {db_file}. No cryptopanic aggregator.")
         return pd.DataFrame()
 
     conn = sqlite3.connect(db_file)
     try:
         query = """
             SELECT
-                DATE(timestamp, 'unixepoch') as news_date,
-                AVG(sentiment_score) as avg_sentiment
-            FROM cryptopanic_news
+              DATE(created_at, 'unixepoch') as news_date,
+              AVG(sentiment_score) as avg_sentiment
+            FROM cryptopanic_posts
             GROUP BY news_date
-            ORDER BY news_date ASC
+            ORDER BY news_date
         """
         df = pd.read_sql_query(query, conn)
         return df
     except Exception as e:
-        logger.exception(f"Error reading cryptopanic aggregator: {e}")
+        logger.exception(f"Error reading from 'cryptopanic_posts': {e}")
         return pd.DataFrame()
     finally:
         conn.close()
 
-
 # ------------------------------------------------------------------------------
-# Step 3: LunarCrush Aggregator (Daily or Single Snapshot)
+# LunarCrush aggregator => from 'lunarcrush_data'
 # ------------------------------------------------------------------------------
 def fetch_lunarcrush_data_for_symbol(db_file: str, symbol: str) -> pd.DataFrame:
     """
-    Example approach: If your 'lunarcrush_data' table has 1 row per day or
-    multiple daily snapshots, you can transform it to daily data: [lc_date, galaxy_score, alt_rank, etc.].
-    Or if you store everything with a timestamp but only 1 snapshot daily, we do a daily grouping.
-
-    We'll do something naive: just get the daily approach or last approach for the symbol.
-    For a robust approach, you'd store a time series. For demonstration, we'll produce:
-      [lc_date, galaxy_score, alt_rank, sentiment, ...].
+    Suppose your 'lunarcrush_data' table is daily or snapshot-based.
+    We'll do a naive aggregator approach:
+      SELECT
+        DATE(inserted_at, 'unixepoch') as lc_date,
+        AVG(galaxy_score) as galaxy_score,
+        AVG(alt_rank) as alt_rank,
+        ...
+      FROM lunarcrush_data
+      WHERE UPPER(symbol)=UPPER(?)
+      GROUP BY lc_date
+    Then we can merge on date in the time-series build_features step.
     """
     if not os.path.exists(db_file):
-        logger.error(f"Database file {db_file} not found.")
+        logger.error(f"DB file not found => {db_file}. No lunarcrush snapshot aggregator.")
         return pd.DataFrame()
 
     conn = sqlite3.connect(db_file)
     try:
-        query = f"""
+        query=f"""
             SELECT
-                DATE(timestamp, 'unixepoch') as lc_date,
-                AVG(galaxy_score) as galaxy_score,
-                AVG(alt_rank) as alt_rank,
-                AVG(price) as avg_price_lc,
-                AVG(volume_24h) as avg_vol_24h,
-                AVG(market_cap) as avg_mcap,
-                AVG(social_volume_24h) as avg_soc_vol,
-                AVG(sentiment) as avg_lc_sent
+              DATE(inserted_at, 'unixepoch') as lc_date,
+              AVG(galaxy_score) as galaxy_score,
+              AVG(alt_rank) as alt_rank,
+              AVG(price) as avg_price_lc,
+              AVG(volume_24h) as avg_vol_24h,
+              AVG(market_cap) as avg_mcap,
+              AVG(sentiment) as avg_lc_sent
             FROM lunarcrush_data
-            WHERE symbol='{symbol}'
+            WHERE UPPER(symbol)=UPPER('{symbol}')
             GROUP BY lc_date
             ORDER BY lc_date
         """
-        df_lc = pd.read_sql_query(query, conn)
-        return df_lc
+        df = pd.read_sql_query(query, conn)
+        return df
     except Exception as e:
-        logger.exception(f"Error reading lunarcrush data for symbol={symbol}: {e}")
+        logger.exception(f"Error reading aggregator from lunarcrush_data => {e}")
         return pd.DataFrame()
     finally:
         conn.close()
 
+# ------------------------------------------------------------------------------
+# Time-series => from 'lunarcrush_timeseries'
+# ------------------------------------------------------------------------------
+def load_lunarcrush_timeseries(db_file: str, coin_id: str, limit: Optional[int] = None) -> pd.DataFrame:
+    """
+    Reads from 'lunarcrush_timeseries' => columns typically:
+      coin_id, timestamp, open_price, close_price, high_price, low_price,
+      volume_24h, market_cap, sentiment, galaxy_score, alt_rank
+    Sort ascending by timestamp. If limit => read only last N rows.
+
+    Return => DataFrame
+    """
+    if not os.path.exists(db_file):
+        logger.error(f"DB not found => can't load => {db_file}")
+        return pd.DataFrame()
+
+    conn = sqlite3.connect(db_file)
+    try:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM lunarcrush_timeseries WHERE coin_id=?",(coin_id,))
+        rowcount = c.fetchone()[0] or 0
+        if rowcount==0:
+            logger.warning(f"No timeseries for coin_id={coin_id}")
+            return pd.DataFrame()
+
+        if limit and rowcount>limit:
+            logger.info(f"coin_id={coin_id} => {rowcount} rows => limit to last {limit}")
+            q = f"""
+                SELECT *
+                FROM (
+                  SELECT
+                    coin_id, timestamp,
+                    open_price, close_price, high_price, low_price,
+                    volume_24h, market_cap, sentiment, galaxy_score, alt_rank
+                  FROM lunarcrush_timeseries
+                  WHERE coin_id=?
+                  ORDER BY timestamp DESC
+                  LIMIT {limit}
+                ) sub
+                ORDER BY timestamp ASC
+            """
+            df = pd.read_sql_query(q, conn, params=[coin_id])
+        else:
+            q2 = """
+                SELECT
+                  coin_id, timestamp,
+                  open_price, close_price, high_price, low_price,
+                  volume_24h, market_cap, sentiment, galaxy_score, alt_rank
+                FROM lunarcrush_timeseries
+                WHERE coin_id=?
+                ORDER BY timestamp ASC
+            """
+            df = pd.read_sql_query(q2, conn, params=[coin_id])
+        return df
+    except Exception as e:
+        logger.exception(f"Error loading timeseries => coin_id={coin_id}, {e}")
+        return pd.DataFrame()
+    finally:
+        conn.close()
 
 # ------------------------------------------------------------------------------
-# Step 4: Build Features, Possibly Merge BTC correlation, CryptoPanic daily sentiment, LunarCrush, etc.
+# Build features
 # ------------------------------------------------------------------------------
-def build_features_and_labels(
-    df: pd.DataFrame,
-    df_btc: pd.DataFrame = None,
-    df_cpanic: pd.DataFrame = None,
-    df_lc: pd.DataFrame = None
+def build_features(
+    df_ts: pd.DataFrame,
+    df_cp: pd.DataFrame = None,
+    df_lc: pd.DataFrame = None,
+    shift_bars: int = 24,
+    threshold_up: float = 0.02
 ) -> Tuple[pd.DataFrame, pd.Series]:
     """
-    Build advanced features for a single pair. Then merges optional:
-      - BTC correlation
-      - CryptoPanic aggregator daily sentiment
-      - LunarCrush aggregator daily approach (galaxy_score, alt_rank, etc.)
+    Build advanced features from a single coin's time-series, merges aggregator from:
+      - cryptopanic_aggregated => [news_date, avg_sentiment]
+      - lunarcrush_data aggregator => [lc_date, galaxy_score, alt_rank, avg_lc_sent, ...]
+    SHIFT_BARS => how many bars forward we look for a future close price jump
+    THRESHOLD_UP => how large a % jump to label "up"
 
-    Returns (X, y) => Feature DataFrame, label Series
-
-    SHIFT_BARS=25, require +1% for label_up=1, to handle short-term labeling.
+    Return => (X, y). X is features, y is label_up in {0,1}.
+    If insufficient data => we can return empty X,y.
     """
+    if df_ts.empty or "close_price" not in df_ts.columns:
+        return pd.DataFrame(), pd.Series([], dtype=int)
 
-    import pandas as pd
-    if df.empty or "last_price" not in df.columns:
-        return pd.DataFrame(), pd.Series(dtype=int)
-
-    # Sort ascending
-    df = df.sort_values("timestamp").reset_index(drop=True)
-
+    df = df_ts.sort_values("timestamp").reset_index(drop=True)
     df["datetime"] = pd.to_datetime(df["timestamp"], unit="s")
-    df["hour_of_day"] = df["datetime"].dt.hour
-    df["day_of_week"] = df["datetime"].dt.weekday
+    df["date"] = df["datetime"].dt.date
 
-    # Basic Indicators
-    df["feature_price"] = df["last_price"]
-    df["feature_ma_3"] = df["last_price"].rolling(window=3).mean()
-    df["feature_spread"] = df["ask_price"] - df["bid_price"]
-
-    # Volume change
-    df["vol_change"] = df["volume"].pct_change().fillna(0)
+    # Basic indicators
+    df["price"] = df["close_price"]
+    df["ma_5"]  = df["close_price"].rolling(5).mean()
+    df["ma_20"] = df["close_price"].rolling(20).mean()
+    df["std_10"]= df["close_price"].rolling(10).std()
 
     # RSI
-    window_length = 14
-    close_delta = df["last_price"].diff()
-    gain = close_delta.clip(lower=0)
-    loss = (-1 * close_delta.clip(upper=0))
-    avg_gain = gain.rolling(window=window_length, min_periods=window_length).mean()
-    avg_loss = loss.rolling(window=window_length, min_periods=window_length).mean()
-    rs = avg_gain / (avg_loss + 1e-9)
-    df["rsi"] = 100 - (100 / (1 + rs))
+    wlen=14
+    delta = df["close_price"].diff()
+    gain  = delta.clip(lower=0)
+    loss  = -1 * delta.clip(upper=0)
+    avg_gain = gain.rolling(wlen).mean()
+    avg_loss = loss.rolling(wlen).mean()
+    rs = avg_gain/(avg_loss+1e-9)
+    df["rsi"] = 100 - (100/(1+rs))
 
-    # MACD
-    ema12 = df["last_price"].ewm(span=12).mean()
-    ema26 = df["last_price"].ewm(span=26).mean()
-    df["macd_line"] = ema12 - ema26
-    df["macd_signal"] = df["macd_line"].ewm(span=9).mean()
+    # local sentiment => if 'sentiment' col
+    if "sentiment" in df.columns:
+        df["sent_7"] = df["sentiment"].rolling(7).mean()
+    else:
+        df["sent_7"] = 0.0
 
-    # Bollinger
-    sma20 = df["last_price"].rolling(20).mean()
-    std20 = df["last_price"].rolling(20).std()
-    df["boll_upper"] = sma20 + (2 * std20)
-    df["boll_lower"] = sma20 - (2 * std20)
+    # SHIFT_BARS => label "up"
+    df["future_close"] = df["close_price"].shift(-shift_bars)
+    df["pct_future_gain"] = (df["future_close"] - df["close_price"]) / (df["close_price"]+1e-9)
+    df["label_up"] = (df["pct_future_gain"]>=threshold_up).astype(int)
+    df.dropna(subset=["future_close"], inplace=True)
 
-    # Rolling vol & rolling volume
-    df["rolling_vol_10"] = df["last_price"].rolling(10).std()
-    df["rolling_volume_10"] = df["volume"].rolling(10).mean()
-
-    # Merge correlation with BTC
-    if df_btc is not None and not df_btc.empty:
-        df_btc = df_btc.sort_values("timestamp").reset_index(drop=True)
-        df_btc_ren = df_btc[["timestamp", "last_price"]].rename(columns={"last_price": "btc_price"})
-        df = pd.merge_asof(
-            df.sort_values("timestamp"),
-            df_btc_ren,
-            on="timestamp",
-            direction="nearest",
-            tolerance=30
-        )
-        df["corr_with_btc"] = df["last_price"].rolling(30).corr(df["btc_price"])
-
-    # Merge CryptoPanic aggregator
-    if df_cpanic is not None and not df_cpanic.empty:
-        df["trade_date"] = df["datetime"].dt.date
-        df_cpanic_ren = df_cpanic.rename(columns={"news_date": "trade_date"})
-        df = pd.merge(
-            df,
-            df_cpanic_ren,
-            on="trade_date",
-            how="left"
-        )
+    # aggregator merges
+    if df_cp is not None and not df_cp.empty:
+        # cryptopanic => [news_date, avg_sentiment]
+        # rename => date => merge on date
+        df_cp2 = df_cp.rename(columns={"news_date":"date"})
+        df = pd.merge(df, df_cp2, on="date", how="left")
         df["avg_sentiment"] = df["avg_sentiment"].fillna(0)
 
-    # Merge LunarCrush aggregator
     if df_lc is not None and not df_lc.empty:
-        df["lc_date"] = df["datetime"].dt.date
-        df_lc_ren = df_lc.rename(columns={"lc_date": "lc_date"})
-        df = pd.merge(
-            df,
-            df_lc_ren,
-            left_on="lc_date",
-            right_on="lc_date",
-            how="left"
-        )
-        for col in ["galaxy_score", "alt_rank", "avg_lc_sent"]:
+        # lunarcrush => [lc_date, galaxy_score, alt_rank, avg_lc_sent, etc.]
+        df_lc2 = df_lc.rename(columns={"lc_date":"date"})
+        df = pd.merge(df, df_lc2, on="date", how="left")
+        for col in ["galaxy_score","alt_rank","avg_lc_sent"]:
             if col in df.columns:
                 df[col].fillna(0, inplace=True)
 
-    df.ffill(inplace=True)
-    df.bfill(inplace=True)
-
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df.dropna(inplace=True)
 
-    # SHIFT_BARS=25 => label_up=1 if future price is +1%
-    df["future_max"] = df["last_price"].rolling(SHIFT_BARS).max().shift(-SHIFT_BARS)
-    df["pct_future_gain"] = (df["future_max"] - df["last_price"]) / (df["last_price"] + 1e-9)
-    df["label_up"] = (df["pct_future_gain"] >= THRESHOLD_UP).astype(int)
-
-    df.dropna(subset=["future_max"], inplace=True)
-    df.reset_index(drop=True, inplace=True)
-
-    # Feature columns
-    feature_cols = [
-        "feature_price", "feature_ma_3", "feature_spread",
-        "vol_change", "rsi", "macd_line", "macd_signal",
-        "boll_upper", "boll_lower",
-        "hour_of_day", "day_of_week",
-        "rolling_vol_10", "rolling_volume_10"
-    ]
-    if "corr_with_btc" in df.columns:
-        feature_cols.append("corr_with_btc")
+    # final features
+    feats = ["price","ma_5","ma_20","std_10","rsi","sent_7"]
     if "avg_sentiment" in df.columns:
-        feature_cols.append("avg_sentiment")
+        feats.append("avg_sentiment")
     if "galaxy_score" in df.columns:
-        feature_cols.append("galaxy_score")
+        feats.append("galaxy_score")
     if "alt_rank" in df.columns:
-        feature_cols.append("alt_rank")
+        feats.append("alt_rank")
     if "avg_lc_sent" in df.columns:
-        feature_cols.append("avg_lc_sent")
+        feats.append("avg_lc_sent")
 
-    df.dropna(subset=feature_cols, inplace=True)
-    df.reset_index(drop=True, inplace=True)
+    X = df[feats].copy()
+    y = df["label_up"].copy()
 
-    X = df[feature_cols]
-    y = df["label_up"]
     return X, y
 
-
 # ------------------------------------------------------------------------------
-# Step 5: Training routine with class imbalance handling
+# Train model => time-series split => hold-out
 # ------------------------------------------------------------------------------
-def train_model(X: pd.DataFrame, y: pd.Series):
-    """
-    Trains a RandomForest with class_weight balancing options.
-    Uses TimeSeriesSplit + GridSearchCV with 'f1_macro' scoring.
-    Then does a final forward-based hold-out for the last 20% of data.
-    Logs accuracy, balanced accuracy, F1, confusion matrix, etc.
-    """
-
+def train_random_forest(X: pd.DataFrame, y: pd.Series):
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
 
-    if X.empty or len(X) < 10:
-        logger.warning("Not enough data to train a robust model!")
+    if X.empty or len(X)<10:
+        logger.warning("Insufficient data => skip training.")
         return None, None
 
-    # 1) Inspect label distribution
-    label_dist = y.value_counts(normalize=True)
-    logger.info("Label distribution (0 vs 1):\n" + str(label_dist))
+    logger.info("Label distribution =>\n%s", y.value_counts())
 
-    # 2) TimeSeriesSplit for cross-validation
     tscv = TimeSeriesSplit(n_splits=3)
-
-    # 3) Hyperparam grid with class_weight
-    param_grid = {
-        'n_estimators': [50, 100],
-        'max_depth': [None, 5, 10],
-        'class_weight': [None, 'balanced']
+    param_grid={
+      "n_estimators": [50,100],
+      "max_depth": [None,5,10],
+      "class_weight": [None,"balanced"]
     }
+    base=RandomForestClassifier(random_state=42)
+    g=GridSearchCV(base, param_grid, scoring="f1_macro", cv=tscv, n_jobs=-1)
+    g.fit(X,y)
 
-    base_rf = RandomForestClassifier(random_state=42)
-    # We use 'f1_macro' to give both classes equal importance
-    grid = GridSearchCV(
-        estimator=base_rf,
-        param_grid=param_grid,
-        scoring='f1_macro',
-        cv=tscv,
-        n_jobs=-1
-    )
-    grid.fit(X, y)
+    best=g.best_estimator_
+    logger.info(f"Best params => {g.best_params_}, best CV F1 => {g.best_score_:.4f}")
 
-    best_model = grid.best_estimator_
-    logger.info(f"Best params from GridSearchCV: {grid.best_params_}")
-    logger.info(f"Best CV (f1_macro) score: {grid.best_score_:.4f}")
+    hold_size = max(1, int(len(X)*0.2))
+    X_train = X.iloc[:-hold_size]
+    y_train = y.iloc[:-hold_size]
+    X_test  = X.iloc[-hold_size:]
+    y_test  = y.iloc[-hold_size:]
 
-    # 4) Final forward-based hold-out (last 20%)
-    hold_out_size = int(0.2 * len(X))
-    if hold_out_size == 0:
-        hold_out_size = 1  # minimal fallback
+    best.fit(X_train,y_train)
+    y_pred=best.predict(X_test)
 
-    X_train = X.iloc[:-hold_out_size]
-    y_train = y.iloc[:-hold_out_size]
-    X_test = X.iloc[-hold_out_size:]
-    y_test = y.iloc[-hold_out_size:]
+    acc=accuracy_score(y_test,y_pred)
+    bal_acc=balanced_accuracy_score(y_test,y_pred)
+    f1m=f1_score(y_test,y_pred,average="macro")
 
-    best_model.fit(X_train, y_train)
-    y_pred = best_model.predict(X_test)
+    logger.info(f"Final hold-out => Acc={acc:.4f}, BalAcc={bal_acc:.4f}, F1macro={f1m:.4f}")
+    cm=confusion_matrix(y_test,y_pred)
+    logger.info("Confusion =>\n%s", cm)
+    logger.info("Report =>\n%s", classification_report(y_test,y_pred))
 
-    acc = accuracy_score(y_test, y_pred)
-    bal_acc = balanced_accuracy_score(y_test, y_pred)
-    f1_macro = f1_score(y_test, y_pred, average='macro')
+    return best, f1m
 
-    logger.info(f"Final hold-out Accuracy = {acc:.4f}")
-    logger.info(f"Final hold-out Balanced Accuracy = {bal_acc:.4f}")
-    logger.info(f"Final hold-out F1 (macro) = {f1_macro:.4f}")
-
-    cm = confusion_matrix(y_test, y_pred)
-    logger.info(f"Confusion Matrix (final hold-out):\n{cm}")
-
-    report = classification_report(y_test, y_pred)
-    logger.info(f"Classification Report:\n{report}")
-
-    return best_model, f1_macro
-
-
-def log_accuracy_to_csv(accuracy: float):
-    """
-    Optionally log the accuracy (or any other metric) to a CSV file over time.
-    """
+def log_accuracy_to_csv(val: float):
     import datetime
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     if not os.path.exists(METRICS_OUTPUT_FILE):
-        with open(METRICS_OUTPUT_FILE, "w") as f:
+        with open(METRICS_OUTPUT_FILE,"w") as f:
             f.write("timestamp,accuracy\n")
-
-    with open(METRICS_OUTPUT_FILE, "a") as f:
-        f.write(f"{timestamp},{accuracy:.4f}\n")
-
+    with open(METRICS_OUTPUT_FILE,"a") as f:
+        f.write(f"{stamp},{val:.4f}\n")
 
 # ------------------------------------------------------------------------------
-# Step 6: ADVANCED Backtest Logic
+# Probability-based naive backtest
 # ------------------------------------------------------------------------------
-def backtest_model(
+def backtest_prob(
     X: pd.DataFrame,
     model,
     buy_threshold=0.6,
     sell_threshold=0.4,
     stop_loss_pct=0.03,
     take_profit_pct=0.05,
-    max_hold_bars=SHIFT_BARS,
-    slippage_rate=0.0005,
-    fee_rate=0.001
+    shift_bars=24
 ):
     """
-    A more realistic backtest that simulates:
-      - Long & Short entries based on probability (p_up > buy_threshold => go long,
-        p_up < sell_threshold => go short).
-      - Maintains a single position at a time (position_size).
-      - Stop-loss & take-profit if price moves beyond thresholds.
-      - Partial exit logic:
-         if we reach half the take_profit early, we close 50% to lock in gains.
-      - Slippage & fees on each trade.
-      - Advanced metrics: total PnL, max drawdown, Sharpe ratio.
-
-    :param X: DataFrame of features in chronological order.
-              Must have "feature_price" for entry/exit prices.
-    :param model: Trained scikit-learn model that supports predict_proba.
-    :param buy_threshold: Probability above which we open a long position if flat.
-    :param sell_threshold: Probability below which we open a short position if flat.
-    :param stop_loss_pct: E.g. 0.03 => stop if trade is -3%.
-    :param take_profit_pct: E.g. 0.05 => fully close if +5%.
-    :param max_hold_bars: Force exit after these many bars if still open.
-    :param slippage_rate: e.g. 0.0005 => 0.05%
-    :param fee_rate: e.g. 0.001 => 0.1%
-
-    :return:
-      df_trades: each row is an entry/exit event or partial exit.
-      advanced_stats: dict with final metrics (total_pnl, max_drawdown, sharpe, etc.)
+    If p_up> buy_threshold => open long => hold up to shift_bars or stop/take-profit.
+    Very naive demonstration.
     """
-    import pandas as pd
+    if X.empty:
+        logger.info("[Backtest] => no data => skip.")
+        return pd.DataFrame(), {}
 
-    if not hasattr(model, "predict_proba"):
-        logger.warning("Model has no predict_proba. We'll do predict => 0/1 only.")
-        def prob_func(row_df):
-            pred = model.predict(row_df)[0]
-            return float(pred)
-    else:
-        def prob_func(row_df):
-            proba = model.predict_proba(row_df)[0]
-            return proba[1] if len(proba) > 1 else float(model.classes_[0] == 1)
+    if not hasattr(model,"predict_proba"):
+        logger.warning("[Backtest] => model has no predict_proba => skip.")
+        return pd.DataFrame(), {}
 
-    # Sort by ascending index if not sorted
-    X = X.reset_index(drop=True)
+    if "price" not in X.columns:
+        logger.warning("[Backtest] => missing 'price' column => skip.")
+        return pd.DataFrame(), {}
 
-    position_size = 0
-    entry_price = 0.0
-    partial_exit_done = False
+    prob_up = model.predict_proba(X)[:,1]
+    prices  = X["price"].values
+    trades=[]
+    i=0
+    position=0
+    entry=0.0
 
-    trades = []
-
-    i = 0
-    while i < len(X):
-        row = X.iloc[i]
-        row_df = row.to_frame().T
-        current_price = row["feature_price"]
-
-        if position_size == 0:
-            p_up = prob_func(row_df)
-            if p_up > buy_threshold:
-                # go LONG
-                buy_price = current_price * (1 + slippage_rate)
-                fee_buy = buy_price * fee_rate
-
-                position_size = 1
-                entry_price = buy_price
-                partial_exit_done = False
-
-                trades.append({
-                    "action": "BUY_OPEN",
-                    "index": i,
-                    "price": buy_price,
-                    "fee": fee_buy,
-                    "p_up": p_up
-                })
-
-            elif p_up < sell_threshold:
-                # go SHORT
-                sell_price = current_price * (1 - slippage_rate)
-                fee_sell = sell_price * fee_rate
-
-                position_size = -1
-                entry_price = sell_price
-                partial_exit_done = False
-
-                trades.append({
-                    "action": "SELL_OPEN",
-                    "index": i,
-                    "price": sell_price,
-                    "fee": fee_sell,
-                    "p_up": p_up
-                })
-
-            i += 1
+    while i<len(X):
+        p=prices[i]
+        pu=prob_up[i]
+        if position==0:
+            if pu>buy_threshold:
+                # buy
+                position=1
+                entry=p
+                trades.append({"index":i,"action":"BUY_OPEN","price":p})
+            i+=1
         else:
-            bar_held = 0
-            exit_trade = False
-
-            while i < len(X) and not exit_trade:
-                row = X.iloc[i]
-                row_df = row.to_frame().T
-                current_price = row["feature_price"]
-
-                if position_size > 0:
-                    raw_return = (current_price - entry_price) / entry_price
-                else:
-                    raw_return = (entry_price - current_price) / entry_price
-
-                # partial exit if half of take_profit
-                if not partial_exit_done and raw_return > 0 and raw_return >= (take_profit_pct / 2):
-                    exit_price = (
-                        current_price * (1 - slippage_rate)
-                        if position_size > 0
-                        else current_price * (1 + slippage_rate)
-                    )
-                    fee_exit = exit_price * fee_rate * 0.5
-                    if position_size > 0:
-                        realized_pnl = 0.5 * ((exit_price - entry_price))
-                    else:
-                        realized_pnl = 0.5 * ((entry_price - exit_price))
-                    realized_pnl_percent = (realized_pnl / (entry_price * 0.5)) * 100
-
-                    trades.append({
-                        "action": "PARTIAL_EXIT",
-                        "index": i,
-                        "price": exit_price,
-                        "fee": fee_exit,
-                        "pnl_percent": realized_pnl_percent
-                    })
-                    partial_exit_done = True
-
-                # stop loss
-                if raw_return <= -abs(stop_loss_pct):
-                    exit_price = (
-                        current_price * (1 - slippage_rate)
-                        if position_size > 0
-                        else current_price * (1 + slippage_rate)
-                    )
-                    fee_exit = exit_price * fee_rate
-                    if position_size > 0:
-                        realized_pnl = (exit_price - entry_price) - fee_exit
-                        realized_pct = ((exit_price - entry_price) / entry_price) * 100
-                    else:
-                        realized_pnl = (entry_price - exit_price) - fee_exit
-                        realized_pct = ((entry_price - exit_price) / entry_price) * 100
-
-                    trades.append({
-                        "action": "STOP_OUT",
-                        "index": i,
-                        "price": exit_price,
-                        "fee": fee_exit,
-                        "pnl_percent": realized_pct
-                    })
-                    position_size = 0
-                    exit_trade = True
-                    i += 1
+            exit_i = i+shift_bars
+            if exit_i>=len(X):
+                trades.append({"index":len(X)-1,"action":"FORCED_EXIT","price":prices[-1]})
+                break
+            forced=False
+            for j in range(i,exit_i):
+                ret=(prices[j]-entry)/entry
+                if ret<=-abs(stop_loss_pct):
+                    trades.append({"index":j,"action":"STOP_OUT","price":prices[j]})
+                    i=j+1
+                    position=0
+                    forced=True
                     break
-
-                # take profit
-                if raw_return >= take_profit_pct:
-                    exit_price = (
-                        current_price * (1 - slippage_rate)
-                        if position_size > 0
-                        else current_price * (1 + slippage_rate)
-                    )
-                    fee_exit = exit_price * fee_rate
-                    if position_size > 0:
-                        realized_pct = ((exit_price - entry_price) / entry_price) * 100
-                    else:
-                        realized_pct = ((entry_price - exit_price) / entry_price) * 100
-
-                    trades.append({
-                        "action": "TAKE_PROFIT",
-                        "index": i,
-                        "price": exit_price,
-                        "fee": fee_exit,
-                        "pnl_percent": realized_pct
-                    })
-                    position_size = 0
-                    exit_trade = True
-                    i += 1
+                if ret>=take_profit_pct:
+                    trades.append({"index":j,"action":"TAKE_PROFIT","price":prices[j]})
+                    i=j+1
+                    position=0
+                    forced=True
                     break
+            if forced:
+                continue
+            # else SHIFT exit
+            trades.append({"index":exit_i,"action":"SHIFT_EXIT","price":prices[exit_i]})
+            position=0
+            i=exit_i+1
 
-                # max hold
-                if bar_held >= max_hold_bars:
-                    exit_price = (
-                        current_price * (1 - slippage_rate)
-                        if position_size > 0
-                        else current_price * (1 + slippage_rate)
-                    )
-                    fee_exit = exit_price * fee_rate
-                    if position_size > 0:
-                        realized_pct = ((exit_price - entry_price) / entry_price) * 100
-                    else:
-                        realized_pct = ((entry_price - exit_price) / entry_price) * 100
+    df_trades=pd.DataFrame(trades)
+    if df_trades.empty:
+        logger.info("[Backtest] => no trades triggered.")
+        return df_trades, {}
 
-                    trades.append({
-                        "action": "MAX_HOLD_EXIT",
-                        "index": i,
-                        "price": exit_price,
-                        "fee": fee_exit,
-                        "pnl_percent": realized_pct
-                    })
-                    position_size = 0
-                    exit_trade = True
-                    i += 1
-                    break
+    # approximate PnL
+    open_pos=None
+    rets=[]
+    for i,row in df_trades.iterrows():
+        if row["action"]=="BUY_OPEN":
+            open_pos=row
+        else:
+            if open_pos is not None:
+                realized=((row["price"]-open_pos["price"])/open_pos["price"])*100
+                rets.append(realized)
+                open_pos=None
 
-                bar_held += 1
-                i += 1
+    if not rets:
+        return df_trades,{}
 
-    if not trades:
-        logger.info("No trades triggered in advanced backtest.")
-        df_trades = pd.DataFrame()
-        stats = {}
-        return df_trades, stats
-
-    df_trades = pd.DataFrame(trades)
-
-    df_trades["cumulative_pnl"] = df_trades["pnl_percent"].fillna(0).cumsum()
-
-    # Max drawdown
-    peak = -999999
-    max_drawdown = 0.0
-    for val in df_trades["cumulative_pnl"]:
-        if val > peak:
-            peak = val
-        dd = peak - val
-        if dd > max_drawdown:
-            max_drawdown = dd
-
-    returns = df_trades["pnl_percent"].fillna(0) / 100.0
-    if returns.std() == 0:
-        sharpe = 0.0
-    else:
-        sharpe = returns.mean() / returns.std()
-
-    final_pnl = df_trades["pnl_percent"].fillna(0).sum()
-
-    stats = {
-        "total_pnl_%": final_pnl,
-        "max_drawdown_%": max_drawdown,
-        "sharpe": sharpe,
-        "num_trades": len(df_trades)
+    total_pnl=sum(rets)
+    avg_pnl=np.mean(rets)
+    stats={
+      "num_trades": len(rets),
+      "total_pnl_%": total_pnl,
+      "avg_pnl_%": avg_pnl
     }
-
-    logger.info(
-        f"Advanced Backtest => total_pnl={final_pnl:.2f}%, "
-        f"max_dd={max_drawdown:.2f}%, sharpe={sharpe:.2f}, trades={len(df_trades)}"
-    )
-
+    logger.info(f"[Backtest] => trades={len(rets)}, totalPnL={total_pnl:.2f}%, avgPnL={avg_pnl:.2f}%")
     return df_trades, stats
+
+# ------------------------------------------------------------------------------
+# Helper => map symbol => coin_id from 'lunarcrush_data'
+# ------------------------------------------------------------------------------
+def _map_symbol_to_coinid(db_file:str) -> Dict[str,str]:
+    """
+    Return e.g. {"ETH":"2","XRP":"3", ...} from 'lunarcrush_data'.
+    """
+    out={}
+    if not os.path.exists(db_file):
+        logger.warning("No DB => can't map symbol => coin_id.")
+        return out
+
+    conn=sqlite3.connect(db_file)
+    try:
+        c=conn.cursor()
+        q="""
+            SELECT symbol, lunarcrush_id
+            FROM lunarcrush_data
+            WHERE lunarcrush_id IS NOT NULL
+            ORDER BY id DESC
+        """
+        rows=c.execute(q).fetchall()
+        for (sym, cid) in rows:
+            if sym and cid and sym.upper() not in out:
+                out[sym.upper()]=str(cid)
+    except Exception as e:
+        logger.exception(f"Error mapping => {e}")
+    finally:
+        conn.close()
+    return out
 
 
 # ------------------------------------------------------------------------------
-# Main Execution
+# Main
 # ------------------------------------------------------------------------------
 def main():
     """
-    1) Load BTC data if desired for correlation.
-    2) Load aggregator from cryptopanic daily if desired.
-    3) For each pair in config.yaml, load 'price_history', build features, merges aggregator data.
-    4) Combine everything into X_full, y_full, then do hyperparam search + final hold-out test.
-    5) Run an advanced backtest on the combined dataset to see real "trading" results.
-    6) Save the model + log final metric.
-
-    Memory-limiting approach:
-    - We read at most MAX_ROWS_PER_PAIR for each pair from 'price_history'.
-      This avoids overloading RAM with very large tables.
+    1) Possibly load aggregator data => cryptopanic_posts aggregator => 'df_cpanic'.
+    2) Map symbol => coin_id from 'lunarcrush_data'.
+    3) For each pair => find coin_id => load time-series => build features => skip if < MIN_DATA_ROWS
+    4) Concatenate => train => backtest => save model => store model_info in JSON
     """
-    # 1) Possibly load BTC data for correlation
-    df_btc = load_data_for_btc(DB_FILE, BTC_PAIR)
+    logger.info("Starting train_model pipeline...")
 
-    # 2) Possibly load aggregator from cryptopanic
+    # 1) aggregator => cryptopanic_posts daily
     df_cpanic = fetch_cryptopanic_aggregated(DB_FILE)
 
-    # 3) If you want to merge LunarCrush aggregator, fetch them on a per-symbol basis
-    lunarcrush_dict = {}
-    unique_symbols = set(pair.split("/")[0].upper() for pair in TRADED_PAIRS)
-    for sym in unique_symbols:
-        df_lc = fetch_lunarcrush_data_for_symbol(DB_FILE, sym)
-        lunarcrush_dict[sym] = df_lc
+    # 2) map symbol => coin_id from 'lunarcrush_data'
+    coin_map = _map_symbol_to_coinid(DB_FILE)
 
-    all_X = []
-    all_y = []
+    all_X=[]
+    all_y=[]
 
+    # 3) for each pair => build
     for pair in TRADED_PAIRS:
-        logger.info(f"Processing pair={pair}...")
-
-        df = load_data_for_pair(DB_FILE, pair)
-        if df.empty:
-            logger.warning(f"No data for {pair}. Skipping.")
-            continue
-
         symbol = pair.split("/")[0].upper()
-        df_lc_for_symbol = lunarcrush_dict.get(symbol, pd.DataFrame())
-
-        # Build features
-        X_pair, y_pair = build_features_and_labels(
-            df,
-            df_btc=df_btc,
-            df_cpanic=df_cpanic,
-            df_lc=df_lc_for_symbol
-        )
-        if X_pair.empty:
-            logger.warning(f"No valid features after building labels for {pair}. Skipping.")
+        cid = coin_map.get(symbol)
+        if not cid:
+            logger.warning(f"No coin_id found for symbol={symbol}. Skipping.")
             continue
 
-        all_X.append(X_pair)
-        all_y.append(y_pair)
+        df_ts = load_lunarcrush_timeseries(DB_FILE, cid)
+        if df_ts.empty:
+            logger.warning(f"No timeseries => coin_id={cid} => skip.")
+            continue
 
+        # aggregator from snapshot
+        df_lc_snap = fetch_lunarcrush_data_for_symbol(DB_FILE, symbol)
+
+        # build features
+        X_coin, y_coin = build_features(
+            df_ts,
+            df_cp=df_cpanic,
+            df_lc=df_lc_snap,
+            shift_bars=SHIFT_BARS,
+            threshold_up=THRESHOLD_UP
+        )
+        if len(X_coin)<MIN_DATA_ROWS:
+            logger.warning(f"coin_id={cid}, after building => only {len(X_coin)} rows => skip (min={MIN_DATA_ROWS})")
+            continue
+
+        all_X.append(X_coin)
+        all_y.append(y_coin)
+
+    # If all coins were skipped => no final dataset
     if not all_X:
-        logger.error("No data retrieved for any pairs. Exiting.")
+        logger.warning("All coins were skipped => no data => no training done.")
+        # We do not forcibly exit. We just do no training.
         return
 
-    # Combine all pairs
+    # 4) train
     X_full = pd.concat(all_X, ignore_index=True)
     y_full = pd.concat(all_y, ignore_index=True)
-    logger.info(f"Combined dataset size: X={X_full.shape}, y={y_full.shape}")
+    logger.info(f"Final dataset => X={X_full.shape}, y={y_full.shape}")
 
-    # 4) Train the model with hyperparam search + final hold-out
-    model, final_metric = train_model(X_full, y_full)
+    model, final_metric = train_random_forest(X_full, y_full)
     if model is None:
-        logger.error("Model training returned None. Exiting.")
+        logger.error("No model => training aborted.")
         return
 
-    # 5) Run advanced backtest
-    logger.info("Running advanced backtest on the full dataset to see realistic 'trading' results.")
-    df_trades, adv_stats = backtest_model(
-        X_full, model,
-        buy_threshold=0.6,
-        sell_threshold=0.4,
-        stop_loss_pct=0.03,
-        take_profit_pct=0.05,
-        max_hold_bars=SHIFT_BARS,
-        slippage_rate=0.0005,
-        fee_rate=0.001
-    )
-    logger.info(f"Backtest stats: {adv_stats}")
+    # backtest
+    df_trades, stats = backtest_prob(X_full, model)
+    logger.info(f"[train_model] Backtest => {stats}")
 
-    # 6) Save the model + log final metric
-    log_accuracy_to_csv(final_metric)
+    # Save model
     joblib.dump(model, MODEL_OUTPUT_PATH)
-    logger.info(f"Model saved to {MODEL_OUTPUT_PATH}")
-    logger.info(f"Appended f1_macro={final_metric:.4f} to {METRICS_OUTPUT_FILE}")
+    logger.info(f"Saved model => {MODEL_OUTPUT_PATH}")
+
+    # log metric
+    if final_metric:
+        log_accuracy_to_csv(final_metric)
+
+    # store model info in JSON
+    model_info = {
+        "training_timestamp": datetime.utcnow().isoformat(),
+        "final_metric": final_metric,
+        "backtest_stats": stats
+    }
+    with open(MODEL_INFO_FILE, "w") as f:
+        json.dump(model_info, f, indent=2)
+    logger.info(f"Saved model info => {MODEL_INFO_FILE}")
 
 
-if __name__ == "__main__":
-    print(f'{__file__} is being run directly')
+if __name__=="__main__":
     main()
