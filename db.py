@@ -7,17 +7,18 @@ db.py
 SQLite database utilities for:
 1) Recording executed trades in the 'trades' table.
 2) Storing price history in 'price_history'.
-3) Collecting aggregator data in 'cryptopanic_news' and 'lunarcrush_data'.
+3) Collecting aggregator data in 'cryptopanic_posts' and 'lunarcrush_data'.
 4) Maintaining GPT context in 'ai_context'.
-5) Storing advanced time-series data in 'lunarcrush_timeseries'.
-6) Logging final AI decisions in 'ai_decisions'.
+5) Logging final AI decisions in 'ai_decisions'.
+6) Storing advanced time-series data in 'lunarcrush_timeseries'.
 
-For multi-sub-position logic, sub_positions is handled in `risk_manager.py` (RiskManagerDB).
+For multi-sub-position logic, see `RiskManagerDB` in risk_manager.py.
 
 Usage:
     - Call init_db() once on startup (or run this file directly) to ensure all tables exist.
-    - Use store_*() helpers to insert or update data as needed.
-    - For sub-positions, see `RiskManagerDB.initialize()` in risk_manager.py.
+    - Use record_trade_in_db(), store_price_history(), store_cryptopanic_data(), etc.
+    - GPT context stored in 'ai_context' => load_gpt_context_from_db() & save_gpt_context_to_db().
+    - For sub-positions, see risk_manager.py => RiskManagerDB.
 """
 
 import sqlite3
@@ -28,26 +29,25 @@ logger = logging.getLogger(__name__)
 
 DB_FILE = "trades.db"
 
+
 def init_db():
     """
-    Creates all needed tables:
+    Creates all needed tables in the SQLite DB specified by DB_FILE, if not exist:
       - trades
       - price_history
-      - cryptopanic_news
+      - cryptopanic_posts
       - lunarcrush_data
       - ai_context
       - ai_decisions
       - lunarcrush_timeseries
+
     If sub_positions are needed, see `risk_manager.py => RiskManagerDB.initialize()`.
     """
-
     conn = sqlite3.connect(DB_FILE)
     try:
         c = conn.cursor()
 
-        # ----------------------------------------------------------------------
-        # 1) 'trades' table
-        # ----------------------------------------------------------------------
+        # 1) trades
         c.execute("""
             CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,9 +60,7 @@ def init_db():
             )
         """)
 
-        # ----------------------------------------------------------------------
-        # 2) 'price_history' table
-        # ----------------------------------------------------------------------
+        # 2) price_history
         c.execute("""
             CREATE TABLE IF NOT EXISTS price_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,7 +89,7 @@ def init_db():
                 positive_votes INTEGER,
                 liked_votes INTEGER,
                 disliked_votes INTEGER,
-                sentiment_score REAL
+                sentiment_score REAL,
                 image TEXT,
                 description TEXT,
                 panic_score REAL,
@@ -177,6 +175,7 @@ def init_db():
         """)
 
         conn.commit()
+        logger.info("All DB tables ensured in init_db().")
     except Exception as e:
         logger.exception(f"Error creating DB: {e}")
     finally:
@@ -248,7 +247,7 @@ def store_price_history(pair: str, bid: float, ask: float, last: float, volume: 
 
 def store_cryptopanic_data(title: str, url: str, sentiment_score: float):
     """
-    Inserts a row into 'cryptopanic_news'.
+    Inserts a row into 'cryptopanic_posts'.
 
     :param title: The news title or headline.
     :param url: Link to the article.
@@ -259,7 +258,7 @@ def store_cryptopanic_data(title: str, url: str, sentiment_score: float):
     try:
         c = conn.cursor()
         c.execute("""
-            INSERT INTO cryptopanic_news (timestamp, title, url, sentiment_score)
+            INSERT INTO cryptopanic_posts (timestamp, title, url, sentiment_score)
             VALUES (?, ?, ?, ?)
         """, (
             int(time.time()),
@@ -317,36 +316,35 @@ def store_lunarcrush_data(
     :param categories: Comma-separated categories, e.g. "defi,nft".
     :param topic: Additional text about the asset, if provided.
     :param logo: URL to the coin's logo or an image resource.
-    """
-    import sqlite3
-    import time
-    from db import DB_FILE, logger
 
-    import fetch_lunarcrush.init_lunarcrush as init_lunarcrush
-
-
-def create_ai_context_table():
-    """
-    A simple table to store GPT conversation memory or context.
-    Usually called within init_db() or manually if you want it separate.
+    Returns: None. Data is inserted into 'lunarcrush_data'.
     """
     conn = sqlite3.connect(DB_FILE)
     try:
         c = conn.cursor()
         c.execute("""
-            CREATE TABLE IF NOT EXISTS ai_context (
-                id INTEGER PRIMARY KEY,
-                context TEXT
+            INSERT INTO lunarcrush_data (
+                timestamp, symbol, name, price, market_cap, volume_24h, volatility,
+                percent_change_1h, percent_change_24h, percent_change_7d, percent_change_30d,
+                social_volume_24h, interactions_24h, social_dominance, galaxy_score,
+                alt_rank, sentiment, categories, topic, logo
             )
-        """)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, [
+            int(time.time()), symbol, name, price, market_cap, volume_24h, volatility,
+            percent_change_1h, percent_change_24h, percent_change_7d, percent_change_30d,
+            social_volume_24h, interactions_24h, social_dominance, galaxy_score,
+            alt_rank, sentiment, categories, topic, logo
+        ])
         conn.commit()
+        logger.info(f"Inserted row into lunarcrush_data for symbol={symbol}.")
     except Exception as e:
-        logger.exception(f"Error creating ai_context table: {e}")
+        logger.exception(f"Error storing lunarcrush data: {e}")
     finally:
         conn.close()
 
 
-def load_gpt_context_from_db():
+def load_gpt_context_from_db() -> str:
     """
     Returns the 'context' field from ai_context WHERE id=1, or "" if none.
 
@@ -370,6 +368,8 @@ def load_gpt_context_from_db():
 def save_gpt_context_to_db(context_str: str):
     """
     Upsert the single row in 'ai_context' with id=1, storing context_str.
+
+    :param context_str: The conversation context to store.
     """
     conn = sqlite3.connect(DB_FILE)
     try:
