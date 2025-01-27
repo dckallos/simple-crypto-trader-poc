@@ -106,3 +106,7 @@ poetry.lock
 
 # Configurations like Bandit that require exclusions
 .bandit
+trades.db
+trained_model.pkl
+identifier.sqlite
+training_metrics.csv
