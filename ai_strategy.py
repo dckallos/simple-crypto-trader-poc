@@ -1,26 +1,16 @@
 """
 ai_strategy.py
 
-An enhanced, production-ready AIStrategy that can:
-1) Use GPT logic (via GPTManager) or fallback logic for single or multiple coins in a single GPT call.
-2) Optionally handle concurrency (multi-thread or async) to gather aggregator data for each pair,
-   but crucially, it can pass **all** aggregator data to GPT in a single request to find the best
-   decisions across multiple coins.
-3) Store sub-positions in DB (RiskManagerDB), enforcing daily drawdown, position sizing, cost constraints, etc.
-4) Log each final decision in 'ai_decisions' for auditing.
-5) If GPT decides to SELL or SWAP a position, we handle that by calling the risk manager to close or reduce
-   any existing sub-position for that pair.
-
-Requirements:
-    - db.py (DB_FILE, load_gpt_context_from_db, save_gpt_context_to_db, record_trade_in_db)
-    - risk_manager.py (RiskManagerDB)
-    - gpt_manager.py => now with generate_multi_trade_decision(...) for advanced multi-coin logic
-    - openai >= v1 library
+An enhanced AIStrategy that:
+1) Uses GPT logic (via GPTManager) or fallback logic for single or multi-coin GPT calls.
+2) Integrates daily drawdown, risk constraints, sub-position logic via RiskManagerDB.
+3) **Now** loads aggregator data from aggregator_summaries, aggregator_classifier_probs, aggregator_embeddings,
+   then uses build_aggregator_prompt(...) to produce a short aggregator text.
 
 Basic Flow:
     - Single pair => call predict(market_data)
     - Multi pairs => call predict_multi(pairs_data)
-      * If you want advanced one-shot GPT for all pairs, see the new method: predict_multi_coins(...)
+    - For advanced one-shot multi-coin => predict_multi_coins(...)
 """
 
 import logging
@@ -28,7 +18,7 @@ import os
 import time
 import json
 import sqlite3
-from typing import Optional, Dict, Any, List, Tuple, Union
+from typing import Optional, Dict, Any, List, Tuple
 
 from dotenv import load_dotenv
 
@@ -39,7 +29,7 @@ from db import (
     record_trade_in_db
 )
 from risk_manager import RiskManagerDB
-from gpt_manager import GPTManager
+from gpt_manager import GPTManager, build_aggregator_prompt
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.DEBUG)
@@ -48,15 +38,9 @@ logging.basicConfig(level=logging.DEBUG)
 class AIStrategy:
     """
     AIStrategy: A flexible class that decides trades for one or multiple pairs,
-    using GPT or fallback logic. Integrates with a RiskManager for sub-positions
-    and daily drawdown constraints.
-
-    Key Updates:
-      - We can now gather aggregator data for all coins in a single cycle,
-        call GPT once with generate_multi_trade_decision(...) from gpt_manager.py,
-        and parse a multi-coin decision array.
-      - If GPT decides to SELL or reduce a position, we attempt to close or reduce
-        the corresponding sub-position in risk_manager_db.
+    using GPT or fallback logic. Now it loads aggregator data from aggregator_summaries,
+    aggregator_classifier_probs, aggregator_embeddings to build a short aggregator prompt
+    for GPT.
     """
 
     def __init__(
@@ -93,9 +77,9 @@ class AIStrategy:
 
         load_dotenv()
 
+        # GPT
         self.gpt_manager = None
         if self.use_openai:
-            # Create GPTManager with multi-trade features
             self.gpt_manager = GPTManager(
                 api_key=os.getenv("OPENAI_API_KEY", ""),
                 model=gpt_model,
@@ -104,7 +88,7 @@ class AIStrategy:
                 **gpt_client_options
             )
 
-        # Risk manager for sub-positions
+        # Risk manager
         self.risk_manager_db = RiskManagerDB(
             db_path=DB_FILE,
             max_position_size=max_position_size,
@@ -114,7 +98,7 @@ class AIStrategy:
         )
         self.risk_manager_db.initialize()
 
-        # GPT context from DB (if using conversation memory)
+        # GPT conversation context from DB
         self.gpt_context = self._init_gpt_context()
 
         # ensure ai_decisions table
@@ -152,31 +136,37 @@ class AIStrategy:
 
     def _gpt_flow_single(self, pair: str, market_data: Dict[str, Any]) -> Tuple[str, float]:
         """
-        Single-pair GPT logic. We build aggregator text, get 3 trades summary,
-        pass them to generate_trade_decision(...) in GPT manager, parse result,
-        risk-check, store decision, etc.
+        Single-pair GPT logic. We gather aggregator data from aggregator_summaries, aggregator_classifier_probs,
+        aggregator_embeddings, build a short aggregator text, pass it to GPT, parse result,
+        apply risk manager, store decision, etc.
         """
         px = market_data["price"]
-        aggregator_text = self._build_aggregator_text(market_data, exclude=["pair", "price"])
+
+        # (A) Build aggregator text from DB
+        aggregator_text = self._build_full_aggregator_text(pair)
+
+        # (B) Summarize recent trades
         trade_summary = self._summarize_recent_trades(pair, limit=3)
         trade_history_list = trade_summary.split("\n") if trade_summary else []
 
-        # For single approach, we call the older "generate_trade_decision" from GPT manager
+        # (C) GPT => single-coin approach
         result = self.gpt_manager.generate_trade_decision(
             conversation_context=self.gpt_context,
             aggregator_text=aggregator_text,
             trade_history=trade_history_list,
             max_trades=10,
             risk_controls=self.risk_controls,
-            open_positions=None  # single approach => ignore for now
+            open_positions=None  # single approach => ignore
         )
         action = result.get("action", "HOLD").upper()
         suggested_size = float(result.get("size", 0.0))
 
+        # (D) final risk checks
         final_signal, final_size = self._post_validate(action, suggested_size, px)
         final_signal, final_size = self.risk_manager_db.adjust_trade(final_signal, final_size, pair, px)
 
-        rationale = f"GPT single => final={final_signal}, size={final_size}, aggregator={aggregator_text}"
+        # (E) store trade & decision
+        rationale = f"GPT single => final={final_signal}, size={final_size}, aggregator=({aggregator_text})"
         if final_signal in ("BUY","SELL") and final_size > 0:
             record_trade_in_db(final_signal, final_size, px, "GPT_SINGLE_DECISION", pair)
         self._store_decision(pair, final_signal, final_size, rationale)
@@ -203,27 +193,29 @@ class AIStrategy:
             return ("HOLD",0.0)
 
     # --------------------------------------------------------------------------
-    # MULTI-PAIR - LEGACY
+    # MULTI-PAIR (LEGACY)
     # --------------------------------------------------------------------------
     def predict_multi(self, pairs_data: List[Dict[str, Any]], concurrency="thread") -> Dict[str, Tuple[str, float]]:
         """
-        A legacy multi approach that calls GPT or fallback on each pair individually.
-        If you want the advanced single-call approach, see `predict_multi_coins`.
+        A naive multi approach => calls predict(...) on each pair. This references the same code path
+        for single predictions, so aggregator data is loaded individually.
+        If you want one-shot multi-coin GPT => see predict_multi_coins.
         """
         if not pairs_data:
-            logger.warning("No pairs_data provided => returning empty decisions.")
+            logger.warning("No pairs_data => empty decisions.")
             return {}
 
         if concurrency=="thread":
             logger.info("[AIStrategy] multi => naive synchronous approach.")
         elif concurrency=="asyncio":
             logger.info("[AIStrategy] multi => placeholder for async approach.")
-            # In real usage, you'd do concurrency with an event loop, gather calls, etc.
+            # In real usage, you'd do concurrency with an event loop, gather, etc.
 
         decisions={}
         for pd in pairs_data:
             pair = pd.get("pair","UNK")
             px = pd.get("price",0.0)
+            # forcibly check stops
             if px>0:
                 self.risk_manager_db.check_stop_loss_take_profit(pair, px)
 
@@ -240,7 +232,7 @@ class AIStrategy:
         return decisions
 
     # --------------------------------------------------------------------------
-    # MULTI-PAIR - ADVANCED (All aggregator data => single GPT call)
+    # MULTI-PAIR (ADVANCED) => Single GPT call
     # --------------------------------------------------------------------------
     def predict_multi_coins(
         self,
@@ -250,62 +242,30 @@ class AIStrategy:
         open_positions: List[str]
     ) -> Dict[str, Tuple[str, float]]:
         """
-        The new approach: gather aggregator data for all coins in aggregator_list,
-        pass them to GPT in a single call => GPT sees entire market and open positions,
-        and returns decisions for each coin in a single JSON.
-
-        aggregator_list => e.g.
-          [
-            {"pair":"ETH/USD","aggregator_data":"rsi=44,price=1850,sentiment=0.4,..."},
-            {"pair":"XBT/USD","aggregator_data":"rsi=50,price=28000,sentiment=0.3,..."}
-          ]
-
-        open_positions => list of strings describing all active positions:
-          ["ETH/USD LONG 0.003@entry=1860.0", "XBT/USD SHORT 0.001@entry=29500.0"]
-
-        We return a dict => { "ETH/USD":("BUY",0.001), "XBT/USD":("SELL",0.001) } etc.
-
-        Steps:
-          1) check stops for each aggregator => forcibly close if needed
-          2) call generate_multi_trade_decision(...) once
-          3) parse the array => for each pair => run post-validate + risk manager => store
-          4) if GPT says SELL => we can interpret that as closing or reducing existing sub-position
+        The advanced approach: aggregator_list => pass them all at once to GPT => single JSON response.
+        aggregator_list => each item => {"pair":"ETH/USD","price":1850,"aggregator_data":"summary:..., prob=0.72, ..."}
+        We'll parse GPT decisions => apply risk => store.
         """
         results = {}
         if not aggregator_list:
-            logger.warning("No aggregator_list => returning empty.")
+            logger.warning("No aggregator_list => empty decisions.")
             return {}
 
-        # forcibly check sub-position stops for each coin
+        # forcibly check stops for each aggregator
         for item in aggregator_list:
             pair = item.get("pair","UNK")
-            # parse price from aggregator_data or from a separate field if you store it
-            # or if aggregator_data is just a string, you might parse out price manually
-            # for demonstration, let's do a naive approach:
-            # if aggregator_data includes 'price=', we parse it (omitted for brevity).
-            # We'll do an optional 'price' key
-            # If you only store aggregator_data as text, you'd need a parse or store price separately
             maybe_price = item.get("price", 0.0)
             if maybe_price>0:
                 self.risk_manager_db.check_stop_loss_take_profit(pair, maybe_price)
 
         if not self.use_openai or not self.gpt_manager:
-            logger.info("[AIStrategy] no GPT => fallback => all hold")
+            logger.info("[AIStrategy] no GPT => fallback => hold all")
             for it in aggregator_list:
                 results[it["pair"]] = ("HOLD",0.0)
             return results
 
-        # 2) single GPT call
+        # single GPT call => parse => post validate => store
         try:
-            # We call new generate_multi_trade_decision
-            # aggregator_list items must each have => "pair":"X/Y","aggregator_data":"some text"
-            # we'll convert that text into e.g. "rsi=..., price=..., galaxy_score=..." as a single string
-            # or do a read from item["aggregator_data"]. We assume the user code has built that string.
-
-            # pass entire self.gpt_context as conversation_context
-            # pass the open_positions
-            # pass the user trade_history
-            # pass risk_controls => self.risk_controls
             multi_resp = self.gpt_manager.generate_multi_trade_decision(
                 conversation_context=self.gpt_context,
                 aggregator_list=aggregator_list,
@@ -315,45 +275,37 @@ class AIStrategy:
                 risk_controls=self.risk_controls
             )
         except Exception as e:
-            logger.exception("[AIStrategy] GPT multi inference fail => fallback => all hold")
+            logger.exception("[AIStrategy] GPT multi fail => fallback => hold all.")
             for it in aggregator_list:
                 results[it["pair"]] = ("HOLD",0.0)
             return results
 
-        # 3) parse the result => a dict with "decisions":[{pair,action,size}...]
         decisions_array = multi_resp.get("decisions", [])
-        # e.g. decisions_array => [ {"pair":"ETH/USD","action":"BUY","size":0.001}, ...]
+        if not decisions_array:
+            logger.warning("[AIStrategy] No GPT decisions => hold all")
+            for it in aggregator_list:
+                results[it["pair"]] = ("HOLD",0.0)
+            return results
 
-        # for each item => do post validation => risk => store
         for dec in decisions_array:
             pair = dec.get("pair","UNK")
             action_raw = dec.get("action","HOLD").upper()
             size_suggested = float(dec.get("size",0.0))
 
-            # if aggregator_list includes a 'price' field for that pair:
-            # We find it:
             found_item = next((x for x in aggregator_list if x.get("pair")==pair), None)
-            if found_item and "price" in found_item:
-                current_price = float(found_item["price"])
-            else:
-                # fallback => can't do a stop check => hold
-                current_price = 0.0
+            current_price = float(found_item["price"]) if (found_item and "price" in found_item) else 0.0
 
             if current_price>0:
-                # post validate
                 final_signal, final_size = self._post_validate(action_raw, size_suggested, current_price)
                 final_signal, final_size = self.risk_manager_db.adjust_trade(final_signal, final_size, pair, current_price)
-
-                # store
-                rationale = f"GPT multi => final={final_signal}, size={final_size}, aggregator_data for {pair}"
+                rationale = f"GPT multi => {pair} => final={final_signal}, size={final_size}"
                 if final_signal in ("BUY","SELL") and final_size>0:
                     record_trade_in_db(final_signal, final_size, current_price, "GPT_MULTI_DECISION", pair)
                 self._store_decision(pair, final_signal, final_size, rationale)
                 self._append_gpt_context(rationale)
                 results[pair] = (final_signal, final_size)
             else:
-                # no price => can't trade
-                logger.warning(f"[AIStrategy] No price for pair={pair}, skipping => HOLD.")
+                logger.warning(f"[AIStrategy] No price for {pair} => hold.")
                 self._store_decision(pair,"HOLD",0.0,"No price => hold")
                 results[pair] = ("HOLD",0.0)
 
@@ -362,22 +314,90 @@ class AIStrategy:
     # --------------------------------------------------------------------------
     # HELPER LOGIC
     # --------------------------------------------------------------------------
-    def _build_aggregator_text(self, market_data: Dict[str, Any], exclude: List[str] = None) -> str:
+    def _build_full_aggregator_text(self, pair: str) -> str:
         """
-        Build aggregator text from market_data, skipping keys in exclude.
-        Example: rsi=44.2, boll_upper=1900.2, ...
+        A specialized aggregator retrieval for single-pair usage.
+        1) Parse symbol from pair => e.g. "ETH/USD" => "ETH"
+        2) Look up aggregator_summaries => gather textual summary
+        3) aggregator_classifier_probs => prob_up
+        4) aggregator_embeddings => small vector [comp1, comp2, comp3]
+        5) Pass them to build_aggregator_prompt(...) => returns a single short string
+
+        Return that aggregator string for GPT usage.
         """
-        if exclude is None:
-            exclude = []
-        parts = []
-        for k, v in market_data.items():
-            if k not in exclude:
-                parts.append(f"{k}={v}")
-        return ", ".join(parts)
+        symbol = pair.split("/")[0].upper()
+        # We'll do naive approach: pick the LATEST row for that symbol from each aggregator table.
+        summary_str = None
+        prob_up = None
+        embedding_vec = None
+
+        # aggregator_summaries => get price_bucket, sentiment_label, galaxy_score, alt_rank
+        conn = sqlite3.connect(DB_FILE)
+        try:
+            c = conn.cursor()
+
+            # Summaries
+            c.execute("""
+            SELECT price_bucket, galaxy_score, alt_rank, sentiment_label
+            FROM aggregator_summaries
+            WHERE UPPER(symbol)=?
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """, (symbol,))
+            row_summ = c.fetchone()
+            if row_summ:
+                pb, gs, ar, sl = row_summ
+                # e.g. "price_bucket=high, galaxy_score=64, alt_rank=150, sentiment_label=slightly_positive"
+                summary_list = []
+                if pb: summary_list.append(f"price_bucket={pb}")
+                if gs is not None: summary_list.append(f"galaxy_score={gs}")
+                if ar is not None: summary_list.append(f"alt_rank={ar}")
+                if sl: summary_list.append(f"sentiment_label={sl}")
+                summary_str = ", ".join(summary_list)
+
+            # Classifier => prob_up
+            c.execute("""
+            SELECT prob_up
+            FROM aggregator_classifier_probs
+            WHERE UPPER(symbol)=?
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """, (symbol,))
+            row_prob = c.fetchone()
+            if row_prob:
+                prob_up = float(row_prob[0])
+
+            # Embeddings => comp1, comp2, comp3
+            c.execute("""
+            SELECT comp1, comp2, comp3
+            FROM aggregator_embeddings
+            WHERE UPPER(symbol)=?
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """, (symbol,))
+            row_emb = c.fetchone()
+            if row_emb:
+                comp1, comp2, comp3 = row_emb
+                embedding_vec = [float(comp1), float(comp2), float(comp3)]
+
+        except Exception as e:
+            logger.exception(f"Error retrieving aggregator data => {e}")
+        finally:
+            conn.close()
+
+        # Now build aggregator_text
+        aggregator_text = build_aggregator_prompt(
+            summary=summary_str,
+            probability=prob_up,
+            embedding=embedding_vec
+        )
+        if not aggregator_text:
+            aggregator_text = "No aggregator data found."
+        return aggregator_text
 
     def _post_validate(self, action: str, size_suggested: float, current_price: float) -> Tuple[str, float]:
         """
-        Check local constraints => e.g. if cost < min_buy => hold
+        Local check => e.g. cost < min_buy => hold
         """
         if action not in ("BUY","SELL"):
             return ("HOLD",0.0)
@@ -506,49 +526,36 @@ if __name__=="__main__":
         gpt_max_tokens=1000
     )
 
-    # Single pair usage
+    # Single pair usage => aggregator text is built from aggregator_* tables
     single_data = {
         "pair":"ETH/USD",
         "price":1850.0,
-        "rsi":45.0,
-        "volume":1000.0,
     }
-    a, s = strategy.predict(single_data)
-    print(f"[SinglePair] => final action={a}, size={s}")
+    action, size = strategy.predict(single_data)
+    print(f"[SinglePair] => final action={action}, size={size}")
 
-    # Multi pair usage (legacy approach => calls GPT or fallback per pair)
+    # Multi pair usage => legacy => calls predict(...) individually
     multi_data = [
-        {"pair":"ETH/USD","price":1800.0,"rsi":46.0,"volume":1100.0},
-        {"pair":"XBT/USD","price":28000.0,"rsi":50.0,"volume":500.0},
+        {"pair":"ETH/USD","price":1800.0},
+        {"pair":"XBT/USD","price":28000.0},
     ]
-    decisions = strategy.predict_multi(multi_data)
-    print("Multi-pair (legacy) =>", decisions)
+    results = strategy.predict_multi(multi_data)
+    print("Multi-pair =>", results)
 
-    # Multi coins advanced approach => single GPT call:
+    # Advanced multi => aggregator_list has aggregator_data => if you want a single GPT call
     aggregator_list = [
         {
             "pair": "ETH/USD",
             "price": 1800.0,
-            "aggregator_data": "rsi=46, price=1800, galaxy_score=62, alt_rank=170, sentiment=0.35"
+            "aggregator_data": "summary: price_bucket=high, galaxy_score=64, sentiment_label=slightly_positive; probability=0.72; embedding_vector=[0.25,-0.1,0.36]"
         },
         {
             "pair": "XBT/USD",
             "price": 28000.0,
-            "aggregator_data": "rsi=50, price=28000, galaxy_score=65, alt_rank=150, sentiment=0.30"
+            "aggregator_data": "summary: price_bucket=medium, galaxy_score=65, sentiment_label=neutral; probability=0.55; embedding_vector=[0.19,0.02,-0.15]"
         }
     ]
-    trade_hist = [
-        "2025-01-20 10:15 BUY ETH/USD 0.001@25000",
-        "2025-01-21 11:20 SELL ETH/USD 0.001@25500"
-    ]
-    open_positions = [
-        "ETH/USD LONG 0.002, entry=1860.0",
-        "XBT/USD SHORT 0.001, entry=29500.0"
-    ]
-    multi_decisions = strategy.predict_multi_coins(
-        aggregator_list=aggregator_list,
-        trade_history=trade_hist,
-        max_trades=5,
-        open_positions=open_positions
-    )
-    print("Multi coins (advanced single GPT call) =>", multi_decisions)
+    trade_hist = ["2025-01-20 10:15 BUY ETH/USD 0.001@25000","2025-01-21 SELL ETH/USD 0.001@25500"]
+    open_positions = ["ETH/USD LONG 0.002, entry=1860.0","XBT/USD SHORT 0.001, entry=29500.0"]
+    final = strategy.predict_multi_coins(aggregator_list, trade_hist, max_trades=5, open_positions=open_positions)
+    print("Multi coins =>", final)
