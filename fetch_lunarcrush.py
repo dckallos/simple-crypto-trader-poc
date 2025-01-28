@@ -70,7 +70,83 @@ class LunarCrushFetcher:
 
         self.BEARER_TOKEN = os.getenv("LUNARCRUSH_BEARER_TOKEN", "")
         if not self.BEARER_TOKEN:
-            logger.warning("No LUNARCRUSH_BEARER_TOKEN => time-series calls may fail or skip.")
+            logger.warning("No LUNARCRUSH_BEARER_TOKEN => time-series calls may fail.")
+
+        self._init_db_tables()
+
+    def _init_db_tables(self):
+        """
+        We define brand-new tables 'my_lunarcrush_data' and 'my_lunarcrush_timeseries'.
+        Each row from snapshot => 'my_lunarcrush_data' with the top-level JSON fields you want.
+        Each time-series record => 'my_lunarcrush_timeseries'.
+        """
+        conn = sqlite3.connect(self.db_file)
+        try:
+            c = conn.cursor()
+
+            # For snapshot => store basically all relevant fields from your JSON snippet
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS lunarcrush_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lunarcrush_id INTEGER,
+                symbol TEXT,
+                name TEXT,
+                price REAL,
+                price_btc REAL,
+                volume_24h REAL,
+                volatility REAL,
+                circulating_supply REAL,
+                max_supply REAL,
+                percent_change_1h REAL,
+                percent_change_24h REAL,
+                percent_change_7d REAL,
+                market_cap REAL,
+                market_cap_rank INTEGER,
+                interactions_24h REAL,
+                social_volume_24h REAL,
+                social_dominance REAL,
+                market_dominance REAL,
+                market_dominance_prev REAL,
+                galaxy_score REAL,
+                sentiment REAL,
+                inserted_at INTEGER
+            )
+            """)
+
+            # For time-series => store the fields from your time-series snippet
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS lunarcrush_timeseries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                coin_id INTEGER,
+                time INTEGER,
+                open_price REAL,
+                close_price REAL,
+                high_price REAL,
+                low_price REAL,
+                volume_24h REAL,
+                market_cap REAL,
+                market_dominance REAL,
+                circulating_supply REAL,
+                sentiment REAL,
+                spam REAL,
+                galaxy_score REAL,
+                volatility REAL,
+                alt_rank INTEGER,
+                contributors_active REAL,
+                contributors_created REAL,
+                posts_active REAL,
+                posts_created REAL,
+                interactions REAL,
+                social_dominance REAL
+            )
+            """)
+
+            conn.commit()
+            logger.info("Ensured my_lunarcrush_data & my_lunarcrush_timeseries tables exist.")
+        except Exception as e:
+            logger.exception(f"Error creating new tables => {e}")
+        finally:
+            conn.close()
 
     # --------------------------------------------------------------------------
     # Snapshot: filtered vs all
