@@ -111,3 +111,4 @@ trained_model.pkl
 identifier.sqlite
 training_metrics.csv
 /Writerside
+lunarcrush_optimal.db
