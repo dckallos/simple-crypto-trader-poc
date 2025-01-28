@@ -5,59 +5,59 @@
 """
 fetch_lunarcrush.py
 
-An enhanced, class-based script that:
-  1) Offers two snapshot methods:
-     a) fetch_snapshot_data_filtered(...) => uses the 'filter_symbols' approach
-     b) fetch_snapshot_data_all_coins(...) => fetches all coins (no filter)
-  2) Fetches time-series data from /public/coins/<coin_id>/time-series/v2
-     in 'lunarcrush_timeseries'.
-  3) Spot-check entire 'lunarcrush_data' table for top N coins across the market.
-  4) A separate method to backfill time-series specifically for those top N coins.
+A single script that:
+  1) Fetches snapshot data (coins/list/v2) => stores in 'lunarcrush_data' (matching db.py columns).
+  2) Fetches time-series data (/public/coins/<id>/time-series/v2) => stores in 'lunarcrush_timeseries'.
+  3) Supports chunk-based backfill for older historical data, if you treat the 'coin_id' as a symbol
+     or a numeric ID. Here, we store the symbol in 'coin_id' by default, matching the new db.py schema.
+  4) Offers a "spot-check" rank to pick top N symbols if you want partial backfill.
 
-Usage:
-    python fetch_lunarcrush.py
+Usage examples:
+    python fetch_lunarcrush.py --snapshot-all
+    python fetch_lunarcrush.py --snapshot-filtered
+    python fetch_lunarcrush.py --time-series
+    python fetch_lunarcrush.py --backfill-all --months=12
+    python fetch_lunarcrush.py --backfill-top --top-n=10
+    python fetch_lunarcrush.py --backfill-configured --months=6
 
 Environment:
     - LUNARCRUSH_API_KEY: For snapshot endpoints
-    - LUNARCRUSH_BEARER_TOKEN: For time-series if required.
-
-Performance / Data-Volume Plan:
-- Time-series data can grow quickly. Consider archiving older data or limiting to best coins.
+    - LUNARCRUSH_BEARER_TOKEN: For time-series endpoints, if required
 """
 
 import os
-import requests
-import logging
-import sqlite3
+import sys
 import time
-import math
-import pandas as pd
+import logging
+import requests
+import sqlite3
+import argparse
+import yaml
+from typing import Optional, List, Tuple
+
 from dotenv import load_dotenv
-from typing import Dict, Any, Optional, List, Tuple
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# ------------------------------------------------------------------------------
-# Example Toggles / Filters
-# ------------------------------------------------------------------------------
+DB_FILE = "trades.db"  # matches your db.py
+MAX_RETRIES = 3
+RETRY_DELAY_SECONDS = 5
+REQUEST_SLEEP_SECONDS = 6
+
+# If you want to snapshot only certain symbols:
 filter_symbols = [
     "ETH", "XBT", "SOL", "ADA", "XRP", "LTC", "DOT", "MATIC", "LINK", "ATOM",
     "XMR", "TRX", "SHIB", "AVAX", "UNI", "APE", "FIL", "AAVE", "SAND", "CHZ",
     "GRT", "CRV", "COMP", "ALGO", "NEAR", "LDO", "XTZ", "EGLD", "KSM"
 ]
 
-MAX_RETRIES = 3
-RETRY_DELAY_SECONDS = 5
-DB_FILE = "trades.db"
-
-# Rate-limit ~10 calls/min => 6s each
-REQUEST_SLEEP_SECONDS = 6
 
 class LunarCrushFetcher:
     """
-    A class that fetches LunarCrush data (snapshot & time-series) into local DB.
-    We have separate methods for (a) all coins vs. (b) filtered coins.
+    Fetches LunarCrush snapshot & time-series data, storing into 'lunarcrush_data'
+    and 'lunarcrush_timeseries' as defined in db.py. Also provides chunk-based
+    backfill and a spot-check rank function.
     """
 
     def __init__(self, db_file: str = DB_FILE):
@@ -66,278 +66,180 @@ class LunarCrushFetcher:
 
         self.API_KEY = os.getenv("LUNARCRUSH_API_KEY", "")
         if not self.API_KEY:
-            logger.warning("No LUNARCRUSH_API_KEY set. Snapshot calls may fail.")
+            logger.warning("No LUNARCRUSH_API_KEY => snapshot calls may fail or skip.")
 
         self.BEARER_TOKEN = os.getenv("LUNARCRUSH_BEARER_TOKEN", "")
         if not self.BEARER_TOKEN:
-            logger.warning("No LUNARCRUSH_BEARER_TOKEN set. Time-series calls may fail if required.")
+            logger.warning("No LUNARCRUSH_BEARER_TOKEN => time-series calls may fail or skip.")
 
     # --------------------------------------------------------------------------
-    # (A) Snapshot: "filtered"
+    # Snapshot: filtered vs all
     # --------------------------------------------------------------------------
-    def fetch_snapshot_data_filtered(self, limit: int = 100):
+    def fetch_snapshot_data_filtered(self, limit: int=100):
         """
-        Uses /public/coins/list/v2 => includes only 'filter_symbols'.
-        This replicates your original logic that references 'filter_symbols'.
+        /public/coins/list/v2 => only those symbols in filter_symbols (uppercase).
+        We'll store a row in 'lunarcrush_data' for each coin found.
         """
         if not self.API_KEY:
-            logger.error("No LUNARCRUSH_API_KEY => abort snapshot fetch.")
+            logger.error("No LUNARCRUSH_API_KEY => cannot fetch snapshots.")
             return
 
         base_url = "https://lunarcrush.com/api4/public/coins/list/v2"
-        params = {
-            "key": self.API_KEY
-        }
-
+        params = {"key": self.API_KEY}
         attempt=0
         while attempt<MAX_RETRIES:
             try:
-                logger.info(f"[SNAPSHOT-FILTERED] GET => {base_url}, params={params}, attempt={attempt+1}")
+                logger.info(f"[SNAPSHOT-FILTERED] attempt={attempt+1}, limit={limit}")
                 resp = requests.get(base_url, params=params, timeout=10)
                 resp.raise_for_status()
 
                 data = resp.json()
-                coins_list = data.get("data", [])
-                logger.info(f"[SNAPSHOT-FILTERED] Fetched {len(coins_list)} coins total.")
+                all_coins = data.get("data", [])
+                logger.info(f"[SNAPSHOT-FILTERED] Endpoint returned {len(all_coins)} coins total.")
 
-                # filter by 'filter_symbols'
-                filter_upper = [s.upper() for s in filter_symbols]
+                # local filter
+                filter_up = [s.upper() for s in filter_symbols]
                 coins_list = [
-                    c for c in coins_list
-                    if c.get("symbol","").upper() in filter_upper
+                    c for c in all_coins
+                    if c.get("symbol","").upper() in filter_up
                 ]
-                logger.info(f"[SNAPSHOT-FILTERED] After filter, we have {len(coins_list)} coins.")
-
-                self._init_lunarcrush_data_table()
+                logger.info(f"[SNAPSHOT-FILTERED] after local filter => {len(coins_list)} coins remain.")
                 self._store_snapshot_records(coins_list)
                 break
             except requests.exceptions.HTTPError as e:
-                attempt+=1
-                logger.error(f"[SNAPSHOT-FILTERED] HTTP Error => {e}, sleep={RETRY_DELAY_SECONDS}")
+                attempt +=1
+                logger.error(f"[SNAPSHOT-FILTERED] HTTP => {e} => sleeping={RETRY_DELAY_SECONDS}")
                 time.sleep(RETRY_DELAY_SECONDS)
             except Exception as e:
-                attempt+=1
-                logger.exception(f"[SNAPSHOT-FILTERED] Error => {e}, sleep={RETRY_DELAY_SECONDS}")
+                attempt +=1
+                logger.exception(f"[SNAPSHOT-FILTERED] => {e}")
                 time.sleep(RETRY_DELAY_SECONDS)
         else:
             logger.error("[SNAPSHOT-FILTERED] all attempts failed => gave up.")
 
-    # --------------------------------------------------------------------------
-    # (B) Snapshot: "all_coins"
-    # --------------------------------------------------------------------------
-    def fetch_snapshot_data_all_coins(self, limit: int = 500):
+    def fetch_snapshot_data_all_coins(self, limit: int=500):
         """
-        Another method to fetch ALL coins from /public/coins/list/v2, ignoring filter_symbols.
-        For a truly wide net, you might set limit=500 or 1000 if your plan allows.
+        /public/coins/list/v2 => fetch up to 'limit' coins, ignoring filter_symbols.
+        We'll store them in 'lunarcrush_data'.
         """
         if not self.API_KEY:
-            logger.error("No LUNARCRUSH_API_KEY => abort snapshot fetch.")
+            logger.error("No LUNARCRUSH_API_KEY => cannot fetch snapshots.")
             return
 
         base_url = "https://lunarcrush.com/api4/public/coins/list/v2"
-        params = {
-            "key": self.API_KEY,
-            "limit": limit
-        }
-
+        params = {"key": self.API_KEY, "limit": limit}
         attempt=0
         while attempt<MAX_RETRIES:
             try:
-                logger.info(f"[SNAPSHOT-ALL] GET => {base_url}, params={params}, attempt={attempt+1}")
+                logger.info(f"[SNAPSHOT-ALL] attempt={attempt+1}, limit={limit}")
                 resp = requests.get(base_url, params=params, timeout=10)
                 resp.raise_for_status()
 
                 data = resp.json()
                 coins_list = data.get("data", [])
-                logger.info(f"[SNAPSHOT-ALL] Fetched {len(coins_list)} coins (unfiltered).")
-
-                self._init_lunarcrush_data_table()
+                logger.info(f"[SNAPSHOT-ALL] Endpoint returned {len(coins_list)} coins unfiltered.")
                 self._store_snapshot_records(coins_list)
                 break
             except requests.exceptions.HTTPError as e:
-                attempt+=1
-                logger.error(f"[SNAPSHOT-ALL] HTTP Error => {e}, sleep={RETRY_DELAY_SECONDS}")
+                attempt +=1
+                logger.error(f"[SNAPSHOT-ALL] HTTP => {e} => sleeping={RETRY_DELAY_SECONDS}")
                 time.sleep(RETRY_DELAY_SECONDS)
             except Exception as e:
-                attempt+=1
-                logger.exception(f"[SNAPSHOT-ALL] Error => {e}, sleep={RETRY_DELAY_SECONDS}")
+                attempt +=1
+                logger.exception(f"[SNAPSHOT-ALL] => {e}")
                 time.sleep(RETRY_DELAY_SECONDS)
         else:
             logger.error("[SNAPSHOT-ALL] all attempts failed => gave up.")
 
 
-    def _init_lunarcrush_data_table(self):
+    def _store_snapshot_records(self, coins_list: list):
         """
-        Creates or ensures 'lunarcrush_data' if not exists.
-        """
-        conn = sqlite3.connect(DB_FILE)
-        try:
-            c = conn.cursor()
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS lunarcrush_data (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    lunarcrush_id INTEGER,
-                    symbol TEXT,
-                    name TEXT,
-                    price REAL,
-                    price_btc REAL,
-                    volume_24h REAL,
-                    volatility REAL,
-                    circulating_supply REAL,
-                    max_supply REAL,
-                    percent_change_1h REAL,
-                    percent_change_24h REAL,
-                    percent_change_7d REAL,
-                    percent_change_30d REAL,
-                    market_cap REAL,
-                    market_cap_rank INTEGER,
-                    market_dominance REAL,
-                    market_dominance_prev REAL,
-                    social_volume_24h REAL,
-                    interactions_24h REAL,
-                    social_dominance REAL,
-                    galaxy_score REAL,
-                    galaxy_score_previous REAL,
-                    alt_rank INTEGER,
-                    alt_rank_previous INTEGER,
-                    sentiment REAL,
-                    categories TEXT,
-                    topic TEXT,
-                    logo TEXT,
-                    inserted_at INTEGER
-                )
-            """)
-            conn.commit()
-        except Exception as e:
-            logger.exception(f"[SNAPSHOT] Error creating 'lunarcrush_data': {e}")
-        finally:
-            conn.close()
+        Insert rows into `lunarcrush_data` using the columns from db.py:
 
-    def _store_snapshot_records(self, coins_list: List[dict]):
+        (timestamp, symbol, name, price, market_cap, volume_24h, volatility,
+         percent_change_1h, percent_change_24h, percent_change_7d, percent_change_30d,
+         social_volume_24h, interactions_24h, social_dominance, galaxy_score,
+         alt_rank, sentiment, categories, topic, logo)
         """
-        Insert into 'lunarcrush_data'.
-        """
+
+        if not coins_list:
+            logger.info("[SNAPSHOT] no coins => skip storing.")
+            return
+
         now_ts = int(time.time())
         conn = sqlite3.connect(self.db_file)
         try:
-            c=conn.cursor()
+            c = conn.cursor()
+            inserted=0
             for coin in coins_list:
-                # parse all fields
-                lc_id = coin.get("id",None)
                 symbol = coin.get("symbol","")
                 name   = coin.get("name","")
+                price  = coin.get("price",0.0)
+                mcap   = coin.get("market_cap",0.0)
+                vol24  = coin.get("volume_24h",0.0)
+                volty  = coin.get("volatility",0.0)
 
-                price = coin.get("price",0.0)
-                price_btc = coin.get("price_btc",0.0)
-
-                volume_24h = coin.get("volume_24h",0.0)
-                volatility = coin.get("volatility",0.0)
-                circ_supply= coin.get("circulating_supply",0.0)
-                max_supply= coin.get("max_supply",0.0)
-
-                pct1h= coin.get("percent_change_1h",0.0)
-                pct24= coin.get("percent_change_24h",0.0)
-                pct7d= coin.get("percent_change_7d",0.0)
-                pct30= coin.get("percent_change_30d",0.0)
-
-                mc= coin.get("market_cap",0.0)
-                mc_rank= coin.get("market_cap_rank",999999)
-                mdom= coin.get("market_dominance",0.0)
-                mdom_prev= coin.get("market_dominance_prev",0.0)
+                pct1h  = coin.get("percent_change_1h",0.0)
+                pct24  = coin.get("percent_change_24h",0.0)
+                pct7d  = coin.get("percent_change_7d",0.0)
+                pct30  = coin.get("percent_change_30d",0.0)
 
                 socvol_24 = coin.get("social_volume_24h",0.0)
                 inter_24  = coin.get("interactions_24h",0.0)
                 soc_dom   = coin.get("social_dominance",0.0)
-
                 gal_score = coin.get("galaxy_score",0.0)
-                gal_prev  = coin.get("galaxy_score_previous",0.0)
-                alt_rank  = coin.get("alt_rank",0)
-                alt_prev  = coin.get("alt_rank_previous",0)
+                alt_r     = coin.get("alt_rank",999999)
+                senti     = coin.get("sentiment",0.0)
 
-                sentiment= coin.get("sentiment",0.0)
-                cats     = coin.get("categories","")
-                topic    = coin.get("topic","")
-                logo     = coin.get("logo","")
+                cats      = coin.get("categories","")
+                topic     = coin.get("topic","")
+                logo      = coin.get("logo","")
 
                 c.execute("""
                     INSERT INTO lunarcrush_data (
-                      lunarcrush_id, symbol, name,
-                      price, price_btc,
-                      volume_24h, volatility,
-                      circulating_supply, max_supply,
-                      percent_change_1h, percent_change_24h, percent_change_7d, percent_change_30d,
-                      market_cap, market_cap_rank,
-                      market_dominance, market_dominance_prev,
-                      social_volume_24h, interactions_24h, social_dominance,
-                      galaxy_score, galaxy_score_previous,
-                      alt_rank, alt_rank_previous,
-                      sentiment, categories, topic, logo,
-                      inserted_at
+                        timestamp, symbol, name, price, market_cap, volume_24h, volatility,
+                        percent_change_1h, percent_change_24h, percent_change_7d, percent_change_30d,
+                        social_volume_24h, interactions_24h, social_dominance, galaxy_score,
+                        alt_rank, sentiment, categories, topic, logo
                     )
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, [
-                    lc_id, symbol, name,
-                    price, price_btc,
-                    volume_24h, volatility,
-                    circ_supply, max_supply,
+                    now_ts,
+                    symbol, name, price, mcap, vol24, volty,
                     pct1h, pct24, pct7d, pct30,
-                    mc, mc_rank,
-                    mdom, mdom_prev,
-                    socvol_24, inter_24, soc_dom,
-                    gal_score, gal_prev,
-                    alt_rank, alt_prev,
-                    sentiment, cats, topic, logo,
-                    now_ts
+                    socvol_24, inter_24, soc_dom, gal_score,
+                    alt_r, senti, cats, topic, logo
                 ])
+                inserted+=1
+
             conn.commit()
-            logger.info(f"[SNAPSHOT] Inserted {len(coins_list)} rows => 'lunarcrush_data'")
+            logger.info(f"[SNAPSHOT] Inserted {inserted} rows into 'lunarcrush_data'.")
         except Exception as e:
-            logger.exception(f"[SNAPSHOT] store_snapshot => {e}")
+            logger.exception(f"[SNAPSHOT] error => {e}")
         finally:
             conn.close()
 
     # --------------------------------------------------------------------------
-    # Time-series fetch
+    # Time-series => 'lunarcrush_timeseries'
     # --------------------------------------------------------------------------
-    def fetch_time_series_for_tracked_coins(
-        self,
-        bucket="hour",
-        interval="1w",
-        start: Optional[int]=None,
-        end: Optional[int]=None
-    ):
+    def fetch_time_series_for_tracked_coins(self, bucket="hour", interval="1w",
+                                            start: Optional[int]=None, end: Optional[int]=None):
         """
-        For each coin in 'lunarcrush_data' => calls _fetch_lunarcrush_time_series =>
-        you can remove the 'filter_symbols' approach here, we want all from the DB.
+        We'll interpret the 'symbol' column in lunarcrush_data as the unique coin ID
+        to pass to /public/coins/<symbol>/time-series/v2.
+        If the API expects numeric IDs, you'd adapt. We'll store the returned data in 'lunarcrush_timeseries'.
         """
-        conn=sqlite3.connect(self.db_file)
-        try:
-            c=conn.cursor()
-            q="""
-            SELECT DISTINCT lunarcrush_id, symbol
-            FROM lunarcrush_data
-            WHERE lunarcrush_id IS NOT NULL
-            """
-            rows=c.execute(q).fetchall()
-        except Exception as e:
-            logger.exception(f"[TIMESERIES] => {e}")
-            return
-        finally:
-            conn.close()
-
-        if not rows:
-            logger.info("[TIMESERIES] No coins => skip.")
+        coin_symbols = self._load_symbols_from_db()
+        if not coin_symbols:
+            logger.info("[TIMESERIES] no symbols => skip.")
             return
 
-        logger.info(f"[TIMESERIES] => found {len(rows)} coin IDs => let's fetch")
-
-        for idx, (cid, sym) in enumerate(rows, start=1):
+        logger.info(f"[TIMESERIES] => found {len(coin_symbols)} distinct symbols => fetch time-series.")
+        for idx, sym in enumerate(coin_symbols, start=1):
             time.sleep(REQUEST_SLEEP_SECONDS)
-            logger.info(
-                f"[TIMESERIES] => {idx}/{len(rows)} => coin_id={cid}, sym={sym}, bucket={bucket}, interval={interval}"
-            )
+            logger.info(f"[TIMESERIES] => {idx}/{len(coin_symbols)} => symbol={sym}, bucket={bucket}, interval={interval}")
             self._fetch_lunarcrush_time_series(
-                str(cid),
+                coin_id=sym,
                 bucket=bucket,
                 interval=interval,
                 start=start,
@@ -352,96 +254,74 @@ class LunarCrushFetcher:
         start: Optional[int]=None,
         end: Optional[int]=None
     ):
-        base_url=f"https://lunarcrush.com/api4/public/coins/{coin_id}/time-series/v2"
-        headers={}
-        if self.BEARER_TOKEN:
-            headers["Authorization"] = f"Bearer {self.BEARER_TOKEN}"
+        if not self.BEARER_TOKEN:
+            logger.warning("No LUNARCRUSH_BEARER_TOKEN => cannot fetch time-series.")
+            return
 
-        params={
-            "bucket": bucket,
-            "interval": interval
-        }
+        base_url = f"https://lunarcrush.com/api4/public/coins/{coin_id}/time-series/v2"
+        headers = {"Authorization": f"Bearer {self.BEARER_TOKEN}"}
+        params = {"bucket": bucket, "interval": interval}
         if start is not None:
             params["start"] = start
         if end is not None:
-            params["end"]   = end
+            params["end"] = end
 
         attempt=0
         while attempt<MAX_RETRIES:
             try:
-                logger.info(f"[TIMESERIES] GET => {base_url}, params={params}, attempt={attempt+1}")
+                logger.info(f"[TIMESERIES] GET => {base_url}, attempt={attempt+1}, coin_id={coin_id}")
                 resp = requests.get(base_url, headers=headers, params=params, timeout=10)
                 resp.raise_for_status()
 
                 data = resp.json()
-                recs=data.get("data",[])
-                logger.info(f"[TIMESERIES] coin_id={coin_id}, got {len(recs)} records")
+                recs = data.get("data", [])
+                logger.info(f"[TIMESERIES] symbol={coin_id}, got {len(recs)} records")
 
                 if recs:
-                    self.init_lunarcrush_timeseries_table()
                     self._store_timeseries_records(coin_id, recs)
                 break
             except requests.exceptions.HTTPError as e:
                 attempt+=1
-                logger.error(f"[TIMESERIES] HTTP => {e}. sleep={RETRY_DELAY_SECONDS}")
+                logger.error(f"[TIMESERIES] HTTP => {e}, sleep={RETRY_DELAY_SECONDS}")
                 time.sleep(RETRY_DELAY_SECONDS)
             except Exception as e:
                 attempt+=1
-                logger.exception(f"[TIMESERIES] => {e}. sleep={RETRY_DELAY_SECONDS}")
+                logger.exception(f"[TIMESERIES] => {e}, sleep={RETRY_DELAY_SECONDS}")
                 time.sleep(RETRY_DELAY_SECONDS)
         else:
-            logger.error(f"[TIMESERIES] All attempts fail => coin_id={coin_id}")
+            logger.error(f"[TIMESERIES] All attempts fail => symbol={coin_id}")
 
-    @staticmethod
-    def init_lunarcrush_timeseries_table():
-        conn = sqlite3.connect(DB_FILE)
-        try:
-            c=conn.cursor()
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS lunarcrush_timeseries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                coin_id TEXT,
-                timestamp INTEGER,
-                open_price REAL,
-                close_price REAL,
-                high_price REAL,
-                low_price REAL,
-                volume_24h REAL,
-                market_cap REAL,
-                sentiment REAL,
-                spam REAL,
-                galaxy_score REAL,
-                alt_rank INTEGER,
-                volatility REAL,
-                interactions REAL,
-                social_dominance REAL
-            )
-            """)
-            conn.commit()
-        except Exception as e:
-            logger.exception(f"[TIMESERIES] create timeseries => {e}")
-        finally:
-            conn.close()
+    def _store_timeseries_records(self, coin_id: str, records: list):
+        """
+        Insert into 'lunarcrush_timeseries', matching the db.py columns:
+          (coin_id, timestamp, open_price, close_price, high_price, low_price, volume_24h, market_cap,
+           sentiment, spam, galaxy_score, alt_rank, volatility, interactions, social_dominance)
+        We'll skip 'market_dominance', 'circulating_supply', etc. not in db.py.
+        """
+        if not records:
+            logger.info(f"[TIMESERIES] symbol={coin_id} => no records => skip.")
+            return
 
-    def _store_timeseries_records(self, coin_id:str, records: list):
-        conn=sqlite3.connect(self.db_file)
+        conn = sqlite3.connect(self.db_file)
         try:
-            c=conn.cursor()
-            for rec in records:
-                timestamp=rec.get("time",0)
-                open_p = rec.get("open",0.0)
-                close_p= rec.get("close",0.0)
-                high_p = rec.get("high",0.0)
-                low_p  = rec.get("low",0.0)
-                vol24  = rec.get("volume_24h",0.0)
-                mc     = rec.get("market_cap",0.0)
-                sent   = rec.get("sentiment",0.0)
-                sp     = rec.get("spam",0.0)
-                gal_s  = rec.get("galaxy_score",0.0)
-                alt_r  = rec.get("alt_rank",0)
-                volty  = rec.get("volatility",0.0)
-                inter  = rec.get("interactions",0.0)
-                socdom = rec.get("social_dominance",0.0)
+            c = conn.cursor()
+            inserted=0
+            for r in records:
+                # typical fields from the time-series JSON
+                ts = r.get("time",0)
+                open_p = r.get("open",0.0)
+                close_p= r.get("close",0.0)
+                high_p = r.get("high",0.0)
+                low_p  = r.get("low",0.0)
+                vol24  = r.get("volume_24h",0.0)
+                mc     = r.get("market_cap",0.0)
+                senti  = r.get("sentiment",0.0)
+                sp     = r.get("spam",0.0)
+                gal_s  = r.get("galaxy_score",0.0)
+                alt_r  = r.get("alt_rank",0)
+                volty  = r.get("volatility",0.0)
+                inter  = r.get("interactions",0.0)
+                socdom = r.get("social_dominance",0.0)
 
                 c.execute("""
                 INSERT INTO lunarcrush_timeseries (
@@ -454,133 +334,229 @@ class LunarCrushFetcher:
                 )
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, [
-                    coin_id, timestamp,
+                    coin_id, ts,
                     open_p, close_p, high_p, low_p,
                     vol24, mc,
-                    sent, sp,
+                    senti, sp,
                     gal_s, alt_r, volty,
                     inter, socdom
                 ])
+                inserted+=1
             conn.commit()
-            logger.info(f"[TIMESERIES] coin_id={coin_id}, inserted {len(records)} rows.")
+            logger.info(f"[TIMESERIES] symbol={coin_id} => inserted {inserted} rows.")
         except Exception as e:
-            logger.exception(f"[TIMESERIES] store => coin_id={coin_id}, {e}")
+            logger.exception(f"[TIMESERIES] store => {e}")
         finally:
             conn.close()
 
-    # ==========================================================================
-    # (A) Spot-check entire market: "spot_check_entire_market"
-    # ==========================================================================
-    @staticmethod
-    def spot_check_entire_market(top_n: int=10) -> List[Tuple[str,float]]:
+    def _load_symbols_from_db(self) -> List[str]:
         """
-        This method does NOT rely on 'filter_symbols'. It expects you to have
-        run fetch_snapshot_data_all_coins(...) so 'lunarcrush_data' has all coins.
-        Then we pick top N by a rank_score formula.
-
-        rank_score = (0.5*gscore) + (0.2*(market_cap/1e9)) + (0.2*%24h) + (0.05*senti) - (0.05*alt_rank)
-        The higher => the better.
-
-        Returns => list of (coin_id, rank_score).
+        Return distinct uppercase symbols from 'lunarcrush_data' => we assume to pass them to /public/coins/<symbol>/time-series.
+        If your API usage requires numeric IDs, adapt accordingly.
         """
-
-        conn = sqlite3.connect(DB_FILE)
         out=[]
+        conn=sqlite3.connect(self.db_file)
         try:
             c=conn.cursor()
-            # reading entire market:
             q="""
-              SELECT
-                symbol, lunarcrush_id,
-                galaxy_score, alt_rank,
-                market_cap, percent_change_24h,
-                sentiment
-              FROM lunarcrush_data
-              WHERE lunarcrush_id IS NOT NULL
+            SELECT DISTINCT UPPER(symbol)
+            FROM lunarcrush_data
+            WHERE symbol IS NOT NULL AND symbol != ''
             """
             rows = c.execute(q).fetchall()
-            if not rows:
-                logger.warning("[SPOTCHECK-ALL] no rows => can't proceed.")
-                return []
-
-            temp=[]
-            for (sym, cid, gscore, arank, mcap, pc24, senti) in rows:
-                if not cid:
-                    continue
-                gscore = gscore or 0.0
-                arank  = arank or 999999
-                mcap   = mcap or 0.0
-                pc24   = pc24 or 0.0
-                senti  = senti or 0.0
-
-                scaled_senti = senti*0.01  # if your sentiment is 0..100
-                rank_score = (
-                    (0.5*gscore)
-                    + (0.2*(mcap/1e9))
-                    + (0.2*pc24)
-                    + (0.05*scaled_senti)
-                    - (0.05*arank)
-                )
-                temp.append((str(cid), rank_score, sym))
-
-            temp.sort(key=lambda x: x[1], reverse=True)
-            top_temp = temp[:top_n]
-            logger.info(f"[SPOTCHECK-ALL] top_n={top_n} => {top_temp}")
-            out = [(c[0], c[1]) for c in top_temp]
+            out=[r[0] for r in rows if r[0]]
         except Exception as e:
-            logger.exception(f"[SPOTCHECK-ALL] => {e}")
+            logger.exception(f"[TIMESERIES] load_symbols => {e}")
         finally:
             conn.close()
         return out
 
-    # ==========================================================================
-    # (B) Backfill the top N from entire market
-    # ==========================================================================
-    def backfill_top_n_timeseries(
+    # --------------------------------------------------------------------------
+    # chunk-based backfill
+    # --------------------------------------------------------------------------
+    def backfill_coins(
         self,
-        top_coins: List[Tuple[str,float]],
+        coin_ids: List[str],
+        months: int=12,
         bucket="hour",
-        interval="1w",
-        start: Optional[int]=None,
-        end: Optional[int]=None
+        interval="1w"
     ):
         """
-        We explicitly only do time-series for these top_coins.
-        Each item => (coin_id, rank_score).
+        For chunk-based historical data. We'll interpret 'coin_ids' as the symbols. We'll
+        chunk from (now - months*30days) to present in ~30-day increments.
         """
-        if not top_coins:
-            logger.info("[BACKFILL-TOPN] no top coins => skip.")
+        if not self.BEARER_TOKEN:
+            logger.warning("No LUNARCRUSH_BEARER_TOKEN => cannot backfill timeseries.")
+            return
+        if not coin_ids:
+            logger.info("[BACKFILL] no coin_ids => skip.")
             return
 
-        self.init_lunarcrush_timeseries_table()
+        logger.info(f"[BACKFILL] chunk-based => {len(coin_ids)} symbols, months={months}")
+        now_ts = int(time.time())
+        chunk_seconds = 30*86400
+        total_back_secs = months*chunk_seconds
 
-        for idx, (cid, rs) in enumerate(top_coins, start=1):
-            logger.info(f"[BACKFILL-TOPN] {idx}/{len(top_coins)} => coin_id={cid}, rank_score={rs}")
-            time.sleep(REQUEST_SLEEP_SECONDS)
-            self._fetch_lunarcrush_time_series(
-                coin_id=cid,
-                bucket=bucket,
-                interval=interval,
-                start=start,
-                end=end
-            )
+        for idx, sym in enumerate(coin_ids, start=1):
+            logger.info(f"[BACKFILL] => symbol={sym} => {idx}/{len(coin_ids)} => months={months}")
+            start_ts = now_ts - total_back_secs
+            while start_ts < now_ts:
+                chunk_end = start_ts + chunk_seconds
+                if chunk_end > now_ts:
+                    chunk_end = now_ts
+
+                logger.info(f"[BACKFILL] chunk => symbol={sym}, start={start_ts}, end={chunk_end}")
+                self._fetch_lunarcrush_time_series(
+                    coin_id=sym,
+                    bucket=bucket,
+                    interval=interval,
+                    start=start_ts,
+                    end=chunk_end
+                )
+                time.sleep(REQUEST_SLEEP_SECONDS)
+                start_ts = chunk_end
+
+    # --------------------------------------------------------------------------
+    # Spot-check entire market => pick top N for partial backfill
+    # --------------------------------------------------------------------------
+    def spot_check_entire_market(self, top_n: int=10) -> List[str]:
+        """
+        We'll read from 'lunarcrush_data' => compute a naive rank_score => return top N symbols
+        so we can do partial backfill. The formula is an example.
+        """
+        out=[]
+        conn=sqlite3.connect(self.db_file)
+        try:
+            c=conn.cursor()
+            rows=c.execute("""
+            SELECT UPPER(symbol), galaxy_score, alt_rank, market_cap, percent_change_24h, sentiment
+            FROM lunarcrush_data
+            WHERE symbol IS NOT NULL
+            """).fetchall()
+            if not rows:
+                logger.warning("[SPOTCHECK] no rows => can't proceed.")
+                return []
+
+            temp=[]
+            for (sym, gsc, ar, mc, pc24, sent) in rows:
+                if not sym:
+                    continue
+                gsc = gsc or 0.0
+                ar  = ar or 999999
+                mc  = mc or 0.0
+                pc24= pc24 or 0.0
+                sent= sent or 0.0
+
+                # example rank => (0.5*gscore + 0.2*(mc/1e9) + 0.2*pc24 + 0.05*(sent/1=100?) - 0.05*ar
+                # We'll just do a naive approach:
+                scaled_senti = sent*0.01
+                rank_score = (0.5*gsc) + (0.2*(mc/1e9)) + (0.2*pc24) + (0.05*scaled_senti) - (0.05*ar)
+                temp.append((sym, rank_score))
+
+            temp.sort(key=lambda x:x[1], reverse=True)
+            top_temp = temp[:top_n]
+            out = [t[0] for t in top_temp]
+            logger.info(f"[SPOTCHECK] => top_n={top_n}, {top_temp}")
+        except Exception as e:
+            logger.exception(f"[SPOTCHECK] => {e}")
+        finally:
+            conn.close()
+        return out
+
 
 # ------------------------------------------------------------------------------
-# Example usage
+# CLI
 # ------------------------------------------------------------------------------
-if __name__=="__main__":
+def parse_args():
+    p = argparse.ArgumentParser(description="Fetch from LunarCrush into your db.py schema.")
+    p.add_argument("--snapshot-filtered", action="store_true",
+                   help="Fetch only filter_symbols from /coins/list/v2 => store in 'lunarcrush_data'.")
+    p.add_argument("--snapshot-all", action="store_true",
+                   help="Fetch up to 'limit' coins from /coins/list/v2 => store in 'lunarcrush_data'.")
+    p.add_argument("--time-series", action="store_true",
+                   help="Fetch time-series for each distinct symbol in 'lunarcrush_data'.")
+    p.add_argument("--backfill-all", action="store_true",
+                   help="Chunk-based backfill for all symbols found in 'lunarcrush_data'.")
+    p.add_argument("--backfill-top", action="store_true",
+                   help="Spot-check rank => pick top N => chunk-based backfill them.")
+    p.add_argument("--backfill-configured", action="store_true",
+                   help="Load config.yaml traded_pairs => parse the symbol => chunk-based backfill.")
+    p.add_argument("--top-n", type=int, default=10,
+                   help="Number of coins for --backfill-top. Default=10.")
+    p.add_argument("--months", type=int, default=12,
+                   help="Number of months to chunk-based backfill. Default=12 => ~1 year.")
+    p.add_argument("--limit", type=int, default=100,
+                   help="Limit for snapshot. Default=100.")
+    return p.parse_args()
+
+def main():
+    args = parse_args()
     fetcher = LunarCrushFetcher(DB_FILE)
 
-    # 1) Option A => fetch snapshot data with filters
-    # fetcher.fetch_snapshot_data_filtered(limit=100)
-    fetcher.init_lunarcrush_timeseries_table()
+    # if you need config
+    config_file = "config.yaml"
+    traded_pairs = []
+    if os.path.exists(config_file):
+        import yaml
+        with open(config_file,"r") as f:
+            config = yaml.safe_load(f)
+        traded_pairs = config.get("traded_pairs",[])
 
-    # or Option B => fetch entire market
-    fetcher.fetch_snapshot_data_all_coins(limit=100)
+    # (A) Snapshots
+    if args.snapshot_filtered:
+        fetcher.fetch_snapshot_data_filtered(limit=args.limit)
+    if args.snapshot_all:
+        fetcher.fetch_snapshot_data_all_coins(limit=args.limit)
 
-    # 2) Now we have 'lunarcrush_data' filled. Let's spot-check entire market:
-    top_n_coins = fetcher.spot_check_entire_market(top_n=30)
-    logger.info(f"Top 10 across entire market => {top_n_coins}")
+    # (B) Time-series => no chunk => just fetch for all symbols
+    if args.time_series:
+        fetcher.fetch_time_series_for_tracked_coins(bucket="hour", interval="1w")
 
-    # 3) We'll backfill just those top 10 coins:
-    fetcher.backfill_top_n_timeseries(top_n_coins, bucket="hour", interval="1w")
+    # (C) chunk-based backfill
+    if any([args.backfill_all, args.backfill_top, args.backfill_configured]):
+        coin_ids=[]
+
+        def load_all_symbols() -> List[str]:
+            out=[]
+            conn=sqlite3.connect(DB_FILE)
+            try:
+                c=conn.cursor()
+                rows=c.execute("""
+                SELECT DISTINCT UPPER(symbol)
+                FROM lunarcrush_data
+                WHERE symbol IS NOT NULL AND symbol != ''
+                """).fetchall()
+                out=[r[0] for r in rows if r[0]]
+            except Exception as e:
+                logger.exception(f"[BACKFILL-ALL] => {e}")
+            finally:
+                conn.close()
+            return out
+
+        def load_configured_symbols(tpairs:List[str]) -> List[str]:
+            # parse symbol from each "ETH/USD" => "ETH"
+            syms=[]
+            for pair in tpairs:
+                syms.append(pair.split("/")[0].upper())
+            syms = list(set(syms))
+            logger.info(f"[ConfiguredSymbols] => {syms}")
+            return syms
+
+        if args.backfill_all:
+            coin_ids = load_all_symbols()
+
+        elif args.backfill_top:
+            top_syms = fetcher.spot_check_entire_market(top_n=args.top_n)
+            coin_ids = top_syms
+
+        elif args.backfill_configured:
+            coin_ids = load_configured_symbols(traded_pairs)
+
+        if not coin_ids:
+            logger.info("[BACKFILL] no coin_ids => skip.")
+        else:
+            fetcher.backfill_coins(coin_ids, months=args.months, bucket="hour", interval="1w")
+
+
+if __name__=="__main__":
+    main()
