@@ -202,7 +202,7 @@ class GPTManager:
                 model=self.model,
                 messages=[system_msg, user_msg],
                 temperature=self.temperature,
-                max_tokens=self.max_tokens
+                max_completion_tokens=self.max_tokens
             )
         except Exception as e:
             logger.exception("Error contacting GPT => fallback => hold.")
@@ -316,7 +316,7 @@ class GPTManager:
                 model=self.model,
                 messages=[system_msg, user_msg],
                 temperature=self.temperature,
-                max_tokens=self.max_tokens
+                max_completion_tokens=self.max_tokens
             )
         except Exception as e:
             logger.exception("[GPT-Multi] Error => fallback => empty decisions")
