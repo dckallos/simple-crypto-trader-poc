@@ -52,7 +52,7 @@ class AIStrategy:
         take_profit_pct: float = 0.01,
         max_daily_drawdown: float = -0.02,
         risk_controls: Optional[Dict[str, Any]] = None,
-        gpt_model: str = "gpt-4o",
+        gpt_model: str = "o1-mini",
         gpt_temperature: float = 1.0,
         gpt_max_tokens: int = 2000,
         **gpt_client_options
