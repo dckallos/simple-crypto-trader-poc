@@ -104,25 +104,35 @@ def init_db():
             CREATE TABLE IF NOT EXISTS lunarcrush_data (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp INTEGER,
+                lunarcrush_id INTEGER,
                 symbol TEXT,
                 name TEXT,
                 price REAL,
-                market_cap REAL,
+                price_btc REAL,
                 volume_24h REAL,
                 volatility REAL,
+                circulating_supply REAL,
+                max_supply REAL,
                 percent_change_1h REAL,
                 percent_change_24h REAL,
                 percent_change_7d REAL,
                 percent_change_30d REAL,
-                social_volume_24h REAL,
+                market_cap REAL,
+                market_cap_rank INTEGER,
                 interactions_24h REAL,
+                social_volume_24h REAL,
                 social_dominance REAL,
+                market_dominance REAL,
+                market_dominance_prev REAL,
                 galaxy_score REAL,
+                galaxy_score_previous REAL,
                 alt_rank INTEGER,
+                alt_rank_previous INTEGER,
                 sentiment REAL,
                 categories TEXT,
                 topic TEXT,
-                logo TEXT
+                logo TEXT,
+                blockchains TEXT
             )
         """)
 
