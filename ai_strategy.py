@@ -1,11 +1,18 @@
+#!/usr/bin/env python3
+# =============================================================================
+# FILE: ai_strategy.py
+# =============================================================================
 """
 ai_strategy.py
 
 An enhanced AIStrategy that:
+
 1) Uses GPT logic (via GPTManager) or fallback logic for single or multi-coin GPT calls.
 2) Integrates daily drawdown, risk constraints, sub-position logic via RiskManagerDB.
-3) **Now** loads aggregator data from aggregator_summaries, aggregator_classifier_probs, aggregator_embeddings,
-   then uses build_aggregator_prompt(...) to produce a short aggregator text.
+3) Loads aggregator data from aggregator_summaries, aggregator_classifier_probs, aggregator_embeddings,
+   then uses build_aggregator_prompt(...) to produce a short aggregator text for GPT.
+4) Updated to align with the recent changes in gpt_manager.py (which now reads model from config.yaml
+   or from a property override).
 
 Basic Flow:
     - Single pair => call predict(market_data)
@@ -38,9 +45,17 @@ logging.basicConfig(level=logging.DEBUG)
 class AIStrategy:
     """
     AIStrategy: A flexible class that decides trades for one or multiple pairs,
-    using GPT or fallback logic. Now it loads aggregator data from aggregator_summaries,
-    aggregator_classifier_probs, aggregator_embeddings to build a short aggregator prompt
-    for GPT.
+    using GPT or fallback logic. It loads aggregator data from aggregator_summaries,
+    aggregator_classifier_probs, and aggregator_embeddings to build a short aggregator prompt
+    for GPT. Then it calls GPTManager for single-coin or multi-coin decisions.
+
+    The flow is:
+      - single => self.predict(...)
+      - multi => self.predict_multi(...)
+      - advanced => self.predict_multi_coins(...)
+
+    We also integrate RiskManagerDB for sub-position logic, daily drawdown checks,
+    and we store final AI decisions in 'ai_decisions'.
     """
 
     def __init__(
@@ -59,17 +74,37 @@ class AIStrategy:
     ):
         """
         :param pairs: E.g. ["ETH/USD","XBT/USD"], if you want a default set
-        :param use_openai: If True => GPT logic; else fallback logic
-        :param max_position_size: clamp on per-trade size
-        :param stop_loss_pct: e.g. 0.05 => auto-close if -5%
+        :type pairs: list of str
+
+        :param use_openai: If True => GPT logic is enabled; else fallback logic is used
+        :type use_openai: bool
+
+        :param max_position_size: The clamp on per-trade size, e.g. 3
+        :type max_position_size: float
+
+        :param stop_loss_pct: e.g. 0.05 => auto-close if -5% from entry
+        :type stop_loss_pct: float
+
         :param take_profit_pct: e.g. 0.01 => auto-close if +1%
+        :type take_profit_pct: float
+
         :param max_daily_drawdown: e.g. -0.02 => skip new trades if daily < -2%
+        :type max_daily_drawdown: float
+
         :param risk_controls: dict of risk constraints (e.g. min buy, etc.)
-        :param gpt_model: GPT model name
-        :param gpt_temperature: GPT creativity
-        :param gpt_max_tokens: max tokens in GPT responses
-        :param gpt_client_options: Additional arguments for GPTManager's client,
-                                   e.g. timeout, max_retries, proxies, etc.
+        :type risk_controls: dict, optional
+
+        :param gpt_model: The GPT model name to override after GPTManager is created
+        :type gpt_model: str
+
+        :param gpt_temperature: GPT sampling temperature
+        :type gpt_temperature: float
+
+        :param gpt_max_tokens: Max tokens in GPT responses
+        :type gpt_max_tokens: int
+
+        :param gpt_client_options: Additional arguments for the GPTManager usage (not used in the new version).
+        :type gpt_client_options: dict
         """
         self.pairs = pairs if pairs else []
         self.use_openai = use_openai
@@ -80,13 +115,20 @@ class AIStrategy:
         # GPT
         self.gpt_manager = None
         if self.use_openai:
+            # The new GPTManager reads from config.yaml by default, but we can still override
+            # temperature and max_tokens. We'll also override .model if gpt_model is provided.
             self.gpt_manager = GPTManager(
-                api_key=os.getenv("OPENAI_API_KEY", ""),
-                model=gpt_model,
+                config_file="config.yaml",
                 temperature=gpt_temperature,
                 max_tokens=gpt_max_tokens,
-                **gpt_client_options
+                log_gpt_calls=True  # Example usage, can be toggled
             )
+            # override with user-supplied gpt_model if desired
+            if gpt_model:
+                self.gpt_manager.model = gpt_model
+
+            # Additional usage of gpt_client_options is no longer standard in GPTManager,
+            # but we won't remove them to avoid losing functionality that might be extended.
 
         # Risk manager
         self.risk_manager_db = RiskManagerDB(
@@ -114,6 +156,12 @@ class AIStrategy:
           1) check stops
           2) GPT or fallback
           3) risk manager => store decision
+
+        :param market_data: e.g. {"pair":"ETH/USD", "price":1850.0, ...}
+        :type market_data: dict
+
+        :return: (action, size)
+        :rtype: (str, float)
         """
         pair = market_data.get("pair", "UNK")
         current_price = market_data.get("price", 0.0)
@@ -136,9 +184,18 @@ class AIStrategy:
 
     def _gpt_flow_single(self, pair: str, market_data: Dict[str, Any]) -> Tuple[str, float]:
         """
-        Single-pair GPT logic. We gather aggregator data from aggregator_summaries, aggregator_classifier_probs,
-        aggregator_embeddings, build a short aggregator text, pass it to GPT, parse result,
-        apply risk manager, store decision, etc.
+        Single-pair GPT logic. We gather aggregator data from aggregator_summaries,
+        aggregator_classifier_probs, aggregator_embeddings, build a short aggregator text,
+        pass it to GPT, parse result, apply risk manager, store decision, etc.
+
+        :param pair: e.g. "ETH/USD"
+        :type pair: str
+
+        :param market_data: e.g. {"price":1800.0, "pair":"ETH/USD", ...}
+        :type market_data: dict
+
+        :return: e.g. ("BUY", 0.001)
+        :rtype: (str, float)
         """
         px = market_data["price"]
 
@@ -167,7 +224,7 @@ class AIStrategy:
 
         # (E) store trade & decision
         rationale = f"GPT single => final={final_signal}, size={final_size}, aggregator=({aggregator_text})"
-        if final_signal in ("BUY","SELL") and final_size > 0:
+        if final_signal in ("BUY", "SELL") and final_size > 0:
             record_trade_in_db(final_signal, final_size, px, "GPT_SINGLE_DECISION", pair)
         self._store_decision(pair, final_signal, final_size, rationale)
         self._append_gpt_context(rationale)
@@ -176,21 +233,31 @@ class AIStrategy:
 
     def _fallback_logic(self, pair: str, market_data: Dict[str, Any]) -> Tuple[str, float]:
         """
-        Dummy fallback if GPT is off or fails. E.g. if price<20000 => BUY => 0.0005, else HOLD
+        Dummy fallback if GPT is off or fails.
+        E.g. if price<20000 => BUY => 0.0005, else HOLD.
+
+        :param pair: e.g. "ETH/USD"
+        :type pair: str
+
+        :param market_data: e.g. {"price":1850.0, "pair":"ETH/USD"}
+        :type market_data: dict
+
+        :return: (action, size)
+        :rtype: (str, float)
         """
         px = market_data.get("price", 0.0)
         if px < 20000:
             sig, sz = self._post_validate("BUY", 0.0005, px)
             sig, sz = self.risk_manager_db.adjust_trade(sig, sz, pair, px)
             rationale = f"[DUMMY] => px={px} <20000 => {sig} {sz}"
-            if sig=="BUY" and sz>0:
+            if sig == "BUY" and sz > 0:
                 record_trade_in_db(sig, sz, px, "DUMMY_SINGLE", pair)
             self._store_decision(pair, sig, sz, rationale)
             return (sig, sz)
         else:
             rationale = f"[DUMMY] => px={px} >=20000 => HOLD"
-            self._store_decision(pair,"HOLD",0.0,rationale)
-            return ("HOLD",0.0)
+            self._store_decision(pair, "HOLD", 0.0, rationale)
+            return ("HOLD", 0.0)
 
     # --------------------------------------------------------------------------
     # MULTI-PAIR (LEGACY)
@@ -200,23 +267,31 @@ class AIStrategy:
         A naive multi approach => calls predict(...) on each pair. This references the same code path
         for single predictions, so aggregator data is loaded individually.
         If you want one-shot multi-coin GPT => see predict_multi_coins.
+
+        :param pairs_data: A list of dicts, each e.g. {"pair":"ETH/USD","price":1800.0}
+        :type pairs_data: list of dict
+
+        :param concurrency: "thread" or "asyncio" placeholder for future concurrency logic
+        :type concurrency: str
+
+        :return: { "ETH/USD":("BUY",0.002), "XBT/USD":("SELL",0.001), ... }
+        :rtype: dict
         """
         if not pairs_data:
             logger.warning("No pairs_data => empty decisions.")
             return {}
 
-        if concurrency=="thread":
+        if concurrency == "thread":
             logger.info("[AIStrategy] multi => naive synchronous approach.")
-        elif concurrency=="asyncio":
+        elif concurrency == "asyncio":
             logger.info("[AIStrategy] multi => placeholder for async approach.")
-            # In real usage, you'd do concurrency with an event loop, gather, etc.
 
-        decisions={}
+        decisions = {}
         for pd in pairs_data:
-            pair = pd.get("pair","UNK")
-            px = pd.get("price",0.0)
+            pair = pd.get("pair", "UNK")
+            px = pd.get("price", 0.0)
             # forcibly check stops
-            if px>0:
+            if px > 0:
                 self.risk_manager_db.check_stop_loss_take_profit(pair, px)
 
             if self.use_openai and self.gpt_manager:
@@ -243,8 +318,23 @@ class AIStrategy:
     ) -> Dict[str, Tuple[str, float]]:
         """
         The advanced approach: aggregator_list => pass them all at once to GPT => single JSON response.
-        aggregator_list => each item => {"pair":"ETH/USD","price":1850,"aggregator_data":"summary:..., prob=0.72, ..."}
+        aggregator_list => each item => {"pair":"ETH/USD","price":1850,"aggregator_data":"..."}
         We'll parse GPT decisions => apply risk => store.
+
+        :param aggregator_list: Each item => { "pair":"ETH/USD","price":1800.0,"aggregator_data":"..." }
+        :type aggregator_list: list of dict
+
+        :param trade_history: List of strings describing recent trades
+        :type trade_history: list of str
+
+        :param max_trades: How many lines from trade_history to feed GPT
+        :type max_trades: int
+
+        :param open_positions: Lines describing open sub-positions
+        :type open_positions: list of str
+
+        :return: { "ETH/USD":("BUY",0.001), "XBT/USD":("HOLD",0.0), ... } or fallback => {}
+        :rtype: dict
         """
         results = {}
         if not aggregator_list:
@@ -253,15 +343,15 @@ class AIStrategy:
 
         # forcibly check stops for each aggregator
         for item in aggregator_list:
-            pair = item.get("pair","UNK")
+            pair = item.get("pair", "UNK")
             maybe_price = item.get("price", 0.0)
-            if maybe_price>0:
+            if maybe_price > 0:
                 self.risk_manager_db.check_stop_loss_take_profit(pair, maybe_price)
 
         if not self.use_openai or not self.gpt_manager:
             logger.info("[AIStrategy] no GPT => fallback => hold all")
             for it in aggregator_list:
-                results[it["pair"]] = ("HOLD",0.0)
+                results[it["pair"]] = ("HOLD", 0.0)
             return results
 
         # single GPT call => parse => post validate => store
@@ -277,37 +367,37 @@ class AIStrategy:
         except Exception as e:
             logger.exception("[AIStrategy] GPT multi fail => fallback => hold all.")
             for it in aggregator_list:
-                results[it["pair"]] = ("HOLD",0.0)
+                results[it["pair"]] = ("HOLD", 0.0)
             return results
 
         decisions_array = multi_resp.get("decisions", [])
         if not decisions_array:
             logger.warning("[AIStrategy] No GPT decisions => hold all")
             for it in aggregator_list:
-                results[it["pair"]] = ("HOLD",0.0)
+                results[it["pair"]] = ("HOLD", 0.0)
             return results
 
         for dec in decisions_array:
-            pair = dec.get("pair","UNK")
-            action_raw = dec.get("action","HOLD").upper()
-            size_suggested = float(dec.get("size",0.0))
+            pair = dec.get("pair", "UNK")
+            action_raw = dec.get("action", "HOLD").upper()
+            size_suggested = float(dec.get("size", 0.0))
 
-            found_item = next((x for x in aggregator_list if x.get("pair")==pair), None)
+            found_item = next((x for x in aggregator_list if x.get("pair") == pair), None)
             current_price = float(found_item["price"]) if (found_item and "price" in found_item) else 0.0
 
-            if current_price>0:
+            if current_price > 0:
                 final_signal, final_size = self._post_validate(action_raw, size_suggested, current_price)
                 final_signal, final_size = self.risk_manager_db.adjust_trade(final_signal, final_size, pair, current_price)
                 rationale = f"GPT multi => {pair} => final={final_signal}, size={final_size}"
-                if final_signal in ("BUY","SELL") and final_size>0:
+                if final_signal in ("BUY", "SELL") and final_size > 0:
                     record_trade_in_db(final_signal, final_size, current_price, "GPT_MULTI_DECISION", pair)
                 self._store_decision(pair, final_signal, final_size, rationale)
                 self._append_gpt_context(rationale)
                 results[pair] = (final_signal, final_size)
             else:
                 logger.warning(f"[AIStrategy] No price for {pair} => hold.")
-                self._store_decision(pair,"HOLD",0.0,"No price => hold")
-                results[pair] = ("HOLD",0.0)
+                self._store_decision(pair, "HOLD", 0.0, "No price => hold")
+                results[pair] = ("HOLD", 0.0)
 
         return results
 
@@ -317,26 +407,30 @@ class AIStrategy:
     def _build_full_aggregator_text(self, pair: str) -> str:
         """
         A specialized aggregator retrieval for single-pair usage.
-        1) Parse symbol from pair => e.g. "ETH/USD" => "ETH"
-        2) Look up aggregator_summaries => gather textual summary
-        3) aggregator_classifier_probs => prob_up
-        4) aggregator_embeddings => small vector [comp1, comp2, comp3]
-        5) Pass them to build_aggregator_prompt(...) => returns a single short string
 
-        Return that aggregator string for GPT usage.
+        Steps:
+          1) Parse symbol from pair => e.g. "ETH/USD" => "ETH"
+          2) aggregator_summaries => gather textual summary
+          3) aggregator_classifier_probs => prob_up
+          4) aggregator_embeddings => small vector [comp1, comp2, comp3]
+          5) Pass them to build_aggregator_prompt(...) => returns a single short string
+
+        :param pair: e.g. "ETH/USD"
+        :type pair: str
+
+        :return: aggregator_text => a short aggregator snippet for GPT usage
+        :rtype: str
         """
         symbol = pair.split("/")[0].upper()
-        # We'll do naive approach: pick the LATEST row for that symbol from each aggregator table.
         summary_str = None
         prob_up = None
         embedding_vec = None
 
-        # aggregator_summaries => get price_bucket, sentiment_label, galaxy_score, alt_rank
         conn = sqlite3.connect(DB_FILE)
         try:
             c = conn.cursor()
 
-            # Summaries
+            # aggregator_summaries => e.g. price_bucket, sentiment_label, galaxy_score, alt_rank
             c.execute("""
             SELECT price_bucket, galaxy_score, alt_rank, sentiment_label
             FROM aggregator_summaries
@@ -347,7 +441,6 @@ class AIStrategy:
             row_summ = c.fetchone()
             if row_summ:
                 pb, gs, ar, sl = row_summ
-                # e.g. "price_bucket=high, galaxy_score=64, alt_rank=150, sentiment_label=slightly_positive"
                 summary_list = []
                 if pb: summary_list.append(f"price_bucket={pb}")
                 if gs is not None: summary_list.append(f"galaxy_score={gs}")
@@ -355,7 +448,7 @@ class AIStrategy:
                 if sl: summary_list.append(f"sentiment_label={sl}")
                 summary_str = ", ".join(summary_list)
 
-            # Classifier => prob_up
+            # aggregator_classifier_probs => prob_up
             c.execute("""
             SELECT prob_up
             FROM aggregator_classifier_probs
@@ -367,7 +460,7 @@ class AIStrategy:
             if row_prob:
                 prob_up = float(row_prob[0])
 
-            # Embeddings => comp1, comp2, comp3
+            # aggregator_embeddings => comp1, comp2, comp3
             c.execute("""
             SELECT comp1, comp2, comp3
             FROM aggregator_embeddings
@@ -385,7 +478,6 @@ class AIStrategy:
         finally:
             conn.close()
 
-        # Now build aggregator_text
         aggregator_text = build_aggregator_prompt(
             summary=summary_str,
             probability=prob_up,
@@ -397,20 +489,32 @@ class AIStrategy:
 
     def _post_validate(self, action: str, size_suggested: float, current_price: float) -> Tuple[str, float]:
         """
-        Local check => e.g. cost < min_buy => hold
-        """
-        if action not in ("BUY","SELL"):
-            return ("HOLD",0.0)
+        Local check => e.g. clamp if cost < min_buy => hold
 
-        cost = size_suggested*current_price
+        :param action: "BUY" or "SELL"
+        :type action: str
+
+        :param size_suggested: e.g. 0.001
+        :type size_suggested: float
+
+        :param current_price: e.g. 1850.0
+        :type current_price: float
+
+        :return: Possibly adjusted (action, size)
+        :rtype: (str, float)
+        """
+        if action not in ("BUY", "SELL"):
+            return ("HOLD", 0.0)
+
+        cost = size_suggested * current_price
         rc = self.risk_controls
         if not rc:
             return (action, size_suggested)
 
-        min_buy = rc.get("minimum_buy_amount",6.0)
-        if action=="BUY" and cost<min_buy:
+        min_buy = rc.get("minimum_buy_amount", 6.0)
+        if action == "BUY" and cost < min_buy:
             logger.info(f"[post_validate] cost={cost:.2f} < min_buy={min_buy:.2f} => hold")
-            return ("HOLD",0.0)
+            return ("HOLD", 0.0)
 
         return (action, size_suggested)
 
@@ -418,6 +522,12 @@ class AIStrategy:
     # GPT CONTEXT
     # --------------------------------------------------------------------------
     def _init_gpt_context(self) -> str:
+        """
+        Load GPT context from the DB table 'ai_context', row id=1.
+
+        :return: The loaded context or empty if none.
+        :rtype: str
+        """
         data = load_gpt_context_from_db()
         if data:
             logger.info("Loaded GPT context from DB.")
@@ -425,6 +535,12 @@ class AIStrategy:
         return ""
 
     def _append_gpt_context(self, new_text: str) -> None:
+        """
+        Append text to the GPT context and save to DB.
+
+        :param new_text: e.g. "GPT single => final=BUY, size=0.001"
+        :type new_text: str
+        """
         self.gpt_context += "\n" + new_text
         save_gpt_context_to_db(self.gpt_context)
 
@@ -432,9 +548,12 @@ class AIStrategy:
     # ai_decisions Table
     # --------------------------------------------------------------------------
     def _create_ai_decisions_table(self):
-        conn=sqlite3.connect(DB_FILE)
+        """
+        Ensure 'ai_decisions' table exists, storing final GPT or fallback signals.
+        """
+        conn = sqlite3.connect(DB_FILE)
         try:
-            c=conn.cursor()
+            c = conn.cursor()
             c.execute("""
             CREATE TABLE IF NOT EXISTS ai_decisions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -452,14 +571,29 @@ class AIStrategy:
             conn.close()
 
     def _store_decision(self, pair: str, action: str, size: float, rationale: str):
+        """
+        Insert a decision row into 'ai_decisions'.
+
+        :param pair: e.g. "ETH/USD"
+        :type pair: str
+
+        :param action: "BUY", "SELL", or "HOLD"
+        :type action: str
+
+        :param size: e.g. 0.001
+        :type size: float
+
+        :param rationale: e.g. "GPT single => final=BUY, aggregator=..."
+        :type rationale: str
+        """
         logger.debug(f"Storing AI => {pair},{action},{size}, reason={rationale}")
-        conn=sqlite3.connect(DB_FILE)
+        conn = sqlite3.connect(DB_FILE)
         try:
-            c=conn.cursor()
+            c = conn.cursor()
             c.execute("""
             INSERT INTO ai_decisions (timestamp, pair, action, size, rationale)
             VALUES (?, ?, ?, ?, ?)
-            """,(int(time.time()), pair, action, size, rationale))
+            """, (int(time.time()), pair, action, size, rationale))
             conn.commit()
         except Exception as e:
             logger.exception(f"Error storing AI decision => {e}")
@@ -469,26 +603,38 @@ class AIStrategy:
     # --------------------------------------------------------------------------
     # Summarize recent trades
     # --------------------------------------------------------------------------
-    def _summarize_recent_trades(self, pair: str, limit: int=3) -> str:
-        conn=sqlite3.connect(DB_FILE)
-        out=[]
+    def _summarize_recent_trades(self, pair: str, limit: int = 3) -> str:
+        """
+        Build a short text summarizing recent trades for 'pair'.
+
+        :param pair: e.g. "ETH/USD"
+        :type pair: str
+
+        :param limit: how many trades to retrieve
+        :type limit: int
+
+        :return: e.g. "1) 2025-01-01 10:00 BUY 0.001@2000\n2) ..."
+        :rtype: str
+        """
+        conn = sqlite3.connect(DB_FILE)
+        out = []
         try:
-            c=conn.cursor()
+            c = conn.cursor()
             c.execute("""
             SELECT timestamp, side, quantity, price
             FROM trades
             WHERE pair=?
             ORDER BY id DESC
             LIMIT ?
-            """,(pair,limit))
-            rows=c.fetchall()
+            """, (pair, limit))
+            rows = c.fetchall()
             if not rows:
                 return "No trades found."
-            rows=rows[::-1] # chronological
-            for i,row in enumerate(rows,start=1):
-                t,sd,qty,px=row
+            rows = rows[::-1]  # chronological
+            for i, row in enumerate(rows, start=1):
+                t, sd, qty, px = row
                 import datetime
-                dt_s=datetime.datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M")
+                dt_s = datetime.datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M")
                 out.append(f"{i}) {dt_s} {sd} {qty}@{px}")
         except Exception as e:
             logger.exception(f"Error summarizing trades => {e}")
@@ -502,7 +648,7 @@ class AIStrategy:
 # ------------------------------------------------------------------------------
 # Example usage snippet
 # ------------------------------------------------------------------------------
-if __name__=="__main__":
+if __name__ == "__main__":
     """
     For demonstration or local testing:
       python ai_strategy.py
@@ -510,52 +656,71 @@ if __name__=="__main__":
     logging.basicConfig(level=logging.INFO)
 
     strategy = AIStrategy(
-        pairs=["ETH/USD","XBT/USD"],
+        pairs=["ETH/USD", "XBT/USD"],
         use_openai=True,
         max_position_size=1.0,
         stop_loss_pct=0.05,
         take_profit_pct=0.01,
         max_daily_drawdown=-0.02,
         risk_controls={
-            "initial_spending_account":100.0,
-            "minimum_buy_amount":10.0,
-            "purchase_upper_limit_percent":0.1,
+            "initial_spending_account": 100.0,
+            "minimum_buy_amount": 10.0,
+            "purchase_upper_limit_percent": 0.1,
         },
         gpt_model="gpt-4o-mini",
         gpt_temperature=0.8,
         gpt_max_tokens=1000
     )
 
-    # Single pair usage => aggregator text is built from aggregator_* tables
+    # Single pair usage => aggregator text is built from aggregator_* tables automatically
     single_data = {
-        "pair":"ETH/USD",
-        "price":1850.0,
+        "pair": "ETH/USD",
+        "price": 1850.0,
     }
     action, size = strategy.predict(single_data)
     print(f"[SinglePair] => final action={action}, size={size}")
 
     # Multi pair usage => legacy => calls predict(...) individually
     multi_data = [
-        {"pair":"ETH/USD","price":1800.0},
-        {"pair":"XBT/USD","price":28000.0},
+        {"pair": "ETH/USD", "price": 1800.0},
+        {"pair": "XBT/USD", "price": 28000.0},
     ]
     results = strategy.predict_multi(multi_data)
     print("Multi-pair =>", results)
 
-    # Advanced multi => aggregator_list has aggregator_data => if you want a single GPT call
+    # Advanced multi => aggregator_list has aggregator_data => single GPT call
     aggregator_list = [
         {
             "pair": "ETH/USD",
             "price": 1800.0,
-            "aggregator_data": "summary: price_bucket=high, galaxy_score=64, sentiment_label=slightly_positive; probability=0.72; embedding_vector=[0.25,-0.1,0.36]"
+            "aggregator_data": (
+                "summary: price_bucket=high, galaxy_score=64, "
+                "sentiment_label=slightly_positive; probability=0.72; "
+                "embedding_vector=[0.25,-0.1,0.36]"
+            )
         },
         {
             "pair": "XBT/USD",
             "price": 28000.0,
-            "aggregator_data": "summary: price_bucket=medium, galaxy_score=65, sentiment_label=neutral; probability=0.55; embedding_vector=[0.19,0.02,-0.15]"
+            "aggregator_data": (
+                "summary: price_bucket=medium, galaxy_score=65, "
+                "sentiment_label=neutral; probability=0.55; "
+                "embedding_vector=[0.19,0.02,-0.15]"
+            )
         }
     ]
-    trade_hist = ["2025-01-20 10:15 BUY ETH/USD 0.001@25000","2025-01-21 SELL ETH/USD 0.001@25500"]
-    open_positions = ["ETH/USD LONG 0.002, entry=1860.0","XBT/USD SHORT 0.001, entry=29500.0"]
-    final = strategy.predict_multi_coins(aggregator_list, trade_hist, max_trades=5, open_positions=open_positions)
+    trade_hist = [
+        "2025-01-20 10:15 BUY ETH/USD 0.001@25000",
+        "2025-01-21 SELL ETH/USD 0.001@25500"
+    ]
+    open_positions = [
+        "ETH/USD LONG 0.002, entry=1860.0",
+        "XBT/USD SHORT 0.001, entry=29500.0"
+    ]
+    final = strategy.predict_multi_coins(
+        aggregator_list,
+        trade_hist,
+        max_trades=5,
+        open_positions=open_positions
+    )
     print("Multi coins =>", final)
