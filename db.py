@@ -14,11 +14,21 @@ SQLite database utilities for:
 
 For multi-sub-position logic, see `RiskManagerDB` in risk_manager.py.
 
+Extended Columns for partial fill logic:
+    - In the 'trades' table, columns have been added so we can track pending orders,
+      partial fills, rejections, or final fills:
+        status TEXT        -- 'pending','open','part_filled','closed','rejected'
+        filled_size REAL   -- total filled so far
+        avg_fill_price REAL-- weighted average fill price for the portion filled
+        fee REAL           -- cumulative fee so far
+
 Usage:
     - Call init_db() once on startup (or run this file directly) to ensure all tables exist.
     - Use record_trade_in_db(), store_price_history(), store_cryptopanic_data(), etc.
     - GPT context stored in 'ai_context' => load_gpt_context_from_db() & save_gpt_context_to_db().
     - For sub-positions, see risk_manager.py => RiskManagerDB.
+    - (NEW) create_pending_trade(...), update_trade_fill(...), set_trade_rejected(...)
+      can help you manage partial-fills or rejections in 'trades'.
 """
 
 import sqlite3
@@ -33,7 +43,7 @@ DB_FILE = "trades.db"
 def init_db():
     """
     Creates all needed tables in the SQLite DB specified by DB_FILE, if not exist:
-      - trades
+      - trades (with extended columns for partial-fill tracking)
       - price_history
       - cryptopanic_posts
       - lunarcrush_data
@@ -48,15 +58,20 @@ def init_db():
         c = conn.cursor()
 
         # 1) trades
+        #    Now includes columns for partial fill logic: status, filled_size, avg_fill_price, fee
         c.execute("""
             CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp INTEGER,
                 pair TEXT,
-                side TEXT,       -- 'BUY' or 'SELL'
+                side TEXT,
                 quantity REAL,
                 price REAL,
-                order_id TEXT
+                order_id TEXT,
+                status TEXT,
+                filled_size REAL DEFAULT 0.0, 
+                avg_fill_price REAL DEFAULT 0.0,
+                fee REAL DEFAULT 0.0
             )
         """)
 
@@ -74,7 +89,7 @@ def init_db():
         """)
 
         # ----------------------------------------------------------------------
-        # 3) 'cryptopanic_news' table
+        # 3) 'cryptopanic_posts' table
         # ----------------------------------------------------------------------
         c.execute("""
             CREATE TABLE IF NOT EXISTS cryptopanic_posts (
@@ -194,10 +209,12 @@ def init_db():
 
 def record_trade_in_db(side: str, quantity: float, price: float, order_id: str, pair="ETH/USD"):
     """
-    Inserts a new record into the 'trades' table.
+    Inserts a new record into the 'trades' table. This was originally used to
+    record a final trade after it's been executed. By default, you might treat
+    this as a fully filled trade (status='closed').
 
     :param side: 'BUY' or 'SELL'.
-    :param quantity: The size of the trade in base units (e.g. BTC quantity).
+    :param quantity: The final filled size in base units (e.g. BTC quantity).
     :param price: Fill price (float).
     :param order_id: The ID returned by place_order (mock or real).
     :param pair: Which trading pair was traded.
@@ -206,15 +223,22 @@ def record_trade_in_db(side: str, quantity: float, price: float, order_id: str, 
     try:
         c = conn.cursor()
         c.execute("""
-            INSERT INTO trades (timestamp, pair, side, quantity, price, order_id)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO trades (
+                timestamp, pair, side, quantity, price, order_id,
+                status, filled_size, avg_fill_price, fee
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             int(time.time()),
             pair,
             side,
             quantity,
             price,
-            order_id
+            order_id,
+            'closed',     # For this legacy function, we treat it as fully filled
+            quantity,     # filled_size = quantity
+            price,        # avg_fill_price = final fill price
+            0.0           # fee = 0 by default here
         ))
         conn.commit()
     except Exception as e:
@@ -392,6 +416,98 @@ def save_gpt_context_to_db(context_str: str):
         conn.commit()
     except Exception as e:
         logger.exception(f"Error saving GPT context: {e}")
+    finally:
+        conn.close()
+
+
+# =============================================================================
+# New or Extended Functions for Partial Fill Logic
+# =============================================================================
+
+def create_pending_trade(side: str, requested_qty: float, pair: str, order_id: str) -> int:
+    """
+    Creates a new row in 'trades' with status='pending' (useful if we're
+    waiting on Kraken fill). The 'price' can remain 0 or indicative if we want
+    to store the intended limit or last known price. For a market order, you
+    can pass 0 or the approximate quote.
+
+    Returns: The newly inserted row's ID (primary key).
+    """
+    conn = sqlite3.connect(DB_FILE)
+    row_id = None
+    try:
+        ts_now = int(time.time())
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO trades (
+                timestamp, pair, side, quantity, price, order_id,
+                status, filled_size, avg_fill_price, fee
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', 0.0, 0.0, 0.0)
+        """, (
+            ts_now, pair, side, requested_qty, 0.0, order_id
+        ))
+        conn.commit()
+        row_id = c.lastrowid
+    except Exception as e:
+        logger.exception(f"Error creating pending trade row: {e}")
+    finally:
+        conn.close()
+
+    return row_id
+
+
+def update_trade_fill(order_id: str, filled_size: float, avg_fill_price: float, fee: float, status: str):
+    """
+    Updates an existing 'trades' row identified by order_id, setting:
+      - filled_size (cumulative quantity executed so far)
+      - avg_fill_price (weighted average fill price so far)
+      - fee (cumulative fees so far)
+      - status (e.g. 'part_filled','closed')
+
+    For partial fills over time, call this each time new fill data arrives from
+    the private feed. For example, if new_filled_size increments from 0.02 -> 0.03,
+    you'll store the updated total and any updated fee.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        c = conn.cursor()
+        c.execute("""
+            UPDATE trades
+            SET filled_size = ?,
+                avg_fill_price = ?,
+                fee = ?,
+                status = ?
+            WHERE order_id = ?
+        """, (filled_size, avg_fill_price, fee, status, order_id))
+        conn.commit()
+        if c.rowcount < 1:
+            logger.warning(f"No trade row found for order_id={order_id} when updating fill.")
+    except Exception as e:
+        logger.exception(f"Error updating trade fill for order_id={order_id}: {e}")
+    finally:
+        conn.close()
+
+
+def set_trade_rejected(order_id: str):
+    """
+    If Kraken says the order is invalid or insufficient funds, we mark
+    the 'trades' row as status='rejected'. Optionally you can also fill
+    in an error message in another column if you want to store more detail.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        c = conn.cursor()
+        c.execute("""
+            UPDATE trades
+            SET status = 'rejected'
+            WHERE order_id = ?
+        """, (order_id,))
+        conn.commit()
+        if c.rowcount < 1:
+            logger.warning(f"No trade row found for order_id={order_id} to set rejected.")
+    except Exception as e:
+        logger.exception(f"Error setting trade rejected for order_id={order_id}: {e}")
     finally:
         conn.close()
 
