@@ -13,23 +13,15 @@ An updated GPTManager class that:
    - usage_stats.json: The token usage block extracted from the response
    - prompt.json: The final, user-facing prompt that GPT sees (combined system+user messages)
 2) Includes extended error handling for network issues vs. JSON parse errors.
-3) Allows skipping function-calling logic (we do not parse 'function_call').
+3) Skips any function-calling logic.
 4) The GPT model is parameterized by your `config.yaml`.
-5) The aggregator prompt is expanded to incorporate additional LunarCrush data fields (e.g. `price_btc`,
-   `alt_rank`, `galaxy_score`, etc.) so GPT has a sense of each data's meaning.
+5) The aggregator prompt is expanded to incorporate additional LunarCrush data fields
+   (e.g. `price_btc`, `alt_rank`, `galaxy_score`, etc.) so GPT has a sense of each data field's meaning.
 
 Dependencies:
     - openai (≥ v1) python package
     - pyyaml for config reading (optional if you already use it)
     - Python 3.8+
-
-Classes:
-    GPTManager: The main class for single-coin or multi-coin GPT trade decision logic.
-
-Public Methods:
-    - build_aggregator_prompt(...)
-    - GPTManager.generate_trade_decision(...)
-    - GPTManager.generate_multi_trade_decision(...)
 """
 
 import os
@@ -38,10 +30,11 @@ import time
 import yaml
 import logging
 import datetime
-from typing import Any, Dict, List, Optional
+from typing import IO, Any, Dict, List, Optional
 
 import openai
-from openai import OpenAI, APIConnectionError, APIStatusError, RateLimitError
+from openai import OpenAI
+from openai import APIConnectionError, APIStatusError, RateLimitError
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -60,17 +53,23 @@ def build_aggregator_prompt(
     This text is then appended to the final GPT prompt so the model
     understands each data field meaning (e.g. price_btc, alt_rank, galaxy_score, etc.).
 
-    Args:
-        summary (str, optional): A short textual summary (e.g. "price_bucket=high, sentiment_label=positive").
-        probability (float, optional): The local classifier probability of "UP" or "positive outcome" (float).
-        embedding (List[float], optional): A small list of floats from PCA or embeddings.
-        additional_fields (Dict[str, Any], optional): If you want to pass custom data fields (like
-            price_btc, alt_rank, etc.). We'll add them to the text snippet.
+    :param summary: A short textual summary (e.g. "price_bucket=high, sentiment_label=positive").
+    :type summary: str, optional
 
-    Returns:
-        str: A single string that combines aggregator data for GPT usage.
+    :param probability: The local classifier probability of "UP" or "positive outcome" (float).
+    :type probability: float, optional
+
+    :param embedding: A small list of floats from PCA or embeddings.
+    :type embedding: list of float, optional
+
+    :param additional_fields: If you want to pass custom data fields (like
+        price_btc, alt_rank, etc.). We'll add them to the text snippet.
+    :type additional_fields: dict, optional
+
+    :return: A single string that combines aggregator data for GPT usage.
+    :rtype: str
     """
-    # Prepend a short explanation of each field's meaning:
+    # Prepend a short explanation of each field’s meaning:
     field_meaning_block = (
         "Additional LunarCrush data: \n"
         " - price_btc: The coin's price in BTC units.\n"
@@ -109,16 +108,18 @@ def build_aggregator_prompt(
 class GPTManager:
     """
     GPTManager:
+
     - Orchestrates GPT-based logic for single-coin or multi-coin trading decisions.
     - Logs request/response JSON in logs/{timestamp}/, including usage stats and the raw prompt.
     - Has extended error handling for better resilience.
+    - Skips function-calling usage to keep the code simpler.
 
     Usage Example:
         from gpt_manager import GPTManager
 
         manager = GPTManager()
         single_result = manager.generate_trade_decision(
-            conversation_context="Prior context or conversation",
+            conversation_context="Prior context",
             aggregator_text="some aggregator snippet",
             trade_history=["2025-01-21 SELL BTC/USD 0.001@21000", ...],
             max_trades=5,
@@ -137,26 +138,31 @@ class GPTManager:
         """
         Initialize the GPTManager, reading 'model' from config.yaml unless overridden.
 
-        Args:
-            config_file (str): Path to your config YAML (defaults to 'config.yaml').
-            temperature (float): GPT sampling temperature.
-            max_tokens (int): The max tokens in GPT responses.
-            log_gpt_calls (bool): If True, log request/response to logs/{timestamp}/.
+        :param config_file: Path to your config YAML (defaults to 'config.yaml').
+            The config file can contain the key 'openai_model' which overrides the default model.
+        :type config_file: str
+
+        :param temperature: GPT sampling temperature. Higher values produce more variety in outputs.
+        :type temperature: float
+
+        :param max_tokens: The maximum number of tokens for GPT's generated response.
+        :type max_tokens: int
+
+        :param log_gpt_calls: If True, logs all GPT requests and responses into logs/{timestamp}/.
+        :type log_gpt_calls: bool
         """
         self.log_gpt_calls = log_gpt_calls
         self.temperature = temperature
         self.max_tokens = max_tokens
 
-        # Load config => read 'openai_model' or fallback
-        self.model = "gpt-4o-mini"  # default
+        # Load config => read 'openai_model' from config_file if present
+        self.model = "gpt-4"
         if os.path.exists(config_file):
-            with open(config_file, "r") as f:
+            with open(config_file, "r", encoding="utf-8") as f:
                 cfg = yaml.safe_load(f)
-            # You can store your model name in config with a key like 'openai_model'
             self.model = cfg.get("openai_model", self.model)
 
         # Initialize the openai client
-        # We rely on OPENAI_API_KEY as env var or you can pass it in somehow
         self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
 
     def generate_trade_decision(
@@ -179,16 +185,26 @@ class GPTManager:
           2) Call GPT => handle exceptions => parse response or fallback => hold
           3) Return {"action":..., "size":...} with fallback if parsing fails.
 
-        Args:
-            conversation_context (str): Summarized or partial conversation memory.
-            aggregator_text (str): Aggregated data snippet from build_aggregator_prompt().
-            trade_history (List[str]): Past trades to show GPT. We'll only pass the last 'max_trades'.
-            max_trades (int): How many lines from trade_history to show GPT.
-            risk_controls (dict): Additional constraints like min buy amount, etc.
-            open_positions (Optional[List[str]]): Lines describing any open sub-positions.
+        :param conversation_context: Summarized or partial conversation memory from prior usage.
+        :type conversation_context: str
 
-        Returns:
-            dict: e.g. {"action":"BUY","size":0.043} or fallback => {"action":"HOLD","size":0.0}
+        :param aggregator_text: Aggregated data snippet from build_aggregator_prompt().
+        :type aggregator_text: str
+
+        :param trade_history: Past trades to show GPT. We'll only pass the last 'max_trades'.
+        :type trade_history: list of str
+
+        :param max_trades: How many lines from trade_history to include in the prompt.
+        :type max_trades: int
+
+        :param risk_controls: Additional constraints, e.g. {"minimum_buy_amount":10.0}.
+        :type risk_controls: dict
+
+        :param open_positions: Lines describing any open sub-positions, if any.
+        :type open_positions: list of str, optional
+
+        :return: A dictionary with "action" and "size", or fallback => {"action":"HOLD","size":0.0}.
+        :rtype: dict
         """
         # (A) Build the prompt
         truncated_history = trade_history[-max_trades:] if trade_history else []
@@ -215,7 +231,6 @@ class GPTManager:
             {"role": "user", "content": user_prompt},
         ]
 
-        # (B) Prepare request
         request_dict = {
             "model": self.model,
             "messages": messages,
@@ -223,24 +238,23 @@ class GPTManager:
             "max_completion_tokens": self.max_tokens,
         }
 
-        # (C) Save request if enabled
-        if self.log_gpt_calls:
-            self._save_prompt_files(user_prompt, request_dict)
+        # # (B) Save prompt if enabled
+        # if self.log_gpt_calls:
+        #     self._save_prompt_files(user_prompt, request_dict)
 
-        # (D) Call GPT
+        # (C) Call GPT with error handling
         try:
             response = self.client.chat.completions.create(**request_dict)
 
-            # (E) Save response
-            if self.log_gpt_calls:
-                self._save_response_files(response)
+            # # (D) Save response if logging
+            # if self.log_gpt_calls:
+            #     self._save_response_files(response)
 
             raw_text = response.choices[0].message.content if response.choices else ""
             parsed = self._parse_single_action_json(raw_text)
             return parsed
 
         except (APIConnectionError, RateLimitError) as net_exc:
-            # network / rate-limiting => fallback => hold
             logger.exception(f"[GPT-Single] Connection or RateLimit error => {net_exc}")
             return {"action": "HOLD", "size": 0.0}
         except APIStatusError as e:
@@ -276,18 +290,28 @@ class GPTManager:
           ]
         }
 
-        Args:
-            conversation_context (str): Prior GPT conversation or summary context.
-            aggregator_list (List[dict]): Each item has "pair","price","aggregator_data".
-            open_positions (List[str]): Lines describing open sub-positions.
-            trade_history (List[str]): Lines describing recent trades to show GPT.
-            max_trades (int): # lines of trade history to show.
-            risk_controls (Dict[str, Any]): Additional constraints.
+        :param conversation_context: Prior GPT conversation or summary context.
+        :type conversation_context: str
 
-        Returns:
-            dict: e.g. {"decisions":[{"pair":"ETH/USD","action":"HOLD","size":0.0},...]}
+        :param aggregator_list: Each item has "pair","price","aggregator_data".
+        :type aggregator_list: list of dict
+
+        :param open_positions: Lines describing open sub-positions.
+        :type open_positions: list of str
+
+        :param trade_history: Lines describing recent trades to show GPT.
+        :type trade_history: list of str
+
+        :param max_trades: How many lines of trade_history to show.
+        :type max_trades: int
+
+        :param risk_controls: Additional constraints (like min buy amount).
+        :type risk_controls: dict
+
+        :return: For example {"decisions":[{"pair":"ETH/USD","action":"BUY","size":0.001},...]}
+                 or fallback => {"decisions":[]}.
+        :rtype: dict
         """
-        # (A) Build prompt
         truncated_history = trade_history[-max_trades:] if trade_history else []
         trade_summary = "\n".join(truncated_history) if truncated_history else "No trades."
         open_pos_summary = "\n".join(open_positions) if open_positions else "No open positions."
@@ -326,16 +350,14 @@ class GPTManager:
             "max_completion_tokens": self.max_tokens,
         }
 
-        # (B) Possibly save request
-        if self.log_gpt_calls:
-            self._save_prompt_files(user_prompt, request_dict)
+        # if self.log_gpt_calls:
+        #     self._save_prompt_files(user_prompt, request_dict)
 
-        # (C) Call GPT
         try:
             response = self.client.chat.completions.create(**request_dict)
 
-            if self.log_gpt_calls:
-                self._save_response_files(response)
+            # if self.log_gpt_calls:
+            #     self._save_response_files(response)
 
             raw_text = response.choices[0].message.content if response.choices else ""
             parsed = self._parse_multi_decisions_json(raw_text)
@@ -359,11 +381,11 @@ class GPTManager:
         Attempt to parse raw_text => {"action":"BUY|SELL|HOLD","size":float}.
         If parse fails, fallback => hold.
 
-        Args:
-            raw_text (str): The GPT output.
+        :param raw_text: The GPT output as a string.
+        :type raw_text: str
 
-        Returns:
-            dict: e.g. {"action":"BUY","size":0.001} or fallback.
+        :return: e.g. {"action":"BUY","size":0.001} or fallback => {"action":"HOLD","size":0.0}.
+        :rtype: dict
         """
         if not raw_text.strip():
             return {"action": "HOLD", "size": 0.0}
@@ -390,16 +412,15 @@ class GPTManager:
         Attempt to parse raw_text => { "decisions":[ {"pair":"X","action":"BUY|SELL|HOLD","size":n}, ... ] }
         If parse fails => fallback => empty decisions.
 
-        Args:
-            raw_text (str): GPT output.
+        :param raw_text: The GPT output as a string.
+        :type raw_text: str
 
-        Returns:
-            dict: e.g. {"decisions":[{"pair":"XBT/USD","action":"BUY","size":0.001}]} or fallback => {"decisions":[]}.
+        :return: e.g. {"decisions":[{"pair":"XBT/USD","action":"BUY","size":0.001}]} or fallback => {"decisions":[]}.
+        :rtype: dict
         """
         if not raw_text.strip():
             return {"decisions": []}
 
-        # remove fences
         cleaned = raw_text.replace("```json", "").replace("```", "").strip()
         try:
             parsed = json.loads(cleaned)
@@ -433,62 +454,52 @@ class GPTManager:
     # --------------------------------------------------------------------------
     # Logging Helpers
     # --------------------------------------------------------------------------
-    def _save_prompt_files(self, user_prompt: str, request_dict: Dict[str, Any]):
+    def _save_prompt_files(self, user_prompt: str, request_dict: Dict[str, Any]) -> None:
         """
         Save the final prompt and the request dict to logs/{timestamp}/prompt.json and request_body.json.
 
-        Args:
-            user_prompt (str): The final user-facing prompt text
-            request_dict (dict): The entire dictionary to be passed to openai client
+        :param user_prompt: The final user-facing prompt text that GPT sees.
+        :type user_prompt: str
+
+        :param request_dict: The entire dictionary to be passed to the openai client,
+            including 'model', 'messages', 'temperature', etc.
+        :type request_dict: dict
         """
         timestamp_dir = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
         log_dir = os.path.join("logs", timestamp_dir)
         os.makedirs(log_dir, exist_ok=True)
 
-        # Save the user prompt in prompt.json
         prompt_path = os.path.join(log_dir, "prompt.json")
-        with open(prompt_path, "w", encoding="utf-8") as f:
-            json.dump({"prompt": user_prompt}, f, indent=4)
+        with open(prompt_path, "w", encoding="utf-8") as f_prompt:  # type: IO[str]
+            json.dump({"prompt": user_prompt}, f_prompt, indent=4)
 
-        # Save the entire request
         req_path = os.path.join(log_dir, "request_body.json")
-        with open(req_path, "w", encoding="utf-8") as f:
-            json.dump(request_dict, f, indent=2)
+        with open(req_path, "w", encoding="utf-8") as f_req:  # type: IO[str]
+            json.dump(request_dict, f_req, indent=4)
 
-    def _save_response_files(self, response_obj: Any):
+    def _save_response_files(self, response_obj: Any) -> None:
         """
         Save the raw response dict and usage stats to logs/{timestamp}/response_body.json and usage_stats.json.
 
-        Args:
-            response_obj (Any): The raw object returned by openai client
-                                Typically an openai.types.ChatCompletion or dictionary
+        :param response_obj: The raw object returned by the openai client,
+            typically an openai.types.ChatCompletion or dict-like structure.
+        :type response_obj: Any
         """
-        # We do not have a direct 'timestamp' from the GPT response, so let's re-use the folder
-        # or create a new one. We'll re-check last logs or create a new one.
-
-        # We'll do a simplistic approach: always create a new folder for the response
-        # or we could store them in the same folder as request. For clarity, let's do the same timestamp
-        # if there's only one call. But we can't guarantee order for multiple calls simultaneously.
-        # We'll just create a new timestamp dir for each call. It's simpler but you'll get more folders.
         timestamp_dir = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
         log_dir = os.path.join("logs", timestamp_dir)
         os.makedirs(log_dir, exist_ok=True)
 
-        # Convert the response to a dict
-        # The new openai python lib returns typed objects. We can do .to_dict() if it's a pydantic model
-        # or just do dict(response_obj) if it's not. We'll try to call .to_dict() else fallback.
+        # Convert response to a dict
         try:
             response_dict = response_obj.to_dict()
         except AttributeError:
-            # maybe it's already a dict or standard object
+            # maybe it's already a dict
             response_dict = response_obj
 
-        # Write response_body.json
         resp_path = os.path.join(log_dir, "response_body.json")
-        with open(resp_path, "w", encoding="utf-8") as f:
-            json.dump(response_dict, f, indent=2)
+        with open(resp_path, "w", encoding="utf-8") as f_resp:  # type: IO[str]
+            json.dump(response_dict, f_resp, indent=4)
 
-        # Also usage_stats.json => usage
         usage_data = {}
         try:
             if hasattr(response_obj, "usage"):
@@ -496,8 +507,8 @@ class GPTManager:
             elif isinstance(response_dict, dict) and "usage" in response_dict:
                 usage_data = response_dict["usage"]
         except Exception:
-            logger.warning("No usage field found in GPT response")
+            logger.warning("[GPTManager] No usage field found in GPT response")
 
         usage_path = os.path.join(log_dir, "usage_stats.json")
-        with open(usage_path, "w", encoding="utf-8") as f:
-            json.dump(usage_data, f, indent=2)
+        with open(usage_path, "w", encoding="utf-8") as f_usage:  # type: IO[str]
+            json.dump(usage_data, f_usage, indent=4)
