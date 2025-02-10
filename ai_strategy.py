@@ -18,6 +18,12 @@ Basic Flow:
     - Single pair => call predict(market_data)
     - Multi pairs => call predict_multi(pairs_data)
     - For advanced one-shot multi-coin => predict_multi_coins(...)
+
+In this updated version, **we no longer record final trades** in the DB directly
+from the AI decision. Instead, we create a "pending" trade entry (status='pending')
+using `create_pending_trade(...)`, and rely on the private websocket logic (or
+other back-end steps) to update partial fills, rejections, or final fill status
+in the 'trades' table.
 """
 
 import logging
@@ -33,7 +39,7 @@ from db import (
     DB_FILE,
     load_gpt_context_from_db,
     save_gpt_context_to_db,
-    record_trade_in_db
+    create_pending_trade  # NEW: for creating a 'pending' row
 )
 from risk_manager import RiskManagerDB
 from gpt_manager import GPTManager, build_aggregator_prompt
@@ -56,6 +62,12 @@ class AIStrategy:
 
     We also integrate RiskManagerDB for sub-position logic, daily drawdown checks,
     and we store final AI decisions in 'ai_decisions'.
+
+    IMPORTANT CHANGE: Instead of storing final trades in the DB at the moment of
+    GPT decision, we now create a "pending" trade row in the `trades` table with
+    `status='pending'`. The actual fill details (avg_fill_price, fee, etc.) and
+    final status must be updated once we receive order events from the private
+    feed (see `ws_data_feed.py` or other back-end logic).
     """
 
     def __init__(
@@ -222,10 +234,16 @@ class AIStrategy:
         final_signal, final_size = self._post_validate(action, suggested_size, px)
         final_signal, final_size = self.risk_manager_db.adjust_trade(final_signal, final_size, pair, px)
 
-        # (E) store trade & decision
+        # (E) store "pending" trade & decision
         rationale = f"GPT single => final={final_signal}, size={final_size}, aggregator=({aggregator_text})"
         if final_signal in ("BUY", "SELL") and final_size > 0:
-            record_trade_in_db(final_signal, final_size, px, "GPT_SINGLE_DECISION", pair)
+            # Instead of storing a final trade, create a 'pending' row in `trades`.
+            create_pending_trade(
+                side=final_signal,
+                requested_qty=final_size,
+                pair=pair,
+                order_id="GPT_SINGLE_DECISION"
+            )
         self._store_decision(pair, final_signal, final_size, rationale)
         self._append_gpt_context(rationale)
 
@@ -251,7 +269,12 @@ class AIStrategy:
             sig, sz = self.risk_manager_db.adjust_trade(sig, sz, pair, px)
             rationale = f"[DUMMY] => px={px} <20000 => {sig} {sz}"
             if sig == "BUY" and sz > 0:
-                record_trade_in_db(sig, sz, px, "DUMMY_SINGLE", pair)
+                create_pending_trade(
+                    side=sig,
+                    requested_qty=sz,
+                    pair=pair,
+                    order_id="DUMMY_SINGLE"
+                )
             self._store_decision(pair, sig, sz, rationale)
             return (sig, sz)
         else:
@@ -390,7 +413,13 @@ class AIStrategy:
                 final_signal, final_size = self.risk_manager_db.adjust_trade(final_signal, final_size, pair, current_price)
                 rationale = f"GPT multi => {pair} => final={final_signal}, size={final_size}"
                 if final_signal in ("BUY", "SELL") and final_size > 0:
-                    record_trade_in_db(final_signal, final_size, current_price, "GPT_MULTI_DECISION", pair)
+                    # create a pending row
+                    create_pending_trade(
+                        side=final_signal,
+                        requested_qty=final_size,
+                        pair=pair,
+                        order_id="GPT_MULTI_DECISION"
+                    )
                 self._store_decision(pair, final_signal, final_size, rationale)
                 self._append_gpt_context(rationale)
                 results[pair] = (final_signal, final_size)
