@@ -292,7 +292,7 @@ def store_cryptopanic_data(title: str, url: str, sentiment_score: float):
     try:
         c = conn.cursor()
         c.execute("""
-            INSERT INTO cryptopanic_posts (timestamp, title, url, sentiment_score)
+            INSERT INTO cryptopanic_posts (created_at, title, url, sentiment_score)
             VALUES (?, ?, ?, ?)
         """, (
             int(time.time()),
