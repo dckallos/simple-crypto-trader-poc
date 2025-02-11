@@ -1,100 +1,139 @@
 #!/usr/bin/env python3
-# =============================================================================
-# FILE: lunarcrush_updater.py
-# =============================================================================
 """
 lunarcrush_updater.py
 
-A background updater that periodically fetches time-series data for each
-coin in 'lunarcrush_data', storing results in 'lunarcrush_timeseries'.
-Respects the ~10 calls per minute rule by sleeping ~6s per coin.
+A script that provides an easy way to update and backfill LunarCrush data on
+a configurable schedule. It consumes and calls logic from fetch_lunarcrush.py,
+which holds the LunarCrushFetcher class and methods.
 
-Usage:
-    python lunarcrush_updater.py [--interval=1800]
+Usage Examples:
+    1) Single run: Snapshot + time-series update
+       $ python lunarcrush_updater.py --snapshot --time-series
 
-Where:
-    --interval=SECONDS is how many seconds to wait between full passes
-    (defaults to 1800s = 30 minutes).
+    2) Single run: Backfill 12 months
+       $ python lunarcrush_updater.py --backfill --backfill-months 12
 
-Process Flow:
-    1) On startup, connect to DB and list all coin_ids from 'lunarcrush_data'.
-    2) For each coin_id, call fetch_time_series_for_tracked_coins (or a direct
-       _fetch_lunarcrush_time_series if you prefer).
-    3) Sleep 6 seconds per coin to avoid more than ~10 requests/min.
-    4) Sleep 'interval' after finishing a full pass, then repeat.
+    3) Continuous updates every 60 minutes:
+       $ python lunarcrush_updater.py --continuous --interval-minutes 60 --snapshot
 
-You can incorporate incremental logic if you want, by calling
-`fetch_last_increment_of_time()` from your `LunarCrushFetcher` and passing
-'start' timestamps. For brevity, we do a simpler approach here.
+    4) Continuous backfill (careful with large intervals; you may want separate tasks):
+       $ python lunarcrush_updater.py --continuous --interval-minutes 180 --backfill --backfill-months 3
 """
 
 import time
 import logging
 import argparse
-import sqlite3
-import yaml
-import os
-from typing import Optional
 
-from fetch_lunarcrush import LunarCrushFetcher, REQUEST_SLEEP_SECONDS, DB_FILE
+# If fetch_lunarcrush is in the same folder or is importable
+from fetch_lunarcrush import LunarCrushFetcher, DB_FILE
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-DEFAULT_PASS_INTERVAL = 1800  # 30 minutes
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Background job to update LunarCrush timeseries.")
-    parser.add_argument("--interval", type=int, default=DEFAULT_PASS_INTERVAL,
-                        help=f"Seconds to wait between fetch cycles (default={DEFAULT_PASS_INTERVAL}).")
-    args = parser.parse_args()
-    return args
+    """
+    Returns command line arguments for controlling the LunarCrush updates.
+    """
+    parser = argparse.ArgumentParser(description="Update and backfill LunarCrush data.")
+    parser.add_argument(
+        "--snapshot",
+        action="store_true",
+        help="Perform a snapshot update (fetch top coins list from LunarCrush and store in DB)."
+    )
+    parser.add_argument(
+        "--snapshot-filtered",
+        action="store_true",
+        help="Perform a snapshot update but only for specific filter_symbols."
+    )
+    parser.add_argument(
+        "--time-series",
+        action="store_true",
+        help="Fetch time-series data for all symbols found in 'lunarcrush_data'."
+    )
+    parser.add_argument(
+        "--backfill",
+        action="store_true",
+        help="Perform a chunk-based backfill for all symbols found in 'lunarcrush_data'."
+    )
+    parser.add_argument(
+        "--backfill-months",
+        type=int,
+        default=6,
+        help="How many months to backfill when --backfill is used. Default=6."
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="Limit for snapshot calls. Default=100."
+    )
+    parser.add_argument(
+        "--continuous",
+        action="store_true",
+        help="Run the selected tasks in an infinite loop, sleeping between runs."
+    )
+    parser.add_argument(
+        "--interval-minutes",
+        type=int,
+        default=60,
+        help="How many minutes to wait between continuous runs. Default=60."
+    )
+
+    return parser.parse_args()
+
+
+def perform_updates(args):
+    """
+    Performs the requested updates once, based on command-line arguments.
+    """
+    fetcher = LunarCrushFetcher(db_file=DB_FILE)
+
+    # Snapshot (unfiltered or filtered)
+    if args.snapshot_filtered:
+        logger.info("Performing snapshot for only filter_symbols...")
+        fetcher.fetch_snapshot_data_filtered(limit=args.limit)
+    elif args.snapshot:
+        logger.info("Performing snapshot for all coins...")
+        fetcher.fetch_snapshot_data_all_coins(limit=args.limit)
+
+    # Time-series fetch for all known symbols
+    if args.time_series:
+        logger.info("Performing time-series fetch for tracked symbols...")
+        fetcher.fetch_time_series_for_tracked_coins(bucket="hour", interval="1w")
+
+    # Backfill chunk-based
+    if args.backfill:
+        logger.info(f"Performing backfill for the last {args.backfill_months} months...")
+        # Load all symbols from the DB
+        coin_ids = fetcher._load_symbols_from_db()  # or a public method if you prefer
+        if not coin_ids:
+            logger.warning("No coin symbols found in DB to backfill.")
+        else:
+            fetcher.backfill_coins(
+                coin_ids=coin_ids,
+                months=args.backfill_months,
+                bucket="hour",
+                interval="1w"
+            )
+
 
 def main():
     args = parse_args()
-    pass_interval = args.interval
 
-    # Read config if needed, or skip:
-    config_file = "config.yaml"
-    if os.path.exists(config_file):
-        with open(config_file,"r") as f:
-            config = yaml.safe_load(f)
-        # You might parse certain config keys, e.g. 'bucket' or 'interval' or 'months'
-    else:
-        logger.warning("No config.yaml found => using default approach.")
-
-    fetcher = LunarCrushFetcher(db_file=DB_FILE)
-    logger.info("[LunarCrush Updater] Starting indefinite background loop. Press Ctrl+C to exit.")
-
-    try:
+    if args.continuous:
+        logger.info(
+            "Running in continuous mode. "
+            f"Will repeat updates every {args.interval_minutes} minutes."
+        )
         while True:
-            # (A) Possibly fetch the list of coin_ids from 'lunarcrush_data'
-            # We'll just do fetch_time_series_for_tracked_coins, which
-            # calls the internal logic for each coin in the DB.
-            logger.info("[LunarCrush Updater] Starting a new pass => fetch_time_series_for_tracked_coins(...)")
+            perform_updates(args)
+            logger.info(f"Completed an update cycle. Sleeping {args.interval_minutes} minutes.")
+            time.sleep(args.interval_minutes * 60)  # convert minutes to seconds
+    else:
+        # Single pass
+        perform_updates(args)
 
-            # If you want a completely incremental approach:
-            #  - you might do something like:
-            #    last_increments = fetcher.fetch_last_increment_of_time()
-            #    then for each coin => fetch from last_increments[coin]+1 onward
-            # or if you want a simpler approach for demonstration:
-            fetcher.fetch_time_series_for_tracked_coins(
-                bucket="hour",
-                interval="1w",
-                start=None,
-                end=None
-            )
-
-            # (B) Sleep pass_interval
-            logger.info(f"[LunarCrush Updater] Sleep {pass_interval}s before next pass...")
-            time.sleep(pass_interval)
-
-    except KeyboardInterrupt:
-        logger.info("[LunarCrush Updater] user exit => stopping.")
-    except Exception as e:
-        logger.exception(f"[LunarCrush Updater] main error => {e}")
-    finally:
-        logger.info("[LunarCrush Updater] Exiting.")
 
 if __name__ == "__main__":
     main()
