@@ -213,6 +213,7 @@ class AIStrategy:
 
         # (A) Build aggregator text from DB
         aggregator_text = self._build_full_aggregator_text(pair)
+        logger.info(f"Aggregator text => \n{json.dumps(aggregator_text, indent=4)}")
 
         # (B) Summarize recent trades
         trade_summary = self._summarize_recent_trades(pair, limit=3)

@@ -97,7 +97,6 @@ def build_aggregator_prompt(
         parts.append(f"(embedding_vector) {emb_str}")
 
     if additional_fields:
-        # For each key => value
         for k, v in additional_fields.items():
             parts.append(f"({k}) {v}")
 
@@ -166,24 +165,27 @@ class GPTManager:
         self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
 
     def generate_trade_decision(
-        self,
-        conversation_context: str,
-        aggregator_text: str,
-        trade_history: List[str],
-        max_trades: int,
-        risk_controls: Dict[str, Any],
-        open_positions: Optional[List[str]] = None
+            self,
+            conversation_context: str,
+            aggregator_text: str,
+            trade_history: List[str],
+            max_trades: int,
+            risk_controls: Dict[str, Any],
+            open_positions: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """
-        Generate a single-coin trading decision from GPT.
+        Generate a single-coin trading decision from GPT with an emphasis on
+        short-term (within ~24 hours) profit in USD.
 
         The final output is expected to be JSON with keys:
             {"action":"BUY|SELL|HOLD","size": <float>}
 
         Steps:
           1) Build user/system prompt to incorporate aggregator_text & recent trades.
-          2) Call GPT => handle exceptions => parse response or fallback => hold
-          3) Return {"action":..., "size":...} with fallback if parsing fails.
+          2) Clarify that we measure success in USD, aiming to close positions by
+             tomorrow if profitable.
+          3) Call GPT => handle exceptions => parse response or fallback => hold.
+          4) Return {"action":..., "size":...} with fallback if parsing fails.
 
         :param conversation_context: Summarized or partial conversation memory from prior usage.
         :type conversation_context: str
@@ -206,25 +208,33 @@ class GPTManager:
         :return: A dictionary with "action" and "size", or fallback => {"action":"HOLD","size":0.0}.
         :rtype: dict
         """
-        # (A) Build the prompt
         truncated_history = trade_history[-max_trades:] if trade_history else []
         trade_summary = "\n".join(truncated_history) if truncated_history else "No trades found."
         open_pos_summary = "\n".join(open_positions) if open_positions else "No open positions."
 
+        # System instructions for a single-coin scenario
         system_instructions = (
-            "You are a specialized single-coin trading assistant. "
-            "You must respond with a single JSON object: "
-            '{"action":"BUY|SELL|HOLD","size":float}. '
-            "No extra text or code blocks."
+            "You are a specialized single-coin trading assistant. We trade with US dollars, "
+            "and we aim to realize profit within the next day (short-term). Our performance "
+            "is measured in net USD by the end of ~24 hours. If the coin is likely to be profitable, "
+            "we prefer to exit positions in USD quickly. You MUST return a single JSON object: "
+            "{\"action\":\"BUY|SELL|HOLD\",\"size\":float}, with no additional text. "
+            "Action must be one of BUY, SELL, or HOLD, and size is a float representing how many coins to trade."
         )
+        logger.info(f"[GPT-Single] System Instructions: \n{aggregator_text}")
+
         user_prompt = (
-            f"Conversation context:\n{conversation_context}\n\n"
-            f"Aggregator data:\n{aggregator_text}\n\n"
-            f"Recent trades:\n{trade_summary}\n\n"
-            f"Open positions:\n{open_pos_summary}\n\n"
-            f"Risk controls:\n{risk_controls}\n\n"
+            f"SYSTEM INSTRUCTIONS:\n"
+            f"{system_instructions}\n\n"
+            f"AGGREGATOR DATA:\n{aggregator_text}\n\n"
+            f"OPEN POSITIONS:\n{open_pos_summary}\n\n"
+            f"RECENT TRADES:\n{trade_summary}\n\n"
+            f"RISK CONTROLS:\n{risk_controls}\n\n"
+            f"PRIOR GPT CONTEXT:\n{conversation_context}\n\n"
+            "OUTPUT FORMAT:\n"
             "Return strictly JSON => {\"action\":\"BUY|SELL|HOLD\",\"size\":float}\n"
         )
+        logger.info(f"[GPT-Single] User Prompt: \n{user_prompt}")
 
         messages = [
             {"role": "assistant", "content": system_instructions},
@@ -238,18 +248,13 @@ class GPTManager:
             "max_completion_tokens": self.max_tokens,
         }
 
-        # # (B) Save prompt if enabled
-        # if self.log_gpt_calls:
-        #     self._save_prompt_files(user_prompt, request_dict)
+        if self.log_gpt_calls:
+            self._save_prompt_files(user_prompt, request_dict)
 
-        # (C) Call GPT with error handling
         try:
             response = self.client.chat.completions.create(**request_dict)
-
-            # # (D) Save response if logging
-            # if self.log_gpt_calls:
-            #     self._save_response_files(response)
-
+            if self.log_gpt_calls:
+                self._save_response_files(response)
             raw_text = response.choices[0].message.content if response.choices else ""
             parsed = self._parse_single_action_json(raw_text)
             return parsed
@@ -265,16 +270,18 @@ class GPTManager:
             return {"action": "HOLD", "size": 0.0}
 
     def generate_multi_trade_decision(
-        self,
-        conversation_context: str,
-        aggregator_list: List[Dict[str, Any]],
-        open_positions: List[str],
-        trade_history: List[str],
-        max_trades: int,
-        risk_controls: Dict[str, Any]
+            self,
+            conversation_context: str,
+            aggregator_list: List[Dict[str, Any]],
+            open_positions: List[str],
+            trade_history: List[str],
+            max_trades: int,
+            risk_controls: Dict[str, Any]
     ) -> Dict[str, Any]:
         """
-        Generate multi-coin trading decisions in a single GPT call.
+        Generate multi-coin trading decisions in a single GPT call, emphasizing
+        short-term (~24h) profit in USD. We measure success in net USD by the end
+        of the day, aiming to close positions quickly if profitable.
 
         aggregator_list => each item => {
             "pair": "ETH/USD",
@@ -316,26 +323,35 @@ class GPTManager:
         trade_summary = "\n".join(truncated_history) if truncated_history else "No trades."
         open_pos_summary = "\n".join(open_positions) if open_positions else "No open positions."
 
-        aggregator_text_block = []
-        for idx, item in enumerate(aggregator_list, start=1):
-            aggregator_text_block.append(
-                f"{idx}) {item.get('pair','?')} => {item.get('aggregator_data','')}"
-            )
-        aggregator_text = "\n".join(aggregator_text_block)
+        # Build aggregator section
+        aggregator_block = []
+        for i, item in enumerate(aggregator_list, start=1):
+            aggregator_data_str = item.get('aggregator_data', '')
+            aggregator_block.append(f"{i}) {item['pair']} => {aggregator_data_str}")
+        aggregator_section = "\n".join(aggregator_block) if aggregator_block else "No aggregator data."
 
+        # System instructions for multi-coin approach
         system_instructions = (
-            "You are a specialized multi-coin crypto trading assistant. "
-            "You see aggregator data for multiple coins, plus open positions. "
-            "You MUST return a single JSON object of the form:\n"
-            '{"decisions":[{"pair":"COIN_PAIR","action":"BUY|SELL|HOLD","size":0.001},...]}'
+            "You are a specialized multi-coin crypto trading assistant. We trade in US dollars, "
+            "and we aim to realize profit within ~24 hours if possible. Our performance is measured "
+            "in net USD at the end of the day. We prefer to close profitable positions quickly rather "
+            "than holding them beyond one day, unless there's a strong reason to hold. You MUST return "
+            "a single JSON object:\n"
+            "{\"decisions\":[{\"pair\":\"COIN_PAIR\",\"action\":\"BUY|SELL|HOLD\",\"size\":float},...]}\n"
+            "No extra text or code blocks."
         )
+
+        # Structured multi-section prompt
         user_prompt = (
-            f"Conversation context:\n{conversation_context}\n\n"
-            f"Aggregators:\n{aggregator_text}\n\n"
-            f"Open positions:\n{open_pos_summary}\n\n"
-            f"Recent trades:\n{trade_summary}\n\n"
-            f"Risk controls:\n{risk_controls}\n\n"
-            "Return strictly JSON => {\"decisions\":[...]}\n"
+            f"SYSTEM INSTRUCTIONS:\n"
+            f"{system_instructions}\n\n"
+            f"AGGREGATOR DATA:\n{aggregator_section}\n\n"
+            f"OPEN POSITIONS:\n{open_pos_summary}\n\n"
+            f"RECENT TRADES:\n{trade_summary}\n\n"
+            f"RISK CONTROLS:\n{risk_controls}\n\n"
+            f"PRIOR GPT CONTEXT:\n{conversation_context}\n\n"
+            "OUTPUT FORMAT:\n"
+            "Return strictly JSON => {\"decisions\":[{\"pair\":\"COIN_PAIR\",\"action\":\"BUY|SELL|HOLD\",\"size\":0.001},...]}\n"
         )
 
         messages = [
@@ -350,15 +366,13 @@ class GPTManager:
             "max_completion_tokens": self.max_tokens,
         }
 
-        # if self.log_gpt_calls:
-        #     self._save_prompt_files(user_prompt, request_dict)
+        if self.log_gpt_calls:
+            self._save_prompt_files(user_prompt, request_dict)
 
         try:
             response = self.client.chat.completions.create(**request_dict)
-
-            # if self.log_gpt_calls:
-            #     self._save_response_files(response)
-
+            if self.log_gpt_calls:
+                self._save_response_files(response)
             raw_text = response.choices[0].message.content if response.choices else ""
             parsed = self._parse_multi_decisions_json(raw_text)
             return parsed
@@ -469,13 +483,24 @@ class GPTManager:
         log_dir = os.path.join("logs", timestamp_dir)
         os.makedirs(log_dir, exist_ok=True)
 
-        prompt_path = os.path.join(log_dir, "prompt.json")
-        with open(prompt_path, "w", encoding="utf-8") as f_prompt:  # type: IO[str]
-            json.dump({"prompt": user_prompt}, f_prompt, indent=4)
+        # Save the user prompt as plain text
+        prompt_path = os.path.join(log_dir, "prompt.txt")
+        with open(prompt_path, "w", encoding="utf-8") as f_prompt:
+            f_prompt.write(user_prompt)
 
-        req_path = os.path.join(log_dir, "request_body.json")
-        with open(req_path, "w", encoding="utf-8") as f_req:  # type: IO[str]
-            json.dump(request_dict, f_req, indent=4)
+        # Save the entire request_dict as raw text (via str())
+        req_path = os.path.join(log_dir, "request_body.txt")
+        with open(req_path, "w", encoding="utf-8") as f_req:
+            # Convert the dictionary to a string (instead of JSON)
+            f_req.write(str(request_dict))
+
+        # prompt_path = os.path.join(log_dir, "prompt.json")
+        # with open(prompt_path, "w", encoding="utf-8") as f_prompt:  # type: IO[str]
+        #     json.dump({"prompt": user_prompt}, f_prompt, indent=4)
+        #
+        # req_path = os.path.join(log_dir, "request_body.json")
+        # with open(req_path, "w", encoding="utf-8") as f_req:  # type: IO[str]
+        #     json.dump(request_dict, f_req, indent=4)
 
     def _save_response_files(self, response_obj: Any) -> None:
         """
@@ -489,26 +514,28 @@ class GPTManager:
         log_dir = os.path.join("logs", timestamp_dir)
         os.makedirs(log_dir, exist_ok=True)
 
-        # Convert response to a dict
-        try:
-            response_dict = response_obj.to_dict()
-        except AttributeError:
-            # maybe it's already a dict
-            response_dict = response_obj
+        # If you want to store the entire response as raw text:
+        resp_path = os.path.join(log_dir, "response_body.txt")
+        with open(resp_path, "w", encoding="utf-8") as f_resp:
+            # Just write the raw string representation
+            f_resp.write(str(response_obj))
 
-        resp_path = os.path.join(log_dir, "response_body.json")
-        with open(resp_path, "w", encoding="utf-8") as f_resp:  # type: IO[str]
-            json.dump(response_dict, f_resp, indent=4)
-
+        # usage stats, if you still want them in a small JSON or text file
+        usage_path = os.path.join(log_dir, "usage_stats.txt")
         usage_data = {}
+
+        # Some responses have usage field
         try:
             if hasattr(response_obj, "usage"):
                 usage_data = dict(response_obj.usage)
-            elif isinstance(response_dict, dict) and "usage" in response_dict:
-                usage_data = response_dict["usage"]
+            else:
+                # maybe it's already a dict
+                response_dict = response_obj
+                if isinstance(response_dict, dict) and "usage" in response_dict:
+                    usage_data = response_dict["usage"]
         except Exception:
             logger.warning("[GPTManager] No usage field found in GPT response")
 
-        usage_path = os.path.join(log_dir, "usage_stats.json")
-        with open(usage_path, "w", encoding="utf-8") as f_usage:  # type: IO[str]
-            json.dump(usage_data, f_usage, indent=4)
+        # write usage_data as text
+        with open(usage_path, "w", encoding="utf-8") as f_usage:
+            f_usage.write(str(usage_data))
