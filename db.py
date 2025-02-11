@@ -53,6 +53,7 @@ def init_db():
 
     If sub_positions are needed, see `risk_manager.py => RiskManagerDB.initialize()`.
     """
+    init_ledger_table(DB_FILE)
     conn = sqlite3.connect(DB_FILE)
     try:
         c = conn.cursor()
@@ -303,6 +304,29 @@ def store_cryptopanic_data(title: str, url: str, sentiment_score: float):
         conn.commit()
     except Exception as e:
         logger.exception(f"Error storing cryptopanic data: {e}")
+    finally:
+        conn.close()
+
+def init_ledger_table(db_path: str = DB_FILE):
+    conn = sqlite3.connect(db_path)
+    try:
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS ledger_entries (
+                ledger_id TEXT PRIMARY KEY,  -- e.g. L4UESK-KG3EQ-UFO4T5
+                refid TEXT,
+                time REAL,
+                type TEXT,
+                subtype TEXT,
+                asset TEXT,
+                amount REAL,
+                fee REAL,
+                balance REAL
+            )
+        """)
+        conn.commit()
+    except Exception as e:
+        logger.exception(f"Error creating ledger_entries table: {e}")
     finally:
         conn.close()
 
