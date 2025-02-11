@@ -7,12 +7,10 @@ fetch_lunarcrush.py
 
 A single script that:
   1) Fetches snapshot data (/public/coins/list/v2) => upserts into the existing 'lunarcrush_data' table,
-     adding columns if needed. The table structure extends what's defined in db.py with extra columns:
-       - price_btc, circulating_supply, max_supply, market_dominance, market_dominance_prev,
-         galaxy_score_previous, alt_rank_previous, blockchains (stored as JSON), ...
+     including columns such as price_btc, circulating_supply, max_supply, market_dominance, etc.
   2) Fetches time-series data (/public/coins/<symbol or ID>/time-series/v2) => upserts into
-     the existing 'lunarcrush_timeseries' table, with additional columns if needed, like:
-       - market_dominance, circulating_supply, contributors_active, etc.
+     the existing 'lunarcrush_timeseries' table, including columns such as market_dominance,
+     contributors_active, etc.
   3) Chunk-based backfill from (now - N months) to present in ~30-day intervals.
   4) "Spot-check" a naive rank => top N => partial backfill if desired.
 
@@ -52,8 +50,8 @@ filter_symbols = [
 class LunarCrushFetcher:
     """
     Fetches LunarCrush snapshot & time-series data, storing into the existing
-    'lunarcrush_data' and 'lunarcrush_timeseries' tables. We extend them with new columns
-    if needed for additional data (like price_btc, circulating_supply, etc.).
+    'lunarcrush_data' and 'lunarcrush_timeseries' tables. We define those tables
+    if not present, ensuring the columns we need are created (instead of doing alter table).
     """
 
     def __init__(self, db_file: str = DB_FILE):
@@ -68,67 +66,92 @@ class LunarCrushFetcher:
         if not self.BEARER_TOKEN:
             logger.warning("No LUNARCRUSH_BEARER_TOKEN => time-series calls may fail.")
 
-        # Attempt to add new columns if they do not exist
-        self._add_new_columns_to_lunarcrush_data()
-        self._add_new_columns_to_lunarcrush_timeseries()
+        # Create tables if they do not exist
+        self._init_db_tables()
 
-    # --------------------------------------------------------------------------
-    # Extend existing tables if needed
-    # --------------------------------------------------------------------------
-    def _add_new_columns_to_lunarcrush_data(self):
+    def _init_db_tables(self):
         """
-        We unify the table from db.py with new columns from the snapshot JSON:
-        - price_btc, circulating_supply, max_supply, market_dominance, market_dominance_prev
-        - galaxy_score_previous, alt_rank_previous
-        - blockchains => stored as JSON text
-        - etc.
-        We'll do naive try/except for each new column.
+        Ensures the 'lunarcrush_data' and 'lunarcrush_timeseries' tables exist,
+        with all columns required by this script for snapshots & time-series.
         """
         conn = sqlite3.connect(self.db_file)
         c = conn.cursor()
-        new_columns = [
-            ("price_btc", "REAL"),
-            ("circulating_supply", "REAL"),
-            ("max_supply", "REAL"),
-            ("market_dominance", "REAL"),
-            ("market_dominance_prev", "REAL"),
-            ("galaxy_score_previous", "REAL"),
-            ("alt_rank_previous", "INTEGER"),
-            ("blockchains", "TEXT"),    # storing as JSON text
-        ]
-        for col, col_type in new_columns:
-            try:
-                c.execute(f"ALTER TABLE lunarcrush_data ADD COLUMN {col} {col_type}")
-                logger.info(f"[Schema] Added column={col} to lunarcrush_data.")
-            except sqlite3.OperationalError:
-                # likely means it already exists
-                pass
-        conn.commit()
-        conn.close()
+        try:
+            # ------------------------------------------------------------------
+            # Table: lunarcrush_data
+            # ------------------------------------------------------------------
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS lunarcrush_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER,
+                lunarcrush_id INTEGER,
+                symbol TEXT,
+                name TEXT,
+                price REAL,
+                price_btc REAL,
+                volume_24h REAL,
+                volatility REAL,
+                circulating_supply REAL,
+                max_supply REAL,
+                percent_change_1h REAL,
+                percent_change_24h REAL,
+                percent_change_7d REAL,
+                percent_change_30d REAL,
+                market_cap REAL,
+                market_cap_rank INTEGER,
+                interactions_24h REAL,
+                social_volume_24h REAL,
+                social_dominance REAL,
+                market_dominance REAL,
+                market_dominance_prev REAL,
+                galaxy_score REAL,
+                galaxy_score_previous REAL,
+                alt_rank INTEGER,
+                alt_rank_previous INTEGER,
+                sentiment REAL,
+                categories TEXT,
+                topic TEXT,
+                logo TEXT,
+                blockchains TEXT
+            )
+            """)
 
-    def _add_new_columns_to_lunarcrush_timeseries(self):
-        """
-        We unify the table from db.py with new columns from the timeseries JSON:
-        - market_dominance, circulating_supply, contributors_active, etc.
-        """
-        conn = sqlite3.connect(self.db_file)
-        c = conn.cursor()
-        new_columns = [
-            ("market_dominance", "REAL"),
-            ("circulating_supply", "REAL"),
-            ("contributors_active", "REAL"),
-            ("contributors_created", "REAL"),
-            ("posts_active", "REAL"),
-            ("posts_created", "REAL"),
-        ]
-        for col, col_type in new_columns:
-            try:
-                c.execute(f"ALTER TABLE lunarcrush_timeseries ADD COLUMN {col} {col_type}")
-                logger.info(f"[Schema] Added column={col} to lunarcrush_timeseries.")
-            except sqlite3.OperationalError:
-                pass
-        conn.commit()
-        conn.close()
+            # ------------------------------------------------------------------
+            # Table: lunarcrush_timeseries
+            # ------------------------------------------------------------------
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS lunarcrush_timeseries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                coin_id TEXT,
+                timestamp INTEGER,
+                open_price REAL,
+                close_price REAL,
+                high_price REAL,
+                low_price REAL,
+                volume_24h REAL,
+                market_cap REAL,
+                market_dominance REAL,
+                circulating_supply REAL,
+                sentiment REAL,
+                spam REAL,
+                galaxy_score REAL,
+                volatility REAL,
+                alt_rank INTEGER,
+                contributors_active REAL,
+                contributors_created REAL,
+                posts_active REAL,
+                posts_created REAL,
+                interactions REAL,
+                social_dominance REAL
+            )
+            """)
+
+            conn.commit()
+            logger.info("[Init] Confirmed 'lunarcrush_data' & 'lunarcrush_timeseries' tables exist.")
+        except Exception as e:
+            logger.exception(f"[Init] DB table creation error => {e}")
+        finally:
+            conn.close()
 
     # --------------------------------------------------------------------------
     # Snapshot
@@ -136,7 +159,8 @@ class LunarCrushFetcher:
     def fetch_snapshot_data_filtered(self, limit: int=100):
         """
         /public/coins/list/v2 => only those symbols in filter_symbols (uppercase).
-        We'll store or upsert in 'lunarcrush_data' for each coin found, with new columns where needed.
+        We'll store or upsert in 'lunarcrush_data' for each coin found, with columns
+        such as price_btc, circulating_supply, etc.
         """
         if not self.API_KEY:
             logger.error("No LUNARCRUSH_API_KEY => cannot fetch snapshots.")
@@ -203,10 +227,10 @@ class LunarCrushFetcher:
 
     def _store_snapshot_records(self, coins_list: List[dict]):
         """
-        Insert or update rows in 'lunarcrush_data', extending columns with new fields:
-          (price_btc, circulating_supply, max_supply, market_dominance, market_dominance_prev,
-           galaxy_score_previous, alt_rank_previous, blockchains as JSON, etc.)
-        We'll do an 'INSERT OR REPLACE' approach if you'd like, or just an INSERT.
+        Insert or update rows in 'lunarcrush_data', with columns like:
+          price_btc, circulating_supply, max_supply, market_dominance, market_dominance_prev,
+          galaxy_score_previous, alt_rank_previous, blockchains as JSON, etc.
+        We'll do an 'INSERT OR REPLACE' approach.
         """
         if not coins_list:
             logger.info("[SNAPSHOT] => no coins => skip.")
@@ -253,7 +277,6 @@ class LunarCrushFetcher:
             blocks_json = json.dumps(blocks, separators=(",",":"))  # compact
 
             # We'll do an upsert approach:
-            # If you want to handle collisions by symbol or something else, adapt accordingly.
             c.execute("""
                 INSERT OR REPLACE INTO lunarcrush_data (
                     id, timestamp, lunarcrush_id, symbol, name,
@@ -364,9 +387,8 @@ class LunarCrushFetcher:
 
     def _store_timeseries_records(self, coin_id: str, records: List[dict]):
         """
-        Insert (or upsert) each row into 'lunarcrush_timeseries', with new columns:
-          - market_dominance, circulating_supply, contributors_active, contributors_created
-          - posts_active, posts_created
+        Insert (or upsert) each row into 'lunarcrush_timeseries', with columns
+        such as market_dominance, circulating_supply, contributors_active, etc.
         """
         if not records:
             return
@@ -524,11 +546,11 @@ class LunarCrushFetcher:
                 # example rank => (0.5*gscore + 0.2*(mc/1e9) + 0.2*pc24 + 0.05*(sent/100) - 0.05*ar)
                 scaled_senti = sent*0.01
                 rank_score = (
-                    0.5*gsc
-                    + 0.2*(mc/1e9)
-                    + 0.2*(pc24)
-                    + 0.05*scaled_senti
-                    - 0.05*ar
+                        0.5 * gsc
+                        + 0.2 * (mc/1e9)
+                        + 0.2 * pc24
+                        + 0.05 * scaled_senti
+                        - 0.05 * ar
                 )
                 temp.append((sym, rank_score))
 
@@ -570,7 +592,6 @@ def main():
     fetcher = LunarCrushFetcher(DB_FILE)
 
     # If you need to read config
-    import os
     config_file = "config.yaml"
     traded_pairs=[]
     if os.path.exists(config_file):
