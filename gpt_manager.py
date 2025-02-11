@@ -155,7 +155,7 @@ class GPTManager:
         self.max_tokens = max_tokens
 
         # Load config => read 'openai_model' from config_file if present
-        self.model = "gpt-4"
+        self.model = "gpt-4o-mini"
         if os.path.exists(config_file):
             with open(config_file, "r", encoding="utf-8") as f:
                 cfg = yaml.safe_load(f)
