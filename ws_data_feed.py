@@ -14,8 +14,16 @@ Implements two separate WebSocket client classes:
 
 2) KrakenPrivateWSClient:
    - Connects to wss://ws-auth.kraken.com
-   - Subscribes to private feeds (e.g. "openOrders"), can place/cancel orders
+   - Subscribes to private feeds (e.g. "openOrders", "ownTrades", addOrderStatus, etc.)
+   - Can place/cancel orders
    - Requires an API token from Kraken's REST call to GetWebSocketsToken
+
+**ENHANCEMENT**:
+   - We now parse certain private feed messages to handle partial fills, final fills, or rejections
+     in the 'trades' table. For instance, if an "addOrderStatus" message indicates "error",
+     we call `set_trade_rejected(...)`. If it indicates a partial or final fill, we call
+     `update_trade_fill(...)`. This ensures your 'trades' table is kept up-to-date with
+     actual fill size, fees, and status.
 
 Usage in your main code:
     # A) For public data
@@ -28,7 +36,7 @@ Usage in your main code:
 
     # B) For private data
     priv_client = KrakenPrivateWSClient(
-        token="YOUR_WEBSOCKETS_TOKEN",  # from REST
+        token="YOUR_WEBSOCKETS_TOKEN",
         on_private_event_callback=some_function_for_open_orders
     )
     priv_client.start()
@@ -47,7 +55,11 @@ import time
 import threading
 import sqlite3
 
-from db import store_price_history
+from db import (
+    store_price_history,
+    update_trade_fill,
+    set_trade_rejected
+)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -217,9 +229,7 @@ class KrakenPublicWSClient:
             elif feed_name == "trade":
                 await self._handle_trade(data[1], pair)
             else:
-                logger.debug(
-                    f"[PublicWS] Unknown feed={feed_name}, data={data}"
-                )
+                logger.debug(f"[PublicWS] Unknown feed={feed_name}, data={data}")
             return
 
     async def _handle_ticker(self, update_obj, pair: str):
@@ -243,7 +253,7 @@ class KrakenPublicWSClient:
         )
 
         # If there's a callback => pass the final last_price
-        if self.on_ticker_callback and last_price>0:
+        if self.on_ticker_callback and last_price > 0:
             self.on_ticker_callback(pair, last_price)
 
     async def _handle_trade(self, trades_list, pair: str):
@@ -264,26 +274,25 @@ class KrakenPublicWSClient:
                 volume=vol
             )
 
+
 # ------------------------------------------------------------------------------
 # PRIVATE FEED: KrakenPrivateWSClient
 # ------------------------------------------------------------------------------
 class KrakenPrivateWSClient:
     """
     A WebSocket client dedicated to PRIVATE feeds from Kraken, connecting
-    to wss://ws-auth.kraken.com. This allows for "openOrders", "ownTrades", etc.
-    We can also place/cancel orders. We do NOT handle public feed subscriptions.
+    to wss://ws-auth.kraken.com. This allows for "openOrders", "ownTrades",
+    "addOrderStatus", etc. We can also place/cancel orders.
+    We do NOT handle public feed subscriptions here.
 
     - Provide 'token' from the REST call to GetWebSocketsToken.
     - Provide an on_private_event_callback if you want custom logic
-      when openOrders or ownTrades come in.
+      in addition to our partial fill / final fill updates.
 
-    Example usage:
-        priv_client = KrakenPrivateWSClient(
-            token="YOUR_WEBSOCKETS_TOKEN",
-            on_private_event_callback=some_function
-        )
-        priv_client.start()
-        # => subscribes to "openOrders" by default
+    We'll parse certain events:
+      * "addOrderStatus" => if "error" => set trade rejected; if "closed" => fully filled
+                            (and we store final fill in 'trades'), if "open" => partial fill.
+      * "openOrders" => can also contain partial fill info (vol_exec, etc.) if you subscribe to it.
     """
 
     def __init__(
@@ -321,7 +330,7 @@ class KrakenPrivateWSClient:
         if not self.running:
             logger.info("KrakenPrivateWSClient is not running or already stopped.")
             return
-        self.running=False
+        self.running = False
         logger.info("KrakenPrivateWSClient stop requested.")
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5.0)
@@ -344,14 +353,14 @@ class KrakenPrivateWSClient:
             try:
                 logger.info("[PrivateWS] Connecting to wss://ws-auth.kraken.com ...")
                 async with websockets.connect(self.url_private, ssl=self.ssl_context) as ws:
-                    self._ws=ws
+                    self._ws = ws
                     logger.info("[PrivateWS] Connected => Subscribing to openOrders, etc.")
                     await self._subscribe(ws)
                     await self._consume_messages(ws)
-                    self._ws=None
+                    self._ws = None
             except Exception as e:
                 logger.exception(f"[PrivateWS] Error => {e}")
-                self._ws=None
+                self._ws = None
                 if not self.running:
                     break
                 logger.info("[PrivateWS] Disconnected => retry in 5s...")
@@ -367,7 +376,7 @@ class KrakenPrivateWSClient:
         if not self.token:
             logger.warning("[PrivateWS] No token => can't subscribe to private feed.")
             return
-        # example: subscribe to openOrders
+
         msg = {
             "event": "subscribe",
             "subscription": {
@@ -391,33 +400,208 @@ class KrakenPrivateWSClient:
                 break
 
     async def _handle_message(self, raw_msg: str):
+        """
+        Handle each message from the private feed. We call on_private_event_callback
+        if provided. Additionally, we parse "addOrderStatus" or "openOrders" to
+        handle partial fills or rejections in our 'trades' table.
+        """
         try:
             data = json.loads(raw_msg)
         except json.JSONDecodeError:
             logger.error(f"[PrivateWS] JSON parse error => {raw_msg}")
             return
 
+        # If the message is a dict => check if 'event' is e.g. "addOrderStatus", etc.
         if isinstance(data, dict):
             ev = data.get("event")
-            if ev in ["subscriptionStatus","heartbeat","systemStatus"]:
+            if ev in ["subscriptionStatus", "heartbeat", "systemStatus"]:
                 logger.debug(f"[PrivateWS] System event => {data}")
             else:
                 # e.g. addOrderStatus, cancelOrderStatus, error, etc.
                 logger.debug(f"[PrivateWS] Possibly private system => {data}")
-            # If you want a callback:
+                # attempt to process a recognized structure
+                self._process_private_order_message(data)
+
             if self.on_private_event_callback:
                 self.on_private_event_callback(data)
             return
 
+        # If the message is a list => might be [ [some order object], "openOrders", {sequence:..} ]
         if isinstance(data, list):
-            # e.g. [ [ ...some data... ], "openOrders", { "sequence": 123 } ]
-            if len(data)<2:
+            if len(data) < 2:
                 logger.debug(f"[PrivateWS] short data => {data}")
                 return
+
             feed_name = data[1]
+            # If feed_name == "openOrders" => parse partial fill data from data[0]
+            if feed_name == "openOrders":
+                self._process_open_orders(data[0])
+
+            # user callback
             if self.on_private_event_callback:
-                # pass entire data or parse as needed
                 self.on_private_event_callback({"feed_name": feed_name, "data": data})
+
+    def _process_private_order_message(self, msg: dict):
+        """
+        Attempt to parse an 'addOrderStatus' or similar event to handle partial/final fill or rejections.
+        For example:
+          {
+            "event": "addOrderStatus",
+            "status": "error",
+            "errorMessage": "EGeneral:Invalid arguments:volume minimum not met",
+            "txid": "OOS2OH-BFAD3-LQ2LUD"
+          }
+
+          or
+
+          {
+            "event":"addOrderStatus",
+            "status":"ok",
+            "txid":"OOS2OH-BFAD3-LQ2LUD",
+            "descr":"buy 0.04000000 AAVEUSD @ market"
+          }
+
+          or final data might also be included. If "status":"closed", you might see
+          "vol_exec":"0.04000000","fee":"0.04","avg_price":"280.47"
+        """
+        if msg.get("event") != "addOrderStatus":
+            return
+
+        order_id = msg.get("txid", "")
+        status_str = msg.get("status", "")
+
+        # if "error" => the 'errorMessage' might have the reason
+        if status_str == "error":
+            # rejected
+            logger.info(f"[PrivateWS] Order rejected => order_id={order_id}, reason={msg.get('errorMessage','')}")
+            set_trade_rejected(order_id)
+            return
+
+        # if "ok" => means order is accepted or open; we might not do anything yet
+        # We'll look for partial or final fills in the separate feed "openOrders" or
+        # we might see them here if 'vol_exec' is included.
+        logger.debug(f"[PrivateWS] addOrderStatus => order_id={order_id}, status={status_str}")
+
+        # If the order is immediately closed or partially filled, we might get
+        # 'vol_exec','avg_price','fee' here. Example:
+        # { "status":"closed","vol_exec":"0.04000000","avg_price":"280.47000", "fee":"0.04488" }
+        # But often that arrives in openOrders feed. We'll parse it here if present:
+        vol_exec_str = msg.get("vol_exec", "0.0")
+        avg_price_str = msg.get("avg_price", "0.0")
+        fee_str = msg.get("fee", "0.0")
+
+        try:
+            vol_exec = float(vol_exec_str)
+            avg_px = float(avg_price_str)
+            fee_val = float(fee_str)
+        except:
+            vol_exec = 0.0
+            avg_px = 0.0
+            fee_val = 0.0
+
+        # we can define an internal status for partial fill vs. closed
+        # e.g. "closed" if vol_exec > 0 and status_str == "closed"
+        # or "part_filled" if vol_exec > 0 but status='open'
+        # For minimal approach: if status='closed', we do "closed",
+        # otherwise if vol_exec>0 => "part_filled", else "open".
+        if status_str == "closed":
+            new_status = "closed"
+        elif vol_exec > 0:
+            new_status = "part_filled"
+        else:
+            new_status = "open"
+
+        if order_id:
+            update_trade_fill(
+                order_id=order_id,
+                filled_size=vol_exec,
+                avg_fill_price=avg_px,
+                fee=fee_val,
+                status=new_status
+            )
+
+    def _process_open_orders(self, order_chunk):
+        """
+        If you subscribe to "openOrders", you'll get a list of orders with fields
+        like 'vol_exec', 'avg_price', 'status', 'cost', 'fee', etc.
+
+        Example data structure:
+        [
+          {
+            "OOS2OH-BFAD3-LQ2LUD": {
+              "vol_exec":"0.01000000",
+              "cost":"12.45",
+              "fee":"0.04980",
+              "avg_price":"1245.0",
+              "status":"open" or "closed" or "canceled",
+              ...
+            }
+          }
+        ]
+        Then there's an array like ["openOrders", {sequence:...}] afterward.
+
+        We'll parse each order in the chunk => update 'trades' table partial/final fill if present.
+        """
+        if not isinstance(order_chunk, list):
+            return
+
+        for item in order_chunk:
+            # each item should be a dict with key=order_id
+            if not isinstance(item, dict):
+                continue
+            for order_id, order_info in item.items():
+                # parse fields
+                status_str = order_info.get("status", "")
+                vol_exec_str = order_info.get("vol_exec", "0.0")
+                avg_price_str = order_info.get("avg_price", "0.0")
+                fee_str = order_info.get("fee", "0.0")
+
+                try:
+                    vol_exec = float(vol_exec_str)
+                    avg_px = float(avg_price_str)
+                    fee_val = float(fee_str)
+                except:
+                    vol_exec = 0.0
+                    avg_px = 0.0
+                    fee_val = 0.0
+
+                if status_str == "canceled":
+                    # treat as rejected or closed with vol_exec partial?
+                    # For simplicity, let's treat it as 'rejected' if vol_exec=0 else 'closed'
+                    if vol_exec == 0:
+                        logger.info(f"[PrivateWS] Order canceled => {order_id}")
+                        set_trade_rejected(order_id)
+                        continue
+                    else:
+                        # partial fill then canceled => set final fill
+                        logger.info(f"[PrivateWS] Order canceled after partial fill => {order_id}")
+                        update_trade_fill(
+                            order_id=order_id,
+                            filled_size=vol_exec,
+                            avg_fill_price=avg_px,
+                            fee=fee_val,
+                            status="closed"
+                        )
+                        continue
+
+                # possibly "open", "closed", or other
+                if status_str == "open":
+                    if vol_exec > 0:
+                        new_status = "part_filled"
+                    else:
+                        new_status = "open"
+                elif status_str == "closed":
+                    new_status = "closed"
+                else:
+                    new_status = status_str  # e.g. "expired", "canceled"
+
+                update_trade_fill(
+                    order_id=order_id,
+                    filled_size=vol_exec,
+                    avg_fill_price=avg_px,
+                    fee=fee_val,
+                    status=new_status
+                )
 
     # --------------------------------------------------------------------------
     # send_order / cancel_order for private feed
@@ -425,6 +609,7 @@ class KrakenPrivateWSClient:
     def send_order(self, pair: str, side: str, ordertype: str, volume: float, price: float=None):
         """
         e.g. self.send_order("XBT/USD", "buy", "market", 0.01)
+        This results in an 'addOrder' event => you get 'addOrderStatus' messages indicating success or error.
         """
         if not self.token:
             logger.warning("[PrivateWS] No token => cannot place order.")
@@ -460,7 +645,7 @@ class KrakenPrivateWSClient:
             return
 
         async def _cancel():
-            msg={
+            msg = {
                 "event":"cancelOrder",
                 "token": self.token,
                 "txid": txids
