@@ -69,6 +69,8 @@ import logging
 import logging.config
 import yaml
 import os
+import urllib
+import urllib.parse
 import json
 from dotenv import load_dotenv
 import warnings
@@ -121,6 +123,192 @@ LOG_CONFIG = {
 }
 
 
+def make_kraken_headers(api_key: str,
+                        api_secret: str,
+                        url_path: str,
+                        data: dict) -> dict:
+    """
+    Builds 'API-Key' and 'API-Sign' headers for Kraken private endpoints.
+    - 'data' must contain all the fields (including 'nonce').
+    - We form-encode them for the signature.
+
+    Returns a dict with:
+        {
+          "API-Key": ...,
+          "API-Sign": ...,
+          "Content-Type": "application/x-www-form-urlencoded",
+        }
+    """
+    import hashlib, hmac, base64
+
+    # 1) Form-encode the data => e.g. "nonce=167342340000&type=all&asset=ZUSD"
+    postdata = urllib.parse.urlencode(data)
+
+    # 2) The message for the sha256 is (nonce + postdata)
+    nonce_str = data.get("nonce", "")
+    message_for_sha256 = (str(nonce_str) + postdata).encode("utf-8")
+    sha256_digest = hashlib.sha256(message_for_sha256).digest()
+
+    # 3) Combine with the URL path
+    path_bytes = url_path.encode("utf-8")
+    to_sign = path_bytes + sha256_digest
+
+    # 4) Decode api_secret, do HMAC-SHA512
+    secret_bytes = base64.b64decode(api_secret)
+    hmac_sig = hmac.new(secret_bytes, to_sign, hashlib.sha512)
+    signature = base64.b64encode(hmac_sig.digest()).decode()
+
+    return {
+        "API-Key": api_key,
+        "API-Sign": signature,
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+
+def fetch_and_store_kraken_ledger(
+    api_key: str,
+    api_secret: str,
+    asset: str = None,
+    ledger_type: str = "all",
+    start: int = None,
+    end: int = None,
+    db_path: str = "trades.db"
+):
+    """
+    Calls /0/private/Ledgers with the specified filters, then upserts each ledger entry
+    into 'ledger_entries' table in your SQLite DB. This table is expected to have columns:
+        ledger_id TEXT PRIMARY KEY,
+        refid TEXT,
+        time REAL,
+        type TEXT,
+        subtype TEXT,
+        asset TEXT,
+        amount REAL,
+        fee REAL,
+        balance REAL
+
+    Args:
+        api_key: Kraken API Key
+        api_secret: Kraken API Secret (base64-encoded string)
+        asset: e.g. "ZUSD" or None for all assets
+        ledger_type: e.g. "all", "trade", "deposit", etc.
+        start: optional start time (unix timestamp) to filter
+        end: optional end time (unix timestamp) to filter
+        db_path: path to your local SQLite database file
+    """
+    # Build your request path
+    url_path = "/0/private/Ledgers"
+    url = "https://api.kraken.com" + url_path
+
+    # Prepare payload: must contain 'nonce' plus any additional fields
+    nonce_val = str(int(time.time() * 1000))
+    payload = {
+        "nonce": nonce_val,
+        "type": ledger_type,
+    }
+    if asset:
+        payload["asset"] = asset
+    if start:
+        payload["start"] = start
+    if end:
+        payload["end"] = end
+
+    # Create headers with the entire payload for signing
+    headers = make_kraken_headers(
+        api_key=api_key,
+        api_secret=api_secret,
+        url_path=url_path,
+        data=payload
+    )
+
+    # Convert the same 'payload' dict into a form-encoded string
+    # This string must match EXACTLY what 'make_kraken_headers' used for the signature.
+    postdata_str = urllib.parse.urlencode(payload)
+
+    # Send the request with data=... (NOT json=...)
+    try:
+        resp = requests.post(
+            url,
+            headers=headers,
+            data=postdata_str,
+            timeout=10
+        )
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        logger.error(f"[Ledger] HTTP request error => {exc}")
+        return
+
+    # Parse the JSON response
+    try:
+        j = resp.json()
+    except json.JSONDecodeError as e:
+        logger.error(f"[Ledger] Non-JSON response => {resp.text}")
+        return
+
+    # If Kraken responded with an "error" array, handle it
+    if j.get("error"):
+        logger.error(f"[Ledger] Kraken returned error => {j['error']}")
+        return
+
+    # Extract ledger objects
+    ledger_dict = j.get("result", {}).get("ledger", {})
+    if not ledger_dict:
+        logger.info("[Ledger] No ledger entries returned (empty 'ledger').")
+        return
+
+    # Connect to DB and upsert each ledger record
+    conn = sqlite3.connect(db_path)
+    try:
+        c = conn.cursor()
+        rows_inserted = 0
+        for ledger_id, entry_obj in ledger_dict.items():
+            refid = entry_obj.get("refid", "")
+            time_val = float(entry_obj.get("time", 0.0))
+            ltype = entry_obj.get("type", "")
+            subtype = entry_obj.get("subtype", "")
+            aclass = entry_obj.get("aclass", "")
+            ast = entry_obj.get("asset", "")
+            amt = float(entry_obj.get("amount", 0.0))
+            fee = float(entry_obj.get("fee", 0.0))
+            bal = float(entry_obj.get("balance", 0.0))
+
+            # Upsert
+            c.execute("""
+                INSERT OR REPLACE INTO ledger_entries (
+                    ledger_id, refid, time, type, subtype, asset, amount, fee, balance
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (ledger_id, refid, time_val, ltype, subtype, ast, amt, fee, bal))
+            rows_inserted += 1
+
+        conn.commit()
+        logger.info(f"[Ledger] Upserted {rows_inserted} ledger entries into ledger_entries.")
+    except Exception as e:
+        logger.exception(f"[Ledger] Error storing ledger entries => {e}")
+    finally:
+        conn.close()
+
+def get_latest_zusd_balance(db_path="trades.db") -> float:
+    conn = sqlite3.connect(db_path)
+    try:
+        c = conn.cursor()
+        q = """
+        SELECT balance 
+        FROM ledger_entries
+        WHERE asset='ZUSD'
+        ORDER BY time DESC
+        LIMIT 1
+        """
+        row = c.execute(q).fetchone()
+        if row:
+            return float(row[0])
+        else:
+            return 0.0
+    except Exception as e:
+        logger.exception(f"Error retrieving latest ZUSD balance => {e}")
+        return 0.0
+    finally:
+        conn.close()
+
 def get_ws_token(api_key: str, api_secret: str) -> Optional[dict]:
     """
     Retrieves a WebSockets authentication token from Kraken's REST API.
@@ -160,60 +348,6 @@ def get_ws_token(api_key: str, api_secret: str) -> Optional[dict]:
     except requests.exceptions.RequestException as e:
         logger.error(f"Error retrieving WS token from Kraken: {e}")
         return None
-
-
-def fetch_kraken_balance(api_key: str, api_secret: str) -> Dict[str, float]:
-    """
-    Calls Kraken's /0/private/Balance endpoint to retrieve all cash balances
-    (e.g. "ZUSD", "ZEUR", "XXBT", etc.). Returns a dict of {asset: float_balance}
-    or empty if error.
-
-    API Key Permissions Required: Funds permissions => Query
-
-    :param api_key: e.g. "YOUR_KRAKEN_API_KEY"
-    :type api_key: str
-
-    :param api_secret: e.g. "YOUR_KRAKEN_SECRET"
-    :type api_secret: str
-
-    :return: {"ZUSD":123.45,"XXBT":0.01,...} or {}
-    :rtype: dict
-    """
-    url = "https://api.kraken.com/0/private/Balance"
-    path = "/0/private/Balance"
-    nonce_val = int(time.time() * 1000)
-
-    postdata = f"nonce={nonce_val}"
-    sha256 = hashlib.sha256((str(nonce_val) + postdata).encode("utf-8")).digest()
-    message = path.encode("utf-8") + sha256
-    secret = base64.b64decode(api_secret)
-    sig = hmac.new(secret, message, hashlib.sha512)
-    signature = base64.b64encode(sig.digest())
-
-    headers = {
-        'API-Key': api_key,
-        'API-Sign': signature.decode(),
-        'Content-Type': 'application/x-www-form-urlencoded'
-    }
-
-    try:
-        resp = requests.post(url, headers=headers, data=postdata, timeout=10)
-        resp.raise_for_status()
-        j = resp.json()
-        if j.get("error"):
-            logger.error(f"[Balance] Kraken returned error => {j['error']}")
-            return {}
-        result = j.get("result", {})
-        out = {}
-        for k, v in result.items():
-            try:
-                out[k] = float(v)
-            except:
-                out[k] = 0.0
-        return out
-    except requests.exceptions.RequestException as e:
-        logger.exception(f"[Balance] Error fetching kraken balance => {e}")
-        return {}
 
 
 class HybridApp:
@@ -294,15 +428,25 @@ class HybridApp:
           3) gather global trade_history => open_positions => pass with aggregator_list to AIStrategy => single GPT call
           4) place trades if final action=BUY/SELL
         """
+        zero_count = sum(1 for p in self.pairs if self.latest_prices[p] == 0.0)
+        if zero_count > 0:
+            logger.info(f"Skipping aggregator because {zero_count} pairs have price=0.0.")
+            return
+
         logger.info("[Aggregator] aggregator_cycle_all_coins => Checking Kraken balance first...")
 
         # 1) fetch balances
-        balance_info = {}
-        if self.kraken_api_key and self.kraken_api_secret:
-            balance_info = fetch_kraken_balance(self.kraken_api_key, self.kraken_api_secret)
-            logger.info(f"[Aggregator] Current Kraken Balances => {balance_info}")
-        else:
-            logger.warning("[Aggregator] No kraken_api_key/secret => skipping balance check.")
+        fetch_and_store_kraken_ledger(
+            api_key=self.kraken_api_key,
+            api_secret=self.kraken_api_secret,
+            asset="ZUSD",
+            ledger_type="all",
+            db_path=DB_FILE
+        )
+        time.sleep(100)
+
+        current_usd_balance = get_latest_zusd_balance(db_path=DB_FILE)
+        logger.info(f'[Aggregator] Current ZUSD balance: {current_usd_balance}')
 
         # 2) aggregator_list
         aggregator_list: List[Dict[str, Any]] = []
@@ -317,13 +461,13 @@ class HybridApp:
 
         # We store the balance info in the AIStrategy as an attribute if needed
         # (Simplistic approach; you could do more refined usage.)
-        self.strategy.current_account_balance = balance_info
+        self.strategy.current_account_balance = current_usd_balance
 
         # AIStrategy => multi coin approach => single GPT call
         decisions = self.strategy.predict_multi_coins(
             aggregator_list=aggregator_list,
             trade_history=trade_history,
-            max_trades=2,
+            max_trades=5,
             open_positions=open_positions_txt
         )
         logger.info("[Aggregator] GPT decisions => %s", decisions)
@@ -582,12 +726,12 @@ def main():
         use_openai=ENABLE_GPT,
         max_position_size=3,
         stop_loss_pct=0.05,
-        take_profit_pct=0.01,
+        take_profit_pct=0.02,
         max_daily_drawdown=-0.02,
         risk_controls=risk_controls,
         gpt_model="o1-mini",
         gpt_temperature=1.0,
-        gpt_max_tokens=25000
+        gpt_max_tokens=5000
     )
     logger.info(f"[Main] AIStrategy => multi-coin GPT => pairs={TRADED_PAIRS}, GPT={ENABLE_GPT}")
 
