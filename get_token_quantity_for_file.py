@@ -1,7 +1,7 @@
 import tiktoken
 
 
-input_filename = "/Users/daniel/dev/crowd/kallos-kraken/.idea/httpRequests/2025-02-10T213410.200.json"
+input_filename = "/Users/daniel/dev/crowd/simple-trader/logs/2025-02-11T01-12-52/prompt.txt"
 model_name = "gpt-4o"
 
 def main():
