@@ -15,8 +15,14 @@ per pair in 'sub_positions'. Each sub-position has:
 
 We also track daily realized PnL; if it's below 'max_daily_drawdown', then new
 trades are forced to HOLD. Additionally, 'max_position_size' clamps the
-per-trade size, an optional 'max_position_value' can clamp cost in USD, and now
+per-trade size, an optional 'max_position_value' can clamp cost in USD, and
 `initial_spending_account` ensures we don't exceed a total allocated capital.
+
+NOTE: As of the newer approach, we do NOT immediately insert a sub-position
+upon an AI "BUY" or "SELL" decision. The AIStrategy now creates an order as
+'pending' in the 'trades' table, then we only create a sub-position here if/when
+the order is actually filled. That typically happens in the private feed
+handling code, which can call `_insert_sub_position()` once a fill is confirmed.
 """
 
 import logging
@@ -41,9 +47,13 @@ class RiskManagerDB:
       - optionally auto-close sub-positions in check_stop_loss_take_profit() if
         stop_loss_pct or take_profit_pct are set.
 
-    A typical flow:
-      - AIStrategy calls: final_signal, final_size = adjust_trade("BUY", 0.01, "ETH/USD", 2000)
-      - We do daily check => if okay, clamp size => ensure we don't exceed capital => insert sub-position => return final.
+    Typical usage flow:
+      - AIStrategy calls `final_signal, final_size = adjust_trade("BUY", size, "ETH/USD", price)`
+        to see if the trade is allowed and properly clamped.
+      - If the final_signal is BUY/SELL, the AIStrategy creates a pending order in `trades`.
+      - Once the private feed (or other code) sees the order fill, it can call
+        `_insert_sub_position()` to record the actual open sub-position, or call
+        `_close_sub_position()` when the position is later exited.
     """
 
     def __init__(
@@ -109,8 +119,9 @@ class RiskManagerDB:
         current_price: float
     ) -> (str, float):
         """
-        Adjust an AI-proposed trade to comply with risk constraints, and if valid,
-        open a sub-position in the DB.
+        Adjust an AI-proposed trade to comply with risk constraints. Returns
+        a final_signal and final_size. If final_signal is "BUY"/"SELL" and final_size > 0,
+        AIStrategy will likely create a "pending" order in 'trades' for future fill.
 
         Steps:
           1) If daily realized PnL <= max_daily_drawdown => force HOLD
@@ -118,8 +129,7 @@ class RiskManagerDB:
           3) clamp size by self.max_position_size
           4) if signal=BUY => check total spent so far, ensure (spent + cost) <= initial_spending_account
           5) if self.max_position_value => clamp cost in USD
-          6) insert sub-position row => side= "long" or "short"
-          7) return final_signal, final_size
+          6) Return final_signal, final_size (the sub-position is opened if/when the order is filled).
         """
         # 1) daily drawdown check
         if self.max_daily_drawdown is not None:
@@ -164,14 +174,8 @@ class RiskManagerDB:
                     return ("HOLD", 0.0)
                 cost = final_size * current_price
 
-        # insert sub-position => side= "long" or "short"
-        side_str = "long" if signal == "BUY" else "short"
-        self._insert_sub_position(pair, side_str, current_price, final_size)
-        logger.info(
-            f"[RiskManager] Opened new sub-position => pair={pair}, side={side_str}, "
-            f"entry_price={current_price:.2f}, size={final_size:.6f}, cost={cost:.2f}"
-        )
-
+        # Return final_signal/final_size here. We do NOT open a sub-position yet.
+        # That happens only if/when the order is actually filled (triggered by private feed).
         return (signal, final_size)
 
     def check_stop_loss_take_profit(self, pair: str, current_price: float) -> None:
@@ -276,6 +280,10 @@ class RiskManagerDB:
             conn.close()
 
     def _insert_sub_position(self, pair: str, side: str, entry_price: float, size: float):
+        """
+        Creates an open sub-position row in the DB. Typically called once an
+        order is actually filled (or partially filled).
+        """
         conn = sqlite3.connect(self.db_path)
         try:
             c = conn.cursor()
@@ -346,7 +354,7 @@ class RiskManagerDB:
           if side=long => (exit_price - entry_price) * size
           if side=short => (entry_price - exit_price) * size
         """
-        if side.lower() in ("long","buy"):
+        if side.lower() in ("long", "buy"):
             return (exit_price - entry_price) * size
         else:
             return (entry_price - exit_price) * size
