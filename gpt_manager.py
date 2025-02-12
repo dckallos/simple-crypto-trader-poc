@@ -137,7 +137,7 @@ class GPTManager:
         self.temperature = temperature
         self.max_tokens = max_tokens
 
-        self.model = "gpt-4o-mini"  # default
+        self.model = "o1-mini"  # default
         if os.path.exists(config_file):
             with open(config_file, "r", encoding="utf-8") as f:
                 cfg = yaml.safe_load(f)
