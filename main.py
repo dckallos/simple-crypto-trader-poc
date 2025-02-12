@@ -464,10 +464,10 @@ class HybridApp:
 
         # AIStrategy => multi coin approach => single GPT call
         decisions = self.strategy.predict_multi_coins(
-            aggregator_list=aggregator_list,
+            input_aggregator_list=aggregator_list,
             trade_history=trade_history,
             max_trades=5,
-            open_positions=open_positions_txt
+            input_open_positions=open_positions_txt
         )
         logger.info("[Aggregator] GPT decisions => %s", decisions)
 
