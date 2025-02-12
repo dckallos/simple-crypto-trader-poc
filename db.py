@@ -5,78 +5,83 @@
 db.py
 
 SQLite database utilities for:
-1) Recording executed trades in the 'trades' table.
-2) Storing price history in 'price_history'.
-3) Collecting aggregator data in 'cryptopanic_posts' and 'lunarcrush_data'.
-4) Maintaining GPT context in 'ai_context'.
-5) Logging final AI decisions in 'ai_decisions'.
-6) Storing advanced time-series data in 'lunarcrush_timeseries'.
+1) Recording final (completed) trades in the 'trades' table. (No pending states here!)
+2) Storing ephemeral/pending trades in the new 'pending_trades' table.
+3) Storing kraken asset-pair info in 'kraken_asset_pairs' for minOrder and other fields.
+4) Logging ledger entries, price history, cryptopanic data, lunarcrush data, AI context, etc.
 
-For multi-sub-position logic, see `RiskManagerDB` in risk_manager.py.
+NOTE: This file has been updated to reflect the new design where 'trades' only
+holds finalized/closed trades, while 'pending_trades' holds ephemeral states
+('pending','open','rejected','closed'), but we are *not* tracking partial fills
+there. We also added 'kraken_asset_pairs' table with expanded columns to store
+Kraken /AssetPairs data for each pair.
 
-Extended Columns for partial fill logic:
-    - In the 'trades' table, columns have been added so we can track pending orders,
-      partial fills, rejections, or final fills:
-        status TEXT        -- 'pending','open','part_filled','closed','rejected'
-        filled_size REAL   -- total filled so far
-        avg_fill_price REAL-- weighted average fill price for the portion filled
-        fee REAL           -- cumulative fee so far
+All other existing functionality not relevant to the newly introduced logic is
+left intact, but references to "pending" or partial-fill logic in 'trades' have
+been removed. Sub-position logic is handled in risk_manager.py or by your app.
 
-Usage:
-    - Call init_db() once on startup (or run this file directly) to ensure all tables exist.
-    - Use record_trade_in_db(), store_price_history(), store_cryptopanic_data(), etc.
-    - GPT context stored in 'ai_context' => load_gpt_context_from_db() & save_gpt_context_to_db().
-    - For sub-positions, see risk_manager.py => RiskManagerDB.
-    - (NEW) create_pending_trade(...), update_trade_fill(...), set_trade_rejected(...)
-      can help you manage partial-fills or rejections in 'trades'.
+CHANGES summary (search for "## NEW or ## CHANGED" comments below for modifications).
 """
 
 import sqlite3
 import time
 import logging
+import os
+from typing import List, Dict, Any
 
 logger = logging.getLogger(__name__)
 
+# Path to your SQLite DB file
 DB_FILE = "trades.db"
 
-
+# ------------------------------------------------------------------------------
+# Basic init / create tables
+# ------------------------------------------------------------------------------
 def init_db():
     """
     Creates all needed tables in the SQLite DB specified by DB_FILE, if not exist:
-      - trades (with extended columns for partial-fill tracking)
+      - trades          (for final, completed trades only)
+      - pending_trades  (new table for ephemeral pending trades)
       - price_history
       - cryptopanic_posts
       - lunarcrush_data
       - ai_context
       - ai_decisions
       - lunarcrush_timeseries
-
-    If sub_positions are needed, see `risk_manager.py => RiskManagerDB.initialize()`.
+      - kraken_asset_pairs (new comprehensive table for /AssetPairs)
+      - ledger_entries  (for ledger data)
     """
     init_ledger_table(DB_FILE)
     conn = sqlite3.connect(DB_FILE)
     try:
         c = conn.cursor()
 
-        # 1) trades
-        #    Now includes columns for partial fill logic: status, filled_size, avg_fill_price, fee
+        # ----------------------------------------------------------------------
+        # 1) TRADES (FINAL ONLY)
+        # ----------------------------------------------------------------------
+        ## CHANGED: Removing 'pending','open','part_filled','rejected' statuses, or partial fill columns.
+        ## We'll create a simpler trades table for final records only.
         c.execute("""
             CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp INTEGER,
                 pair TEXT,
-                side TEXT,
-                quantity REAL,
-                price REAL,
-                order_id TEXT,
-                status TEXT,
-                filled_size REAL DEFAULT 0.0, 
-                avg_fill_price REAL DEFAULT 0.0,
-                fee REAL DEFAULT 0.0
+                side TEXT,         -- 'BUY' or 'SELL'
+                quantity REAL,     -- final filled quantity
+                price REAL,        -- final average fill price
+                order_id TEXT,     -- Kraken order ID or reference if needed
+                fee REAL DEFAULT 0 -- total fee for the entire fill
             )
         """)
 
-        # 2) price_history
+        # ----------------------------------------------------------------------
+        # 2) PENDING_TRADES (NEW)
+        # ----------------------------------------------------------------------
+        create_pending_trades_table(conn)  # calls a helper function below
+
+        # ----------------------------------------------------------------------
+        # 3) PRICE_HISTORY
+        # ----------------------------------------------------------------------
         c.execute("""
             CREATE TABLE IF NOT EXISTS price_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,7 +95,7 @@ def init_db():
         """)
 
         # ----------------------------------------------------------------------
-        # 3) 'cryptopanic_posts' table
+        # 4) CRYPTOPANIC_POSTS
         # ----------------------------------------------------------------------
         c.execute("""
             CREATE TABLE IF NOT EXISTS cryptopanic_posts (
@@ -114,7 +119,7 @@ def init_db():
         """)
 
         # ----------------------------------------------------------------------
-        # 4) 'lunarcrush_data' table
+        # 5) LUNARCRUSH_DATA
         # ----------------------------------------------------------------------
         c.execute("""
             CREATE TABLE IF NOT EXISTS lunarcrush_data (
@@ -153,7 +158,7 @@ def init_db():
         """)
 
         # ----------------------------------------------------------------------
-        # 5) 'ai_context' table
+        # 6) AI_CONTEXT
         # ----------------------------------------------------------------------
         c.execute("""
             CREATE TABLE IF NOT EXISTS ai_context (
@@ -163,7 +168,7 @@ def init_db():
         """)
 
         # ----------------------------------------------------------------------
-        # 6) 'ai_decisions' table
+        # 7) AI_DECISIONS
         # ----------------------------------------------------------------------
         c.execute("""
             CREATE TABLE IF NOT EXISTS ai_decisions (
@@ -177,7 +182,7 @@ def init_db():
         """)
 
         # ----------------------------------------------------------------------
-        # 7) 'lunarcrush_timeseries' table
+        # 8) LUNARCRUSH_TIMESERIES
         # ----------------------------------------------------------------------
         c.execute("""
             CREATE TABLE IF NOT EXISTS lunarcrush_timeseries (
@@ -200,63 +205,51 @@ def init_db():
             )
         """)
 
+        # ----------------------------------------------------------------------
+        # 9) KRAKEN_ASSET_PAIRS (NEW or EXPANDED)
+        # ----------------------------------------------------------------------
+        create_kraken_asset_pairs_table(conn)
+
         conn.commit()
         logger.info("All DB tables ensured in init_db().")
+
     except Exception as e:
         logger.exception(f"Error creating DB: {e}")
     finally:
         conn.close()
 
-
-def record_trade_in_db(side: str, quantity: float, price: float, order_id: str, pair="ETH/USD"):
-    """
-    Inserts a new record into the 'trades' table. This was originally used to
-    record a final trade after it's been executed. By default, you might treat
-    this as a fully filled trade (status='closed').
-
-    :param side: 'BUY' or 'SELL'.
-    :param quantity: The final filled size in base units (e.g. BTC quantity).
-    :param price: Fill price (float).
-    :param order_id: The ID returned by place_order (mock or real).
-    :param pair: Which trading pair was traded.
-    """
-    conn = sqlite3.connect(DB_FILE)
+# ------------------------------------------------------------------------------
+# LEDGER ENTRIES
+# ------------------------------------------------------------------------------
+def init_ledger_table(db_path: str = DB_FILE):
+    conn = sqlite3.connect(db_path)
     try:
         c = conn.cursor()
         c.execute("""
-            INSERT INTO trades (
-                timestamp, pair, side, quantity, price, order_id,
-                status, filled_size, avg_fill_price, fee
+            CREATE TABLE IF NOT EXISTS ledger_entries (
+                ledger_id TEXT PRIMARY KEY,  -- e.g. L4UESK-KG3EQ-UFO4T5
+                refid TEXT,
+                time REAL,
+                type TEXT,
+                subtype TEXT,
+                asset TEXT,
+                amount REAL,
+                fee REAL,
+                balance REAL
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            int(time.time()),
-            pair,
-            side,
-            quantity,
-            price,
-            order_id,
-            'closed',     # For this legacy function, we treat it as fully filled
-            quantity,     # filled_size = quantity
-            price,        # avg_fill_price = final fill price
-            0.0           # fee = 0 by default here
-        ))
+        """)
         conn.commit()
     except Exception as e:
-        logger.exception(f"Error recording trade in DB: {e}")
+        logger.exception(f"Error creating ledger_entries table: {e}")
     finally:
         conn.close()
 
-
+# ------------------------------------------------------------------------------
+# PRICE HISTORY & CRYPTOPANIC
+# ------------------------------------------------------------------------------
 def store_price_history(pair: str, bid: float, ask: float, last: float, volume: float):
     """
     Inserts a new record into the 'price_history' table for real-time price data.
-
-    :param pair: e.g. "XBT/USD"
-    :param bid: Current bid price
-    :param ask: Current ask price
-    :param last: Last traded price
-    :param volume: Volume in the last period or since last update
     """
     logger.debug(f"Inserting price for {pair}: last={last}, volume={volume}")
     conn = sqlite3.connect(DB_FILE)
@@ -283,10 +276,6 @@ def store_price_history(pair: str, bid: float, ask: float, last: float, volume: 
 def store_cryptopanic_data(title: str, url: str, sentiment_score: float):
     """
     Inserts a row into 'cryptopanic_posts'.
-
-    :param title: The news title or headline.
-    :param url: Link to the article.
-    :param sentiment_score: A numeric sentiment measure (e.g. from -1 to +1).
     """
     logger.info(f"Storing CryptoPanic news: title={title}, sentiment={sentiment_score}")
     conn = sqlite3.connect(DB_FILE)
@@ -307,106 +296,44 @@ def store_cryptopanic_data(title: str, url: str, sentiment_score: float):
     finally:
         conn.close()
 
-def init_ledger_table(db_path: str = DB_FILE):
-    conn = sqlite3.connect(db_path)
-    try:
-        c = conn.cursor()
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS ledger_entries (
-                ledger_id TEXT PRIMARY KEY,  -- e.g. L4UESK-KG3EQ-UFO4T5
-                refid TEXT,
-                time REAL,
-                type TEXT,
-                subtype TEXT,
-                asset TEXT,
-                amount REAL,
-                fee REAL,
-                balance REAL
-            )
-        """)
-        conn.commit()
-    except Exception as e:
-        logger.exception(f"Error creating ledger_entries table: {e}")
-    finally:
-        conn.close()
-
-
-def store_lunarcrush_data(
-    symbol: str,
-    name: str,
-    price: float,
-    market_cap: float,
-    volume_24h: float,
-    volatility: float,
-    percent_change_1h: float,
-    percent_change_24h: float,
-    percent_change_7d: float,
-    percent_change_30d: float,
-    social_volume_24h: float,
-    interactions_24h: float,
-    social_dominance: float,
-    galaxy_score: float,
-    alt_rank: int,
-    sentiment: float,
-    categories: str,
-    topic: str,
-    logo: str
-):
+# ------------------------------------------------------------------------------
+# TRADES (FINAL) - We keep record_trade_in_db for legacy, but emphasize it's final
+# ------------------------------------------------------------------------------
+def record_trade_in_db(side: str, quantity: float, price: float, order_id: str, pair="ETH/USD"):
     """
-    Insert a row into 'lunarcrush_data' table with the specified metrics.
-
-    :param symbol: e.g. "ETH"
-    :param name: e.g. "Ethereum"
-    :param price: Current price for the asset.
-    :param market_cap: Current market cap.
-    :param volume_24h: Trading volume in the last 24 hours.
-    :param volatility: Volatility metric from LunarCrush.
-    :param percent_change_1h: Price % change in last hour.
-    :param percent_change_24h: Price % change in last 24h.
-    :param percent_change_7d: Price % change in last 7 days.
-    :param percent_change_30d: Price % change in last 30 days.
-    :param social_volume_24h: Social mentions in last 24h.
-    :param interactions_24h: Interactions (likes, shares, etc.) in 24h.
-    :param social_dominance: The ratio of social volume vs. total across all assets.
-    :param galaxy_score: LunarCrush metric (0..100).
-    :param alt_rank: LunarCrush alt rank (lower is better).
-    :param sentiment: 0..100 measure or a custom sentiment from LunarCrush.
-    :param categories: Comma-separated categories, e.g. "defi,nft".
-    :param topic: Additional text about the asset, if provided.
-    :param logo: URL to the coin's logo or an image resource.
-
-    Returns: None. Data is inserted into 'lunarcrush_data'.
+    Inserts a final, *fully executed* record into the 'trades' table.
+    Old usage might treat it as a fully filled trade (status='closed').
+    But we've removed partial fill columns; this is final record only.
     """
     conn = sqlite3.connect(DB_FILE)
     try:
         c = conn.cursor()
         c.execute("""
-            INSERT INTO lunarcrush_data (
-                timestamp, symbol, name, price, market_cap, volume_24h, volatility,
-                percent_change_1h, percent_change_24h, percent_change_7d, percent_change_30d,
-                social_volume_24h, interactions_24h, social_dominance, galaxy_score,
-                alt_rank, sentiment, categories, topic, logo
+            INSERT INTO trades (
+                timestamp, pair, side, quantity, price, order_id, fee
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, [
-            int(time.time()), symbol, name, price, market_cap, volume_24h, volatility,
-            percent_change_1h, percent_change_24h, percent_change_7d, percent_change_30d,
-            social_volume_24h, interactions_24h, social_dominance, galaxy_score,
-            alt_rank, sentiment, categories, topic, logo
-        ])
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            int(time.time()),
+            pair,
+            side,
+            quantity,
+            price,
+            order_id,
+            0.0  # fee can be updated if you have final info
+        ))
         conn.commit()
-        logger.info(f"Inserted row into lunarcrush_data for symbol={symbol}.")
     except Exception as e:
-        logger.exception(f"Error storing lunarcrush data: {e}")
+        logger.exception(f"Error recording trade in DB: {e}")
     finally:
         conn.close()
 
-
+# ------------------------------------------------------------------------------
+# GPT context loading/saving
+# ------------------------------------------------------------------------------
 def load_gpt_context_from_db() -> str:
     """
     Returns the 'context' field from ai_context WHERE id=1, or "" if none.
-
-    :return: str
     """
     conn = sqlite3.connect(DB_FILE)
     try:
@@ -426,8 +353,6 @@ def load_gpt_context_from_db() -> str:
 def save_gpt_context_to_db(context_str: str):
     """
     Upsert the single row in 'ai_context' with id=1, storing context_str.
-
-    :param context_str: The conversation context to store.
     """
     conn = sqlite3.connect(DB_FILE)
     try:
@@ -443,102 +368,260 @@ def save_gpt_context_to_db(context_str: str):
     finally:
         conn.close()
 
-
 # =============================================================================
-# New or Extended Functions for Partial Fill Logic
+# CREATE PENDING_TRADES TABLE
 # =============================================================================
+## NEW: We'll store ephemeral/pending trades here, with minimal columns. No partial fill logic.
+def create_pending_trades_table(conn=None):
+    close_conn = False
+    if conn is None:
+        conn = sqlite3.connect(DB_FILE)
+        close_conn = True
 
-def create_pending_trade(side: str, requested_qty: float, pair: str, order_id: str) -> int:
+    try:
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS pending_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at INTEGER,
+                pair TEXT,
+                side TEXT,
+                requested_qty REAL,
+                status TEXT,               -- 'pending','open','closed','rejected'
+                kraken_order_id TEXT,
+                reason TEXT
+            )
+        """)
+        conn.commit()
+        logger.info("[DB] pending_trades table ensured.")
+    except Exception as e:
+        logger.exception(f"Error creating pending_trades table: {e}")
+    finally:
+        if close_conn:
+            conn.close()
+
+# ------------------------------------------------------------------------------
+# CRUD for PENDING_TRADES
+# ------------------------------------------------------------------------------
+## CHANGED: No partial fill columns or partial fill logic is included.
+def create_pending_trade(side: str, requested_qty: float, pair: str, reason: str = None) -> int:
     """
-    Creates a new row in 'trades' with status='pending' (useful if we're
-    waiting on Kraken fill). The 'price' can remain 0 or indicative if we want
-    to store the intended limit or last known price. For a market order, you
-    can pass 0 or the approximate quote.
-
-    Returns: The newly inserted row's ID (primary key).
+    Insert a new row in 'pending_trades' with status='pending'.
+    Returns newly inserted row ID.
     """
     conn = sqlite3.connect(DB_FILE)
     row_id = None
     try:
-        ts_now = int(time.time())
         c = conn.cursor()
         c.execute("""
-            INSERT INTO trades (
-                timestamp, pair, side, quantity, price, order_id,
-                status, filled_size, avg_fill_price, fee
+            INSERT INTO pending_trades (
+                created_at, pair, side, requested_qty, status, kraken_order_id, reason
             )
-            VALUES (?, ?, ?, ?, ?, ?, 'pending', 0.0, 0.0, 0.0)
-        """, (
-            ts_now, pair, side, requested_qty, 0.0, order_id
-        ))
+            VALUES (?, ?, ?, ?, 'pending', NULL, ?)
+        """, (int(time.time()), pair, side, requested_qty, reason))
         conn.commit()
         row_id = c.lastrowid
     except Exception as e:
-        logger.exception(f"Error creating pending trade row: {e}")
+        logger.exception(f"Error creating pending trade: {e}")
     finally:
         conn.close()
-
     return row_id
 
 
-def update_trade_fill(order_id: str, filled_size: float, avg_fill_price: float, fee: float, status: str):
+def mark_pending_trade_open(pending_id: int, kraken_order_id: str):
     """
-    Updates an existing 'trades' row identified by order_id, setting:
-      - filled_size (cumulative quantity executed so far)
-      - avg_fill_price (weighted average fill price so far)
-      - fee (cumulative fees so far)
-      - status (e.g. 'part_filled','closed')
-
-    For partial fills over time, call this each time new fill data arrives from
-    the private feed. For example, if new_filled_size increments from 0.02 -> 0.03,
-    you'll store the updated total and any updated fee.
+    If Kraken accepts the order, set status='open' and store kraken_order_id.
     """
     conn = sqlite3.connect(DB_FILE)
     try:
         c = conn.cursor()
         c.execute("""
-            UPDATE trades
-            SET filled_size = ?,
-                avg_fill_price = ?,
-                fee = ?,
-                status = ?
-            WHERE order_id = ?
-        """, (filled_size, avg_fill_price, fee, status, order_id))
+            UPDATE pending_trades
+            SET status='open', kraken_order_id=?
+            WHERE id=?
+        """, (kraken_order_id, pending_id))
         conn.commit()
         if c.rowcount < 1:
-            logger.warning(f"No trade row found for order_id={order_id} when updating fill.")
+            logger.warning(f"No pending_trades row found with id={pending_id} to mark open.")
     except Exception as e:
-        logger.exception(f"Error updating trade fill for order_id={order_id}: {e}")
+        logger.exception(f"Error marking pending trade open: {e}")
     finally:
         conn.close()
 
 
-def set_trade_rejected(order_id: str):
+def mark_pending_trade_rejected(pending_id: int, reason: str = None):
     """
-    If Kraken says the order is invalid or insufficient funds, we mark
-    the 'trades' row as status='rejected'. Optionally you can also fill
-    in an error message in another column if you want to store more detail.
+    If Kraken rejects the order for any reason, set status='rejected'.
+    Optionally store a reason string.
     """
     conn = sqlite3.connect(DB_FILE)
     try:
         c = conn.cursor()
         c.execute("""
-            UPDATE trades
-            SET status = 'rejected'
-            WHERE order_id = ?
-        """, (order_id,))
+            UPDATE pending_trades
+            SET status='rejected', reason=?
+            WHERE id=?
+        """, (reason, pending_id))
         conn.commit()
         if c.rowcount < 1:
-            logger.warning(f"No trade row found for order_id={order_id} to set rejected.")
+            logger.warning(f"No pending_trades row found with id={pending_id} to reject.")
     except Exception as e:
-        logger.exception(f"Error setting trade rejected for order_id={order_id}: {e}")
+        logger.exception(f"Error marking pending trade rejected: {e}")
     finally:
         conn.close()
 
 
-if __name__ == "__main__":
-    import logging
-    logging.basicConfig(level=logging.INFO)
-    logger.info("Running init_db() from db.py directly.")
-    init_db()
-    logger.info("DB initialization complete.")
+def mark_pending_trade_closed(pending_id: int, reason: str = None):
+    """
+    If the trade is fully filled, mark status='closed'.
+    We'll also create a final row in 'trades' outside (ws_data_feed or whichever).
+    This just updates the status in pending_trades for traceability.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        c = conn.cursor()
+        c.execute("""
+            UPDATE pending_trades
+            SET status='closed', reason=?
+            WHERE id=?
+        """, (reason, pending_id))
+        conn.commit()
+        if c.rowcount < 1:
+            logger.warning(f"No pending_trades row found with id={pending_id} to close.")
+    except Exception as e:
+        logger.exception(f"Error marking pending trade closed: {e}")
+    finally:
+        conn.close()
+
+
+# =============================================================================
+# CREATE KRAKEN_ASSET_PAIRS TABLE (expanded)
+# =============================================================================
+## NEW: We store a wide range of columns from the /AssetPairs response
+def create_kraken_asset_pairs_table(conn=None):
+    close_conn = False
+    if conn is None:
+        conn = sqlite3.connect(DB_FILE)
+        close_conn = True
+
+    try:
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS kraken_asset_pairs (
+                pair_name TEXT PRIMARY KEY,    -- e.g. 'XXBTZUSD','XETHXXBT'
+                altname TEXT,
+                wsname TEXT,
+                aclass_base TEXT,
+                base TEXT,
+                aclass_quote TEXT,
+                quote TEXT,
+                lot TEXT,
+                cost_decimals INTEGER,
+                pair_decimals INTEGER,
+                lot_decimals INTEGER,
+                lot_multiplier INTEGER,
+                leverage_buy TEXT,  -- stored as JSON string
+                leverage_sell TEXT, -- stored as JSON
+                fees TEXT,          -- stored as JSON
+                fees_maker TEXT,    -- stored as JSON
+                fee_volume_currency TEXT,
+                margin_call INTEGER,
+                margin_stop INTEGER,
+                ordermin TEXT,       -- store as string or float if you prefer
+                costmin TEXT,        -- store as string or float
+                tick_size TEXT,      -- store as string or float
+                status TEXT,
+                long_position_limit INTEGER,
+                short_position_limit INTEGER,
+                last_updated INTEGER
+            )
+        """)
+        conn.commit()
+        logger.info("[DB] kraken_asset_pairs table ensured.")
+    except Exception as e:
+        logger.exception(f"Error creating kraken_asset_pairs table: {e}")
+    finally:
+        if close_conn:
+            conn.close()
+
+def store_kraken_asset_pair_info(pair_name: str, pair_info: Dict[str, Any]):
+    """
+    Insert or replace the row in kraken_asset_pairs with the data from pair_info.
+    We'll store arrays (leverage, fees) as JSON strings for simplicity.
+    `pair_info` is the dict for that pair from the /AssetPairs result.
+    """
+    import json
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        c = conn.cursor()
+        now_ts = int(time.time())
+        # Extract fields
+        altname = pair_info.get("altname","")
+        wsname = pair_info.get("wsname","")
+        aclass_base = pair_info.get("aclass_base","")
+        base = pair_info.get("base","")
+        aclass_quote = pair_info.get("aclass_quote","")
+        quote = pair_info.get("quote","")
+        lot = pair_info.get("lot","")
+        cost_decimals = pair_info.get("cost_decimals",0)
+        pair_decimals = pair_info.get("pair_decimals",0)
+        lot_decimals = pair_info.get("lot_decimals",0)
+        lot_multiplier = pair_info.get("lot_multiplier",0)
+        # Convert arrays to JSON
+        leverage_buy = json.dumps(pair_info.get("leverage_buy", []))
+        leverage_sell = json.dumps(pair_info.get("leverage_sell", []))
+        fees = json.dumps(pair_info.get("fees", []))
+        fees_maker = json.dumps(pair_info.get("fees_maker", []))
+        fee_volume_currency = pair_info.get("fee_volume_currency","")
+        margin_call = pair_info.get("margin_call",0)
+        margin_stop = pair_info.get("margin_stop",0)
+        ordermin = pair_info.get("ordermin","")
+        costmin = pair_info.get("costmin","")
+        tick_size = pair_info.get("tick_size","")
+        status = pair_info.get("status","")
+        long_pos_limit = pair_info.get("long_position_limit",0)
+        short_pos_limit = pair_info.get("short_position_limit",0)
+
+        c.execute("""
+            INSERT OR REPLACE INTO kraken_asset_pairs (
+                pair_name, altname, wsname, aclass_base, base, aclass_quote, quote,
+                lot, cost_decimals, pair_decimals, lot_decimals, lot_multiplier,
+                leverage_buy, leverage_sell, fees, fees_maker, fee_volume_currency,
+                margin_call, margin_stop, ordermin, costmin, tick_size, status,
+                long_position_limit, short_position_limit, last_updated
+            )
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            pair_name,
+            altname,
+            wsname,
+            aclass_base,
+            base,
+            aclass_quote,
+            quote,
+            lot,
+            cost_decimals,
+            pair_decimals,
+            lot_decimals,
+            lot_multiplier,
+            leverage_buy,
+            leverage_sell,
+            fees,
+            fees_maker,
+            fee_volume_currency,
+            margin_call,
+            margin_stop,
+            ordermin,
+            costmin,
+            tick_size,
+            status,
+            long_pos_limit,
+            short_pos_limit,
+            now_ts
+        ))
+        conn.commit()
+        logger.info(f"Upserted asset pair info for {pair_name} into kraken_asset_pairs.")
+    except Exception as e:
+        logger.exception(f"Error storing asset pair info for {pair_name}: {e}")
+    finally:
+        conn.close()
