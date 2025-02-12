@@ -3,6 +3,7 @@ enable_live_ai_inference: true
 enable_gpt_integration: true
 trade_interval_seconds: 120
 min_data_rows: 100
+openai_model: "o1-mini"
 
 risk_controls:
   initial_spending_account: 50.0
