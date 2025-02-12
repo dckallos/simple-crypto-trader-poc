@@ -439,11 +439,10 @@ class HybridApp:
         fetch_and_store_kraken_ledger(
             api_key=self.kraken_api_key,
             api_secret=self.kraken_api_secret,
-            asset="ZUSD",
+            asset="all",
             ledger_type="all",
             db_path=DB_FILE
         )
-        time.sleep(100)
 
         current_usd_balance = get_latest_zusd_balance(db_path=DB_FILE)
         logger.info(f'[Aggregator] Current ZUSD balance: {current_usd_balance}')
@@ -587,6 +586,9 @@ class HybridApp:
             """, (coin_id,))
             row2 = c.fetchone()
             if row2:
+                logger.info("**************************************")
+                logger.info(f'[Aggregator] sentiment for {symbol} => {row2}')
+                logger.info("**************************************")
                 s = row2["sentiment"] if row2["sentiment"] else 0.0
                 g = row2["galaxy_score"] if row2["galaxy_score"] else 0.0
                 a = row2["alt_rank"] if row2["alt_rank"] is not None else 999999
