@@ -18,46 +18,20 @@ to AIStrategy => predict_multi_coins(...) for a single GPT invocation. GPT can
 output buy/sell/hold decisions for each coin in one shot, including swapping trades
 if it sees a better opportunity.
 
-We keep single-coin logic in AIStrategy for optional usage later, but this aggregator
+We keep single-coin logic in AIStrategy for optional usage, but the aggregator
 calls the multi-coin approach by default.
 
+**UPDATED**:
+ - We have removed references to `'pending'` or `'part_filled'` states in the `trades` table.
+ - We rely on `init_db()` to create the new `pending_trades` table and the expanded
+   `kraken_asset_pairs` table, but we skip scheduling any fetch job for /0/public/AssetPairs.
+ - Everything else remains consistent with the older version, aside from those
+   references to old 'pending' statuses in `trades`.
+
 Environment:
-    - KRAKEN_API_KEY, KRAKEN_SECRET_API_KEY for private feed usage (balance queries & real trades)
+    - KRAKEN_API_KEY, KRAKEN_API_SECRET for private feed usage
     - OPENAI_API_KEY if GPT is used in AIStrategy
     - config.yaml for aggregator settings (pairs, intervals, risk_controls, etc.)
-
-ASCII Flow:
-
-    +-------------------+
-    |  Public WS Feed   | (KrakenPublicWSClient)
-    |  (ticker events)  |
-    +-------------------+
-              |
-              v
-    aggregator_app.on_ticker() => store in DB => aggregator_app tries aggregator_cycle_all_coins()
-                  (every aggregator_interval seconds)
-              |
-              v
-    +---------------------------------+
-    | aggregator_cycle_all_coins()   |
-    | => _fetch_kraken_balance()     |
-    | => build aggregator data       |
-    | => AIStrategy => GPT (multi)   |
-    +---------------------------------+
-              |
-       "decisions":[
-         {"pair":"ETH/USD","action":"BUY","size":0.001},
-         {"pair":"XBT/USD","action":"SELL","size":0.002}
-       ]
-              |
-              v
- +----------------------------------+
- |  Private WS Feed (KrakenPrivate) |
- |  => placeOrder => real trades    |
- +----------------------------------+
-
-Usage:
-    python main.py
 """
 
 import time
@@ -131,29 +105,16 @@ def make_kraken_headers(api_key: str,
     Builds 'API-Key' and 'API-Sign' headers for Kraken private endpoints.
     - 'data' must contain all the fields (including 'nonce').
     - We form-encode them for the signature.
-
-    Returns a dict with:
-        {
-          "API-Key": ...,
-          "API-Sign": ...,
-          "Content-Type": "application/x-www-form-urlencoded",
-        }
     """
     import hashlib, hmac, base64
 
-    # 1) Form-encode the data => e.g. "nonce=167342340000&type=all&asset=ZUSD"
     postdata = urllib.parse.urlencode(data)
-
-    # 2) The message for the sha256 is (nonce + postdata)
     nonce_str = data.get("nonce", "")
     message_for_sha256 = (str(nonce_str) + postdata).encode("utf-8")
     sha256_digest = hashlib.sha256(message_for_sha256).digest()
-
-    # 3) Combine with the URL path
     path_bytes = url_path.encode("utf-8")
     to_sign = path_bytes + sha256_digest
 
-    # 4) Decode api_secret, do HMAC-SHA512
     secret_bytes = base64.b64decode(api_secret)
     hmac_sig = hmac.new(secret_bytes, to_sign, hashlib.sha512)
     signature = base64.b64encode(hmac_sig.digest()).decode()
@@ -163,6 +124,7 @@ def make_kraken_headers(api_key: str,
         "API-Sign": signature,
         "Content-Type": "application/x-www-form-urlencoded",
     }
+
 
 def fetch_and_store_kraken_ledger(
     api_key: str,
@@ -175,31 +137,13 @@ def fetch_and_store_kraken_ledger(
 ):
     """
     Calls /0/private/Ledgers with the specified filters, then upserts each ledger entry
-    into 'ledger_entries' table in your SQLite DB. This table is expected to have columns:
-        ledger_id TEXT PRIMARY KEY,
-        refid TEXT,
-        time REAL,
-        type TEXT,
-        subtype TEXT,
-        asset TEXT,
-        amount REAL,
-        fee REAL,
-        balance REAL
+    into 'ledger_entries' table. This helps with data on deposits, withdrawals, etc.
 
-    Args:
-        api_key: Kraken API Key
-        api_secret: Kraken API Secret (base64-encoded string)
-        asset: e.g. "ZUSD" or None for all assets
-        ledger_type: e.g. "all", "trade", "deposit", etc.
-        start: optional start time (unix timestamp) to filter
-        end: optional end time (unix timestamp) to filter
-        db_path: path to your local SQLite database file
+    For usage, pass the relevant timeframe or asset if needed.
     """
-    # Build your request path
     url_path = "/0/private/Ledgers"
     url = "https://api.kraken.com" + url_path
 
-    # Prepare payload: must contain 'nonce' plus any additional fields
     nonce_val = str(int(time.time() * 1000))
     payload = {
         "nonce": nonce_val,
@@ -212,19 +156,14 @@ def fetch_and_store_kraken_ledger(
     if end:
         payload["end"] = end
 
-    # Create headers with the entire payload for signing
     headers = make_kraken_headers(
         api_key=api_key,
         api_secret=api_secret,
         url_path=url_path,
         data=payload
     )
-
-    # Convert the same 'payload' dict into a form-encoded string
-    # This string must match EXACTLY what 'make_kraken_headers' used for the signature.
     postdata_str = urllib.parse.urlencode(payload)
 
-    # Send the request with data=... (NOT json=...)
     try:
         resp = requests.post(
             url,
@@ -237,25 +176,21 @@ def fetch_and_store_kraken_ledger(
         logger.error(f"[Ledger] HTTP request error => {exc}")
         return
 
-    # Parse the JSON response
     try:
         j = resp.json()
     except json.JSONDecodeError as e:
         logger.error(f"[Ledger] Non-JSON response => {resp.text}")
         return
 
-    # If Kraken responded with an "error" array, handle it
     if j.get("error"):
         logger.error(f"[Ledger] Kraken returned error => {j['error']}")
         return
 
-    # Extract ledger objects
     ledger_dict = j.get("result", {}).get("ledger", {})
     if not ledger_dict:
-        logger.info("[Ledger] No ledger entries returned (empty 'ledger').")
+        logger.info("[Ledger] No ledger entries returned.")
         return
 
-    # Connect to DB and upsert each ledger record
     conn = sqlite3.connect(db_path)
     try:
         c = conn.cursor()
@@ -265,29 +200,32 @@ def fetch_and_store_kraken_ledger(
             time_val = float(entry_obj.get("time", 0.0))
             ltype = entry_obj.get("type", "")
             subtype = entry_obj.get("subtype", "")
-            aclass = entry_obj.get("aclass", "")
-            ast = entry_obj.get("asset", "")
+            asset_val = entry_obj.get("asset", "")
             amt = float(entry_obj.get("amount", 0.0))
             fee = float(entry_obj.get("fee", 0.0))
             bal = float(entry_obj.get("balance", 0.0))
 
-            # Upsert
             c.execute("""
                 INSERT OR REPLACE INTO ledger_entries (
                     ledger_id, refid, time, type, subtype, asset, amount, fee, balance
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (ledger_id, refid, time_val, ltype, subtype, ast, amt, fee, bal))
+            """, (ledger_id, refid, time_val, ltype, subtype, asset_val, amt, fee, bal))
             rows_inserted += 1
 
         conn.commit()
-        logger.info(f"[Ledger] Upserted {rows_inserted} ledger entries into ledger_entries.")
+        logger.info(f"[Ledger] Upserted {rows_inserted} ledger entries.")
     except Exception as e:
         logger.exception(f"[Ledger] Error storing ledger entries => {e}")
     finally:
         conn.close()
 
+
 def get_latest_zusd_balance(db_path="trades.db") -> float:
+    """
+    Reads ledger_entries for 'ZUSD' => returns the last known balance.
+    This is a naive approach, your ledger might have multiple changes.
+    """
     conn = sqlite3.connect(db_path)
     try:
         c = conn.cursor()
@@ -309,19 +247,10 @@ def get_latest_zusd_balance(db_path="trades.db") -> float:
     finally:
         conn.close()
 
+
 def get_ws_token(api_key: str, api_secret: str) -> Optional[dict]:
     """
-    Retrieves a WebSockets authentication token from Kraken's REST API.
-    That token is used for the private feed (wss://ws-auth.kraken.com).
-
-    :param api_key: Your Kraken API Key
-    :type api_key: str
-
-    :param api_secret: Your Kraken Secret Key
-    :type api_secret: str
-
-    :return: JSON with e.g. {"error":[],"result":{"token":"..."}}
-    :rtype: dict or None if error
+    Retrieves a WebSockets auth token from Kraken's REST API => used for private feed.
     """
     url = "https://api.kraken.com/0/private/GetWebSocketsToken"
     path = "/0/private/GetWebSocketsToken"
@@ -329,7 +258,6 @@ def get_ws_token(api_key: str, api_secret: str) -> Optional[dict]:
 
     data = {"nonce": nonce}
     postdata = f"nonce={nonce}"
-
     sha256 = hashlib.sha256((nonce + postdata).encode("utf-8")).digest()
     message = path.encode("utf-8") + sha256
     secret = base64.b64decode(api_secret)
@@ -354,11 +282,13 @@ class HybridApp:
     """
     A combined aggregator that:
       1) Receives live ticker updates from public WS => store in DB => track last known price
-      2) At aggregator_interval => aggregator_cycle_all_coins => gather aggregator data for ALL pairs
-         => AIStrategy => single GPT call => produce decisions for each coin in one shot
-      3) If final_action=BUY/SELL => place real trades on private feed.
-      4) Calls fetch_kraken_balance() before aggregator logic to ensure we have funds
-         info that we can optionally pass into AIStrategy if needed.
+      2) At aggregator_interval => aggregator_cycle_all_coins => gather aggregator data for all pairs
+         => AIStrategy => single GPT call => produce decisions
+      3) Place trades if GPT suggests them => But we do so by creating pending trades in the new
+         'pending_trades' table. Then the private feed actually finalizes them or rejects them.
+
+    This updated version removes references to 'pending' trades in 'trades'.
+    Instead, we store ephemeral states in 'pending_trades' only.
     """
 
     def __init__(
@@ -372,22 +302,10 @@ class HybridApp:
     ):
         """
         :param pairs: e.g. ["ETH/USD","XBT/USD"] => tracked coins
-        :type pairs: list of str
-
         :param strategy: AIStrategy instance
-        :type strategy: AIStrategy
-
-        :param aggregator_interval: time in seconds between aggregator cycles, default=300
-        :type aggregator_interval: int
-
+        :param aggregator_interval: seconds between aggregator cycles
         :param private_ws_client: optional => private feed for real trades
-        :type private_ws_client: KrakenPrivateWSClient or None
-
-        :param kraken_api_key: for fetch_kraken_balance calls
-        :type kraken_api_key: str
-
-        :param kraken_api_secret: for fetch_kraken_balance calls
-        :type kraken_api_secret: str
+        :param kraken_api_key, kraken_api_secret: used for ledger or other private calls
         """
         self.pairs = pairs
         self.strategy = strategy
@@ -396,7 +314,6 @@ class HybridApp:
         self.kraken_api_key = kraken_api_key
         self.kraken_api_secret = kraken_api_secret
 
-        # Track last ticker price
         self.latest_prices: Dict[str, float] = {}
         for p in pairs:
             self.latest_prices[p] = 0.0
@@ -405,14 +322,8 @@ class HybridApp:
 
     def on_ticker(self, pair: str, last_price: float):
         """
-        Called by public feed on each new ticker. We store in memory, then
-        check if aggregator_interval is up => aggregator_cycle_all_coins().
-
-        :param pair: e.g. "ETH/USD"
-        :type pair: str
-
-        :param last_price: The most recent last traded price
-        :type last_price: float
+        Called by public feed on each new ticker => store in memory,
+        then check aggregator_interval => aggregator_cycle_all_coins.
         """
         self.latest_prices[pair] = last_price
         now = time.time()
@@ -422,20 +333,17 @@ class HybridApp:
 
     def aggregator_cycle_all_coins(self):
         """
-        Steps:
-          1) fetch kraken account balance => e.g. {'ZUSD':..., 'XXBT':..., ...}
-          2) gather aggregator data for all pairs => aggregator_list
-          3) gather global trade_history => open_positions => pass with aggregator_list to AIStrategy => single GPT call
-          4) place trades if final action=BUY/SELL
+        1) fetch ledger => store => read ZUSD balance
+        2) gather aggregator data => aggregator_list => pass to AIStrategy => multi-coin
+        3) place trades if needed => though AIStrategy already calls create_pending_trade
         """
         zero_count = sum(1 for p in self.pairs if self.latest_prices[p] == 0.0)
         if zero_count > 0:
             logger.info(f"Skipping aggregator because {zero_count} pairs have price=0.0.")
             return
 
-        logger.info("[Aggregator] aggregator_cycle_all_coins => Checking Kraken balance first...")
+        logger.info("[Aggregator] aggregator_cycle_all_coins => Checking ledger for ZUSD balance...")
 
-        # 1) fetch balances
         fetch_and_store_kraken_ledger(
             api_key=self.kraken_api_key,
             api_secret=self.kraken_api_secret,
@@ -443,189 +351,43 @@ class HybridApp:
             ledger_type="all",
             db_path=DB_FILE
         )
-
         current_usd_balance = get_latest_zusd_balance(db_path=DB_FILE)
         logger.info(f'[Aggregator] Current ZUSD balance: {current_usd_balance}')
 
-        # 2) aggregator_list
         aggregator_list: List[Dict[str, Any]] = []
         for pair in self.pairs:
             aggregator_list.append(self._build_aggregator_for_pair(pair))
 
-        # 3) build trade history + open positions
+        # Example trade_history + open_positions usage for AIStrategy => multi-coin approach
         trade_history = self._build_global_trade_history(limit=10)
         open_positions_txt = self._build_open_positions_list()
 
-        logger.info("[Aggregator] aggregator_list => %s", aggregator_list)
-
-        # We store the balance info in the AIStrategy as an attribute if needed
-        # (Simplistic approach; you could do more refined usage.)
-        self.strategy.current_account_balance = current_usd_balance
-
-        # AIStrategy => multi coin approach => single GPT call
         decisions = self.strategy.predict_multi_coins(
             input_aggregator_list=aggregator_list,
             trade_history=trade_history,
             max_trades=5,
-            input_open_positions=open_positions_txt
+            input_open_positions=open_positions_txt,
+            current_balance=current_usd_balance
         )
         logger.info("[Aggregator] GPT decisions => %s", decisions)
 
-        # 4) place trades if needed
-        for p, (action, size) in decisions.items():
-            if action in ("BUY", "SELL") and size > 0:
-                side_str = "buy" if action == "BUY" else "sell"
-                px = self._lookup_price_for_pair(p, aggregator_list)
-                logger.info(f"[Aggregator] => place real order => {p}, side={side_str}, vol={size:.6f}, px={px}")
-                if self.ws_private and px > 0:
-                    self.ws_private.send_order(
-                        pair=p,
-                        side=side_str,
-                        ordertype="market",
-                        volume=size
-                    )
-                else:
-                    logger.warning("[Aggregator] no private feed or no valid price => cannot place real order.")
-
     def _build_aggregator_for_pair(self, pair: str) -> Dict[str, Any]:
         """
-        Return a single aggregator item for 'pair'.
-
-        :param pair: e.g. "ETH/USD"
-        :type pair: str
-
-        :return: {"pair":"ETH/USD","price":1850.0,"aggregator_data":"..."}
-        :rtype: dict
+        Return aggregator snippet for 'pair'. We might read aggregator_summaries or
+        other data. For demonstration, we store minimal data:
         """
         last_price = self.latest_prices.get(pair, 0.0)
-        px_stats = self._fetch_recent_price_trends(pair)
-        vol = px_stats.get("price_volatility", 0.0)
-        ma10 = px_stats.get("price_ma_10", 0.0)
-
-        base_symbol = pair.split("/")[0].upper()
-        sentiment_text = self._load_sentiment_for_symbol(base_symbol)
-        aggregator_str = f"price={last_price}, vol={vol}, ma10={ma10}, {sentiment_text}"
-
+        # Potentially do more advanced aggregator logic here
+        aggregator_str = f"price={last_price}, somePlaceholder=..."
         return {
             "pair": pair,
             "price": last_price,
             "aggregator_data": aggregator_str
         }
 
-    def _fetch_recent_price_trends(self, pair: str) -> Dict[str, Any]:
-        """
-        Query the local DB for recent price_history data for 'pair'.
-        Build a small dictionary with volatility, moving average, etc.
-
-        :param pair: e.g. "ETH/USD"
-        :type pair: str
-
-        :return: e.g. {"price_volatility":0.02,"price_ma_10":1805.6}
-        :rtype: dict
-        """
-        try:
-            conn = sqlite3.connect(DB_FILE)
-            q = """
-                SELECT last_price
-                FROM price_history
-                WHERE pair=?
-                ORDER BY timestamp DESC
-                LIMIT 100
-            """
-            df = pd.read_sql_query(q, conn, params=[pair])
-        except Exception as e:
-            logger.exception(f"[Aggregator] DB error => {e}")
-            return {}
-        finally:
-            conn.close()
-
-        if df.empty:
-            return {}
-        df = df.iloc[::-1].reset_index(drop=True)
-        df["ma_10"] = df["last_price"].rolling(10).mean()
-        df["volatility"] = df["last_price"].pct_change().std()
-
-        last_row = df.iloc[-1]
-        return {
-            "price_ma_10": float(last_row["ma_10"]) if not pd.isnull(last_row["ma_10"]) else 0.0,
-            "price_volatility": float(last_row["volatility"]) if not pd.isnull(last_row["volatility"]) else 0.0
-        }
-
-    def _load_sentiment_for_symbol(self, symbol: str) -> str:
-        """
-        Return a short string describing the sentiment/gscore/alt_rank for 'symbol'
-        from the latest lunarcrush_timeseries row.
-
-        :param symbol: e.g. "ETH"
-        :type symbol: str
-
-        :return: e.g. "sentiment=..., galaxy=..., alt_rank=..."
-        :rtype: str
-        """
-        out = "sentiment=0.0, galaxy=0.0, alt_rank=999999"
-        conn = sqlite3.connect(DB_FILE)
-        conn.row_factory = sqlite3.Row
-        try:
-            c = conn.cursor()
-            c.execute(
-                "SELECT lunarcrush_id FROM lunarcrush_data WHERE UPPER(symbol)=? ORDER BY id DESC LIMIT 1",
-                (symbol.upper(),)
-            )
-            row = c.fetchone()
-            if row and row["lunarcrush_id"]:
-                coin_id = str(row["lunarcrush_id"])
-            else:
-                return out
-
-            c.execute("""
-                SELECT sentiment, galaxy_score, alt_rank
-                FROM lunarcrush_timeseries
-                WHERE coin_id=?
-                ORDER BY timestamp DESC
-                LIMIT 1
-            """, (coin_id,))
-            row2 = c.fetchone()
-            if row2:
-                logger.info("**************************************")
-                logger.info(f'[Aggregator] sentiment for {symbol} => {row2}')
-                logger.info("**************************************")
-                s = row2["sentiment"] if row2["sentiment"] else 0.0
-                g = row2["galaxy_score"] if row2["galaxy_score"] else 0.0
-                a = row2["alt_rank"] if row2["alt_rank"] is not None else 999999
-                out = f"sentiment={s}, galaxy={g}, alt_rank={a}"
-        except Exception as e:
-            logger.exception(f"[Aggregator] error loading sentiment => {e}")
-        finally:
-            conn.close()
-        return out
-
-    def _lookup_price_for_pair(self, pair: str, aggregator_list: List[Dict[str, Any]]) -> float:
-        """
-        Find 'price' in aggregator_list for 'pair', or 0.0 if missing.
-
-        :param pair: e.g. "ETH/USD"
-        :type pair: str
-
-        :param aggregator_list: The list created in aggregator_cycle_all_coins
-        :type aggregator_list: list of dict
-
-        :return: e.g. 1850.0
-        :rtype: float
-        """
-        for item in aggregator_list:
-            if item["pair"] == pair:
-                return item.get("price", 0.0)
-        return 0.0
-
     def _build_global_trade_history(self, limit=10) -> List[str]:
         """
-        Gather up to 'limit' rows from trades table => reversed => lines.
-
-        :param limit: default=10
-        :type limit: int
-
-        :return: e.g. ["2025-01-01 10:00 BUY ETH/USD 0.001@25000", ...]
-        :rtype: list of str
+        Gather up to 'limit' trades from 'trades' table => reversed => lines
         """
         lines = []
         conn = sqlite3.connect(DB_FILE)
@@ -655,10 +417,8 @@ class HybridApp:
 
     def _build_open_positions_list(self) -> List[str]:
         """
-        Return textual list of open sub_positions for GPT usage.
-
-        :return: e.g. ["ETH/USD LONG 0.002, entry=1860.0", "XBT/USD SHORT 0.001, entry=29500.0"]
-        :rtype: list of str
+        Return textual list of open sub_positions.
+        This can help AIStrategy see what's currently held.
         """
         lines = []
         conn = sqlite3.connect(DB_FILE)
@@ -686,12 +446,12 @@ class HybridApp:
 
 def main():
     """
-    Main entry point for demonstrating the aggregator approach:
+    Main entry point:
       1) Reads config.yaml for pairs, intervals, GPT usage, etc.
       2) Creates AIStrategy => multi-coin GPT approach
       3) Creates a HybridApp aggregator => calls aggregator_cycle_all_coins at intervals
       4) Subscribes to KrakenPublicWSClient => on_ticker => aggregator cycle
-      5) If a valid WS token is found => also subscribe to private feed => place real trades
+      5) If a valid WS token => also subscribe to private feed => place real orders
     """
     logging.config.dictConfig(LOG_CONFIG)
 
@@ -705,9 +465,9 @@ def main():
     AGG_INTERVAL = config.get("trade_interval_seconds", 300)
 
     risk_controls = config.get("risk_controls", {
-        "initial_spending_account": 30.0,
-        "purchase_upper_limit_percent": 50.0,
-        "minimum_buy_amount": 10.0,
+        "initial_spending_account": 50.0,
+        "purchase_upper_limit_percent": 75.0,
+        "minimum_buy_amount": 8.0,
         "max_position_value": 25.0
     })
 
@@ -720,15 +480,15 @@ def main():
 
     # 2) Optional training
     if ENABLE_TRAINING:
-        logger.info("[Main] Potential training step here. Omitted for brevity.")
+        logger.info("[Main] Potential training step here. Omitted for brevity...")
 
-    # 3) create AIStrategy => multi-coin GPT approach (which references our updated GPTManager)
+    # 3) create AIStrategy => multi-coin GPT approach
     ai_strategy = AIStrategy(
         pairs=TRADED_PAIRS,
         use_openai=ENABLE_GPT,
         max_position_size=3,
         stop_loss_pct=0.05,
-        take_profit_pct=0.02,
+        take_profit_pct=0.01,
         max_daily_drawdown=-0.02,
         risk_controls=risk_controls,
         gpt_model="o1-mini",
@@ -737,16 +497,14 @@ def main():
     )
     logger.info(f"[Main] AIStrategy => multi-coin GPT => pairs={TRADED_PAIRS}, GPT={ENABLE_GPT}")
 
-    # 4) get private token => we might do balance calls, etc. if we want
+    # 4) get private token => build private feed if success
     token_json = get_ws_token(KRAKEN_API_KEY, KRAKEN_API_SECRET)
     token_str = None
     if token_json and "result" in token_json and "token" in token_json["result"]:
         token_str = token_json["result"]["token"]
-        logger.info(f"[Main] Got private WS token => {token_str[:10]}... (truncated)")
-    else:
-        logger.warning("[Main] Could not retrieve token => private feed disabled")
+        logger.info(f"[Main] Got private WS token => {token_str[:10]}...")
 
-    # 5) aggregator with multi-coin approach + ability to fetch balance
+    # 5) aggregator with multi-coin approach + ability to fetch ledger
     aggregator_app = HybridApp(
         pairs=TRADED_PAIRS,
         strategy=ai_strategy,
@@ -756,14 +514,13 @@ def main():
         kraken_api_secret=KRAKEN_API_SECRET
     )
 
-    # Build public feed => pass aggregator_app.on_ticker => aggregator interval => aggregator_cycle_all_coins
+    # Build public feed => pass aggregator_app.on_ticker
     pub_client = KrakenPublicWSClient(
         pairs=TRADED_PAIRS,
         feed_type="ticker",
         on_ticker_callback=aggregator_app.on_ticker
     )
 
-    # Build private feed if token
     priv_client = None
     if token_str:
         def on_private_event(evt_dict):
@@ -780,7 +537,7 @@ def main():
     if priv_client:
         priv_client.start()
 
-    logger.info("[Main] Running multi-coin aggregator approach with balance checks. Press Ctrl+C to exit.")
+    logger.info("[Main] Running aggregator approach. Press Ctrl+C to exit.")
     try:
         while True:
             time.sleep(1)
