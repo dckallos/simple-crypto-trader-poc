@@ -440,11 +440,6 @@ class HybridApp:
          3) GPT => create pending trades if needed
         (We have removed time-series population from here.)
         """
-        zero_count = sum(1 for p in self.pairs if self.latest_prices[p] == 0.0)
-        if zero_count > 0:
-            logger.info(f"Skipping aggregator because {zero_count} pairs have price=0.0.")
-            return
-
         # 1) Update LunarCrush data
         self.update_lunarcrush_data()
 
@@ -470,6 +465,11 @@ class HybridApp:
         # Example trade_history + open_positions usage for AIStrategy => multi-coin approach
         trade_history = self._build_global_trade_history(limit=10)
         open_positions_txt = self._build_open_positions_list()
+
+        zero_count = sum(1 for p in self.pairs if self.latest_prices[p] == 0.0)
+        if zero_count > 0:
+            logger.info(f"Skipping aggregator because {zero_count} pairs have price=0.0.")
+            return
 
         decisions = self.strategy.predict_multi_coins(
             input_aggregator_list=aggregator_list,
