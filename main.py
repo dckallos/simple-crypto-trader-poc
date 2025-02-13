@@ -11,26 +11,15 @@ using the classes defined in ws_data_feed.py:
 - KrakenPublicWSClient: for public data like ticker/trade
 - KrakenPrivateWSClient: for private data like openOrders, placing/canceling orders
 
-At a fixed interval, we gather aggregator data for ALL tracked coin pairs (including
-recent price, sentiment, volatility, etc.) in a single pass. Before doing so, we also
-call the Kraken "Balance" endpoint to check available funds. Then we pass everything
-to AIStrategy => predict_multi_coins(...) for a single GPT invocation. GPT can
-output buy/sell/hold decisions for each coin in one shot, including swapping trades
-if it sees a better opportunity.
-
-We keep single-coin logic in AIStrategy for optional usage, but the aggregator
-calls the multi-coin approach by default.
-
-**UPDATED**:
- - We have removed references to `'pending'` or `'part_filled'` states in the `trades` table.
- - We rely on `init_db()` to create the new `pending_trades` table, but skip the /AssetPairs fetch schedule.
- - We now add a call to `update_lunarcrush_data()` in each aggregator cycle to keep the local
-   lunarcrush_data table fresh.
+We also have a HybridApp aggregator that calls AIStrategy => predict_multi_coins(...)
+periodically. However, in this updated version we explicitly populate the
+lunarcrush_data and lunarcrush_timeseries tables at application startup—rather
+than waiting for aggregator cycles.
 
 Environment:
     - KRAKEN_API_KEY, KRAKEN_API_SECRET for private feed usage
     - OPENAI_API_KEY if GPT is used in AIStrategy
-    - config.yaml for aggregator settings (pairs, intervals, risk_controls, etc.)
+    - config_loader.py for aggregator settings (pairs, intervals, risk_controls, etc.)
 """
 
 import time
@@ -40,7 +29,6 @@ import hmac
 import base64
 import logging
 import logging.config
-import yaml
 import os
 import urllib
 import urllib.parse
@@ -51,12 +39,10 @@ import sqlite3
 import pandas as pd
 from typing import Optional, Dict, Any, List
 
-from db import init_db, DB_FILE
+from db import init_db, DB_FILE, record_trade_in_db
 from ai_strategy import AIStrategy
 from ws_data_feed import KrakenPublicWSClient, KrakenPrivateWSClient
 from config_loader import ConfigLoader
-
-# NEW import for LunarCrushFetcher
 from fetch_lunarcrush import LunarCrushFetcher
 
 logging.basicConfig(level=logging.DEBUG)
@@ -98,6 +84,7 @@ LOG_CONFIG = {
         },
     }
 }
+
 
 def fetch_kraken_balance(api_key: str, api_secret: str) -> Dict[str, float]:
     """
@@ -162,7 +149,9 @@ def make_kraken_headers(api_key: str,
     - 'data' must contain all the fields (including 'nonce').
     - We form-encode them for the signature.
     """
-    import hashlib, hmac, base64
+    import hashlib
+    import hmac
+    import base64
 
     postdata = urllib.parse.urlencode(data)
     nonce_str = data.get("nonce", "")
@@ -188,8 +177,6 @@ def fetch_and_store_kraken_public_asset_pairs(
     country_code: Optional[str] = None
 ) -> None:
     """
-    fetch_and_store_kraken_public_assetpairs
-
     Calls the Kraken public endpoint for retrieving asset pairs:
     GET https://api.kraken.com/0/public/AssetPairs
 
@@ -226,8 +213,6 @@ def fetch_and_store_kraken_public_asset_pairs(
     from db import store_kraken_asset_pair_info
 
     base_url = "https://api.kraken.com/0/public/AssetPairs"
-
-    # build query params
     params = {}
     if pair_list:
         joined_pairs = ",".join(pair_list)
@@ -238,31 +223,24 @@ def fetch_and_store_kraken_public_asset_pairs(
         params["country_code"] = country_code
 
     logger.info(f"[AssetPairs] GET => {base_url}, params={params}")
-
     try:
-        # No private key or signature required for this public GET
         resp = requests.get(base_url, params=params, timeout=10)
         resp.raise_for_status()
-
         j = resp.json()
-        # Check if the API returned an error array
         err_arr = j.get("error", [])
         if err_arr:
             logger.error(f"[AssetPairs] Returned error => {err_arr}")
             return
 
-        # 'result' => dict of pair_name => data
         results = j.get("result", {})
         if not results:
             logger.warning("[AssetPairs] result is empty => no asset pairs returned.")
             return
 
-        # For each pair in results => upsert into local DB
         count = 0
         for pair_name, pair_info in results.items():
             store_kraken_asset_pair_info(pair_name, pair_info)
             count += 1
-
         logger.info(f"[AssetPairs] Upserted {count} pairs into kraken_asset_pairs.")
     except requests.exceptions.RequestException as e:
         logger.exception(f"[AssetPairs] HTTP request error => {e}")
@@ -430,10 +408,11 @@ class HybridApp:
       1) Receives live ticker updates from public WS => store in DB => track last known price
       2) At aggregator_interval => aggregator_cycle_all_coins => gather aggregator data for all pairs
          => AIStrategy => single GPT call => produce decisions
-      3) Place trades if GPT suggests them => But we do so by creating pending trades in the
-         'pending_trades' table. Then the private feed actually finalizes them or rejects them.
+      3) Places trades if GPT suggests them => creating pending trades in the
+         'pending_trades' table. Then the private feed finalizes them or rejects them.
 
-    Now includes a call to update LunarCrush data each aggregator cycle.
+    We no longer backfill or update lunarcrush_timeseries in aggregator cycles:
+    that now happens explicitly at app startup (see main).
     """
 
     def __init__(
@@ -458,7 +437,6 @@ class HybridApp:
         self.ws_private = private_ws_client
         self.kraken_api_key = kraken_api_key
         self.kraken_api_secret = kraken_api_secret
-        self.is_lunarcrush_back_fill_completed = False
 
         self.latest_prices: Dict[str, float] = {}
         for p in pairs:
@@ -480,10 +458,10 @@ class HybridApp:
     def aggregator_cycle_all_coins(self):
         """
         The aggregator cycle:
-         1) Update local lunarcrush_data (NEW).
-         2) fetch ledger => store => read ZUSD balance
-         3) build aggregator_list => AIStrategy => multi-coin GPT
-         4) GPT => create pending trades if needed
+         1) fetch ledger => store => read ZUSD balance
+         2) build aggregator_list => AIStrategy => multi-coin GPT
+         3) GPT => create pending trades if needed
+        (We have removed time-series population from here.)
         """
         zero_count = sum(1 for p in self.pairs if self.latest_prices[p] == 0.0)
         if zero_count > 0:
@@ -491,11 +469,9 @@ class HybridApp:
             return
 
         # 1) Update LunarCrush data
-        # IMPORTANT: This step takes several minutes, so we do it first.
         self.update_lunarcrush_data()
 
         logger.info("[Aggregator] aggregator_cycle_all_coins => Checking ledger for ZUSD balance...")
-
         fetch_and_store_kraken_ledger(
             api_key=self.kraken_api_key,
             api_secret=self.kraken_api_secret,
@@ -535,12 +511,8 @@ class HybridApp:
         """
         try:
             fetcher = LunarCrushFetcher(db_file=DB_FILE)
-            ## snapshot data for top 100 coins or filtered
             fetcher.fetch_snapshot_data_filtered(limit=100)
-            # Optionally fetch time-series for some or all coins
-            fetcher.fetch_time_series_for_tracked_coins(bucket="hour", interval="1w")
-            # Prevent rate limiting issue
-            # TODO: clean-up, and don't leave hard-coded waits
+            ## snapshot data for top 100 coins or filtered
             logger.info("[Aggregator] Successfully updated lunarcrush_data from LunarCrush API.")
         except Exception as e:
             logger.exception(f"[Aggregator] Error updating lunarcrush_data => {e}")
@@ -580,7 +552,7 @@ class HybridApp:
         try:
             c = conn.cursor()
 
-            # 1) aggregator_summaries => aggregator fields
+            # aggregator_summaries => aggregator fields
             c.execute("""
                 SELECT
                     price_bucket,
@@ -598,7 +570,7 @@ class HybridApp:
             """, (symbol,))
             row_summ = c.fetchone()
 
-            # 2) lunarcrush_data => the latest price
+            # lunarcrush_data => the latest price
             c.execute("""
                 SELECT 
                     price,
@@ -625,7 +597,6 @@ class HybridApp:
                 pct_7d = row_price.get("percent_change_7d", "Not Available")
                 pct_30d = row_price.get("percent_change_30d", "Not Available")
 
-                # Build aggregator_text if aggregator_summaries row found
                 if row_summ:
                     (
                         price_bucket,
@@ -637,29 +608,30 @@ class HybridApp:
                         dominance_bucket,
                         sentiment_label
                     ) = row_summ
+
                     aggregator_text = (
-                        f"[{symbol}]\n"
-                        f"\tprice = {last_price:.2f}\n"
-                        f"\tprice_bucket={price_bucket}\n"
-                        f"\tvolatility = {volatility}\n"
-                        f"\tvolume_24h = {volume_24h:.2%}\n"
-                        f"\tpercent_change_1h = {pct_1h:.2%}\n"
-                        f"\tpercent_change_24h = {pct_24h:.2%}\n"
-                        f"\tpercent_change_7d = {pct_7d:.2%}\n"
-                        f"\tpercent_change_30d = {pct_30d:.2%}\n"
-                        f"\tgalaxy_score={galaxy_score} (previous_value = {galaxy_score_previous})\n"
-                        f"\talt_rank={alt_rank} (previous_value = {alt_rank_previous})\n"
-                        f"\tmarket_dominance = {market_dominance:.2%} => {str(dominance_bucket).upper()}\n"
-                        f"\tsocial_sentiment = {sentiment}\n"
-                        f"\tsentiment_label = {str(sentiment_label).upper()}\n"
+                            f"[{symbol}]\n"
+                            f"\tprice = {last_price:.2f}\n"
+                            f"\tprice_bucket={price_bucket}\n"
+                            f"\tvolatility = {volatility}\n"
+                            f"\tvolume_24h = {volume_24h:.2%}\n"
+                            f"\tpercent_change_1h = {pct_1h:.2%}\n"
+                            f"\tpercent_change_24h = {pct_24h:.2%}\n"
+                            f"\tpercent_change_7d = {pct_7d:.2%}\n"
+                            f"\tpercent_change_30d = {pct_30d:.2%}\n"
+                            f"\tgalaxy_score={galaxy_score} (previous_value = {galaxy_score_previous})\n"
+                            f"\talt_rank={alt_rank} (previous_value = {alt_rank_previous})\n"
+                            f"\tmarket_dominance = {market_dominance:.2%} => {str(dominance_bucket).upper()}\n"
+                            f"\tsocial_sentiment = {sentiment}\n"
+                            f"\tsentiment_label = {str(sentiment_label).upper()}\n"
                     )
             else:
                 aggregator_text = (
-                    f"No aggregator_summaries row for symbol={symbol}; using last_price={last_price:.2f}"
+                    f"No aggregator_summaries row for symbol={symbol}; last_price={last_price:.2f}"
                 )
 
         except Exception as e:
-            logger.exception(f"[HybridApp] Error loading aggregator for symbol={symbol}: {e}")
+            logger.exception(f"[HybridApp] Error loading aggregator for {symbol}: {e}")
             aggregator_text = f"Error retrieving aggregator data: {e}"
         finally:
             conn.close()
@@ -732,24 +704,23 @@ class HybridApp:
 def main():
     """
     Main entry point:
-      1) Reads config.yaml for pairs, intervals, GPT usage, etc.
+      1) Reads config from config_loader.py for pairs, intervals, GPT usage, etc.
       2) Creates AIStrategy => multi-coin GPT approach
-      3) Creates a HybridApp aggregator => calls aggregator_cycle_all_coins at intervals
-      4) Subscribes to KrakenPublicWSClient => on_ticker => aggregator cycle
-      5) If a valid WS token => also subscribe to private feed => place real orders
+      3) On startup, explicitly updates DB tables, including:
+         - fetching lunarcrush snapshot data for configured symbols
+         - backfilling timeseries data for those symbols
+         - storing kraken asset pairs for those symbols
+      4) Creates a HybridApp aggregator => calls aggregator_cycle_all_coins at intervals
+      5) Subscribes to KrakenPublicWSClient => on_ticker => aggregator cycle
+      6) If a valid WS token => also subscribe to private feed => place real orders
     """
     logging.config.dictConfig(LOG_CONFIG)
 
-    CONFIG_FILE = "config.yaml"
-    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-
-    ENABLE_TRAINING = config.get("enable_training", True)
-    ENABLE_GPT = config.get("enable_gpt_integration", True)
-    TRADED_PAIRS = config.get("traded_pairs", [])
-    AGG_INTERVAL = config.get("trade_interval_seconds", 300)
-
-    risk_controls = config.get("risk_controls", {
+    ENABLE_TRAINING = ConfigLoader.get_value("enable_training", True)
+    ENABLE_GPT = ConfigLoader.get_value("enable_gpt_integration", True)
+    TRADED_PAIRS = ConfigLoader.get_traded_pairs()
+    AGG_INTERVAL = ConfigLoader.get_value("trade_interval_seconds", 300)
+    risk_controls = ConfigLoader.get_value("risk_controls", {
         "initial_spending_account": 50.0,
         "purchase_upper_limit_percent": 75.0,
         "minimum_buy_amount": 8.0,
@@ -763,17 +734,37 @@ def main():
     # 1) init DB => includes new pending_trades, etc.
     init_db()
 
-    asset_pairs = ConfigLoader.get_traded_pairs()
+    # 2) On startup => fetch Kraken public asset pairs for the configured pairs
+    logger.info("[Main] Fetching Kraken public asset pairs at startup...")
     fetch_and_store_kraken_public_asset_pairs(
-        pair_list=asset_pairs,
-        info="info"
+        info="info",
+        country_code="US:MI"
     )
 
-    # 2) Optional training
+    # 3) On startup => update LunarCrush data *and also* backfill timeseries for configured pairs
+    logger.info("[Main] Updating local lunarcrush_data + backfilling timeseries for configured symbols...")
+    try:
+        fetcher = LunarCrushFetcher(db_file=DB_FILE)
+        # Snapshot data
+        fetcher.fetch_snapshot_data_filtered(limit=100)
+
+        # Backfill timeseries for each symbol in traded_pairs => e.g. 6 months
+        coin_ids = [pair.split("/")[0].upper() for pair in TRADED_PAIRS]
+        fetcher.backfill_coins(
+            coin_ids=coin_ids,
+            months=6,          # adjust as needed
+            bucket="hour",
+            interval="1w"
+        )
+        logger.info("[Main] Successfully updated lunarcrush_data and backfilled timeseries.")
+    except Exception as e:
+        logger.exception(f"[Main] Error updating or backfilling lunarcrush => {e}")
+
+    # 4) Optional training
     if ENABLE_TRAINING:
         logger.info("[Main] Potential training step here. Omitted for brevity...")
 
-    # 3) create AIStrategy => multi-coin GPT approach
+    # 5) create AIStrategy => multi-coin GPT approach
     ai_strategy = AIStrategy(
         pairs=TRADED_PAIRS,
         use_openai=ENABLE_GPT,
@@ -788,14 +779,14 @@ def main():
     )
     logger.info(f"[Main] AIStrategy => multi-coin GPT => pairs={TRADED_PAIRS}, GPT={ENABLE_GPT}")
 
-    # 4) get private token => build private feed if success
+    # 6) get private token => build private feed if success
     token_json = get_ws_token(KRAKEN_API_KEY, KRAKEN_API_SECRET)
     token_str = None
     if token_json and "result" in token_json and "token" in token_json["result"]:
         token_str = token_json["result"]["token"]
         logger.info(f"[Main] Got private WS token => {token_str[:10]}...")
 
-    # 5) aggregator with multi-coin approach + ledger calls
+    # 7) aggregator with multi-coin approach + ledger calls
     aggregator_app = HybridApp(
         pairs=TRADED_PAIRS,
         strategy=ai_strategy,
@@ -839,7 +830,6 @@ def main():
         if priv_client:
             priv_client.stop()
         logger.info("[Main] aggregator halted.")
-
 
 if __name__ == "__main__":
     main()
