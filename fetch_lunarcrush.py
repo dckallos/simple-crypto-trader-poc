@@ -27,7 +27,7 @@ import requests
 import sqlite3
 import argparse
 import json
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 
 from dotenv import load_dotenv
 
@@ -142,7 +142,8 @@ class LunarCrushFetcher:
                 posts_active REAL,
                 posts_created REAL,
                 interactions REAL,
-                social_dominance REAL
+                social_dominance REAL,
+                UNIQUE(coin_id, timestamp) ON CONFLICT REPLACE
             )
             """)
 
@@ -385,71 +386,192 @@ class LunarCrushFetcher:
         else:
             logger.error(f"[TIMESERIES] all attempts failed => coin_id={coin_id}")
 
-    def _store_timeseries_records(self, coin_id: str, records: List[dict]):
+    # def _store_timeseries_records(self, coin_id: str, records: List[dict]):
+    #     """
+    #     Insert (or upsert) each row into 'lunarcrush_timeseries', with columns
+    #     such as market_dominance, circulating_supply, contributors_active, etc.
+    #     """
+    #     if not records:
+    #         return
+    #
+    #     conn=sqlite3.connect(self.db_file)
+    #     c = conn.cursor()
+    #     inserted=0
+    #
+    #     for row in records:
+    #         ts         = row.get("time", 0)
+    #         open_p     = row.get("open", 0.0)
+    #         close_p    = row.get("close", 0.0)
+    #         high_p     = row.get("high", 0.0)
+    #         low_p      = row.get("low", 0.0)
+    #         vol24      = row.get("volume_24h", 0.0)
+    #         mcap       = row.get("market_cap", 0.0)
+    #         mk_dom     = row.get("market_dominance", 0.0)
+    #         circ_sup   = row.get("circulating_supply", 0.0)
+    #         senti      = row.get("sentiment", 0.0)
+    #         spam       = row.get("spam", 0.0)
+    #         gal_s      = row.get("galaxy_score", 0.0)
+    #         volty      = row.get("volatility", 0.0)
+    #         alt_r      = row.get("alt_rank", 999999)
+    #         contrib_act= row.get("contributors_active", 0.0)
+    #         contrib_cre= row.get("contributors_created", 0.0)
+    #         posts_act  = row.get("posts_active", 0.0)
+    #         posts_cre  = row.get("posts_created", 0.0)
+    #         inter      = row.get("interactions", 0.0)
+    #         soc_dom    = row.get("social_dominance", 0.0)
+    #
+    #         # Insert or replace
+    #         c.execute("""
+    #           INSERT OR REPLACE INTO lunarcrush_timeseries (
+    #             id, coin_id, timestamp,
+    #             open_price, close_price, high_price, low_price,
+    #             volume_24h, market_cap, market_dominance, circulating_supply,
+    #             sentiment, spam, galaxy_score, volatility, alt_rank,
+    #             contributors_active, contributors_created, posts_active, posts_created,
+    #             interactions, social_dominance
+    #           )
+    #           VALUES (
+    #             NULL, ?, ?,
+    #             ?, ?, ?, ?,
+    #             ?, ?, ?, ?,
+    #             ?, ?, ?, ?, ?,
+    #             ?, ?, ?, ?,
+    #             ?, ?
+    #           )
+    #         """, [
+    #             coin_id, ts,
+    #             open_p, close_p, high_p, low_p,
+    #             vol24, mcap, mk_dom, circ_sup,
+    #             senti, spam, gal_s, volty, alt_r,
+    #             contrib_act, contrib_cre, posts_act, posts_cre,
+    #             inter, soc_dom
+    #         ])
+    #         inserted+=1
+    #
+    #     conn.commit()
+    #     conn.close()
+    #     logger.info(f"[TIMESERIES] coin_id={coin_id} => upserted {inserted} rows.")
+
+    def _store_timeseries_records(self, coin_id: str, records: List[Dict]) -> None:
         """
-        Insert (or upsert) each row into 'lunarcrush_timeseries', with columns
-        such as market_dominance, circulating_supply, contributors_active, etc.
+        Insert or update each row into 'lunarcrush_timeseries', keyed by (coin_id, timestamp).
+        If a row with the same coin_id + timestamp already exists, update all columns.
+        If it doesn't exist, insert a new row.
         """
         if not records:
             return
 
-        conn=sqlite3.connect(self.db_file)
+        conn = sqlite3.connect(self.db_file)
         c = conn.cursor()
-        inserted=0
+        inserted = 0
 
+        # Using an ON CONFLICT clause that updates each field on conflict(coin_id, timestamp).
+        # This requires a unique index on (coin_id, timestamp) in your table definition.
+        sql = """
+        INSERT INTO lunarcrush_timeseries (
+            coin_id,
+            timestamp,
+            open_price,
+            close_price,
+            high_price,
+            low_price,
+            volume_24h,
+            market_cap,
+            market_dominance,
+            circulating_supply,
+            sentiment,
+            spam,
+            galaxy_score,
+            volatility,
+            alt_rank,
+            contributors_active,
+            contributors_created,
+            posts_active,
+            posts_created,
+            interactions,
+            social_dominance
+        )
+        VALUES (
+            :coin_id,
+            :timestamp,
+            :open_price,
+            :close_price,
+            :high_price,
+            :low_price,
+            :volume_24h,
+            :market_cap,
+            :market_dominance,
+            :circulating_supply,
+            :sentiment,
+            :spam,
+            :galaxy_score,
+            :volatility,
+            :alt_rank,
+            :contributors_active,
+            :contributors_created,
+            :posts_active,
+            :posts_created,
+            :interactions,
+            :social_dominance
+        )
+        ON CONFLICT(coin_id, timestamp)
+        DO UPDATE SET
+            open_price         = excluded.open_price,
+            close_price        = excluded.close_price,
+            high_price         = excluded.high_price,
+            low_price          = excluded.low_price,
+            volume_24h         = excluded.volume_24h,
+            market_cap         = excluded.market_cap,
+            market_dominance   = excluded.market_dominance,
+            circulating_supply = excluded.circulating_supply,
+            sentiment          = excluded.sentiment,
+            spam               = excluded.spam,
+            galaxy_score       = excluded.galaxy_score,
+            volatility         = excluded.volatility,
+            alt_rank           = excluded.alt_rank,
+            contributors_active  = excluded.contributors_active,
+            contributors_created = excluded.contributors_created,
+            posts_active       = excluded.posts_active,
+            posts_created      = excluded.posts_created,
+            interactions       = excluded.interactions,
+            social_dominance   = excluded.social_dominance
+        """
+
+        # Prepare a list of dictionaries, one per row, to use with executemany.
+        data_to_insert = []
         for row in records:
-            ts         = row.get("time", 0)
-            open_p     = row.get("open", 0.0)
-            close_p    = row.get("close", 0.0)
-            high_p     = row.get("high", 0.0)
-            low_p      = row.get("low", 0.0)
-            vol24      = row.get("volume_24h", 0.0)
-            mcap       = row.get("market_cap", 0.0)
-            mk_dom     = row.get("market_dominance", 0.0)
-            circ_sup   = row.get("circulating_supply", 0.0)
-            senti      = row.get("sentiment", 0.0)
-            spam       = row.get("spam", 0.0)
-            gal_s      = row.get("galaxy_score", 0.0)
-            volty      = row.get("volatility", 0.0)
-            alt_r      = row.get("alt_rank", 999999)
-            contrib_act= row.get("contributors_active", 0.0)
-            contrib_cre= row.get("contributors_created", 0.0)
-            posts_act  = row.get("posts_active", 0.0)
-            posts_cre  = row.get("posts_created", 0.0)
-            inter      = row.get("interactions", 0.0)
-            soc_dom    = row.get("social_dominance", 0.0)
+            data_to_insert.append({
+                "coin_id": coin_id,
+                "timestamp": row.get("time", 0),
+                "open_price": row.get("open", 0.0),
+                "close_price": row.get("close", 0.0),
+                "high_price": row.get("high", 0.0),
+                "low_price": row.get("low", 0.0),
+                "volume_24h": row.get("volume_24h", 0.0),
+                "market_cap": row.get("market_cap", 0.0),
+                "market_dominance": row.get("market_dominance", 0.0),
+                "circulating_supply": row.get("circulating_supply", 0.0),
+                "sentiment": row.get("sentiment", 0.0),
+                "spam": row.get("spam", 0.0),
+                "galaxy_score": row.get("galaxy_score", 0.0),
+                "volatility": row.get("volatility", 0.0),
+                "alt_rank": row.get("alt_rank", 999999),
+                "contributors_active": row.get("contributors_active", 0.0),
+                "contributors_created": row.get("contributors_created", 0.0),
+                "posts_active": row.get("posts_active", 0.0),
+                "posts_created": row.get("posts_created", 0.0),
+                "interactions": row.get("interactions", 0.0),
+                "social_dominance": row.get("social_dominance", 0.0)
+            })
 
-            # Insert or replace
-            c.execute("""
-              INSERT OR REPLACE INTO lunarcrush_timeseries (
-                id, coin_id, timestamp,
-                open_price, close_price, high_price, low_price,
-                volume_24h, market_cap, market_dominance, circulating_supply,
-                sentiment, spam, galaxy_score, volatility, alt_rank,
-                contributors_active, contributors_created, posts_active, posts_created,
-                interactions, social_dominance
-              )
-              VALUES (
-                NULL, ?, ?,
-                ?, ?, ?, ?,
-                ?, ?, ?, ?,
-                ?, ?, ?, ?, ?,
-                ?, ?, ?, ?,
-                ?, ?
-              )
-            """, [
-                coin_id, ts,
-                open_p, close_p, high_p, low_p,
-                vol24, mcap, mk_dom, circ_sup,
-                senti, spam, gal_s, volty, alt_r,
-                contrib_act, contrib_cre, posts_act, posts_cre,
-                inter, soc_dom
-            ])
-            inserted+=1
+        # Bulk upsert in a single pass
+        c.executemany(sql, data_to_insert)
+        inserted = len(data_to_insert)
 
         conn.commit()
         conn.close()
-        logger.info(f"[TIMESERIES] coin_id={coin_id} => upserted {inserted} rows.")
+
+        logger.info(f"[TIMESERIES] coin_id={coin_id} => upserted/updated {inserted} rows.")
 
     def _load_symbols_from_db(self) -> List[str]:
         out=[]
