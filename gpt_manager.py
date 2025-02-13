@@ -100,6 +100,16 @@ def build_aggregator_prompt(
     return "\n".join(lines)
 
 
+def build_aggregator_prompt_simple(aggregator_lines: List[Dict[str, Any]]) -> str:
+    if not aggregator_lines:
+        return "No aggregator data."
+    lines = []
+    for i, row in enumerate(aggregator_lines, start=1):
+        output_aggregator_data = row.get("aggregator_data", "No aggregator data.")
+        lines.append(output_aggregator_data)
+    return "\n".join(lines)
+
+
 class GPTManager:
     """
     GPTManager:
@@ -214,7 +224,7 @@ class GPTManager:
         # logging
         logger.info("[GPT-Single] aggregator_text => \n%s", aggregator_text)
         if self.log_gpt_calls:
-            self._save_prompt_files(user_prompt, request_dict)
+            self._save_prompt_files(user_prompt, system_instructions, request_dict)
 
         try:
             response = self.client.chat.completions.create(**request_dict)
@@ -244,39 +254,35 @@ class GPTManager:
         max_trades: int,
         risk_controls: Dict[str, Any],
         reflection_enabled: bool = True,
-        current_balance: float = 0.0
+        current_balance: float = 0.0,
+        current_trade_balance:  dict[str, float] = None
     ) -> Dict[str, Any]:
         """
         Multi-coin approach => aggregator_lines is a list of dicts with the relevant
         aggregator changes for each pair. We'll build a textual block from that,
         then ask for final JSON => { "decisions": [...], "rationale": "..."}.
-
-        aggregator_lines example:
-          [
-            { "pair":"ETH/USD","price":2710.98,"price_change":2.3, ... },
-            { "pair":"BTC/USD","price":30001.2,"price_change":-1.2, ... }
-          ]
         """
         truncated_history = trade_history[-max_trades:] if trade_history else []
-        trades_summ = "\n".join(truncated_history) if truncated_history else "No trades so far."
+        trades_summ = "\n".join(truncated_history) if truncated_history else "No active investments made from USD."
         openpos_summ = "\n".join(open_positions) if open_positions else "No open positions."
 
         # build aggregator text with changes
-        aggregator_text = build_aggregator_prompt(aggregator_lines)
+        aggregator_text = build_aggregator_prompt_simple(aggregator_lines)
 
         system_instructions = (
-            "You are a specialized multi-coin crypto trading assistant. We trade in US dollars, "
-            "and we aim to realize profit within ~24 hours if possible. Our performance is measured "
-            "in net USD at the end of the day. We prefer to close profitable positions quickly rather "
-            "than holding them beyond one day, unless there's a strong reason to hold. Selling coins increases "
-            "the available USD amount, which can be used on your next cycle. Return final JSON => {\n"
+
+            "You are a cryptocurrency trading analyst. You have expertise in reading price patterns, "
+            "social media sentiment, and volume trends to make short-term (day-trading) recommendations. "
+            "Instructions: \n"
+            "\t1. First, work out your own reasoning step-by-step enclosed in triple quotes (\"\"\"), "
+            "but do not reveal these steps directly to the user.\n"
+            "\t2. Return final JSON => {\n"
             " \"decisions\":[{\"pair\":\"...\",\"action\":\"BUY|SELL|HOLD\",\"size\":float},...],\n"
             " \"rationale\":\"...\"\n"
             "}\n\n"
             "Rationale must be ≤300 chars, numeric or technical justifications.\n"
-            "If reflection_enabled, chain-of-thought can be in triple backticks.\n\n"
             "EXAMPLE:\n"
-            "Chain-of-thought => <hidden>\n"
+            "Work out your own reasoning => <hidden>\n"
             "Final => {\n"
             "  \"decisions\":[\n"
             "    {\"pair\":\"ETH/USD\",\"action\":\"HOLD\",\"size\":0.0},\n"
@@ -288,14 +294,17 @@ class GPTManager:
         )
 
         user_prompt = (
-            f"AVAILABLE USD BALANCE: {current_balance:.2f}\n\n"
-            f"[REFLECTION_ENABLED={reflection_enabled}]\n\n"
-            f"AGGREGATOR DATA (current + changes):\n{aggregator_text}\n\n"
-            f"OPEN POSITIONS:\n{openpos_summ}\n\n"
-            f"RECENT TRADES:\n{trades_summ}\n\n"
-            f"RISK CONTROLS:\n{risk_controls}\n\n"
-            "RETURN final JSON => {\"decisions\":[...],\"rationale\":\"...\"} with rationale ≤300 chars.\n"
-            "If reflection is on, chain-of-thought in triple backticks first."
+            "Analyze the following LunarCrush data and market indicators, "
+            "then provide your buy/sell/hold recommendations.\n\n"
+            "---BEGIN ACCOUNT DATA---\n\n"
+            f"AVAILABLE USD BALANCE FOR TRADES: {current_balance:.2f}\n\n"
+            f"CURRENT TRADE BALANCES: \n{json.dumps(current_trade_balance, indent=4)}\n\n"
+            f"RECENTLY ACTIVE INVESTMENTS:\n{trades_summ}\n\n"
+            "---END ACCOUNT DATA---\n\n"
+            "---BEGIN COIN DATA---\n\n"
+            f"{aggregator_text}\n\n"
+            "---END COIN DATA---\n\n"
+            "RETURN final JSON => {\"decisions\":[...],\"rationale\":\"...\"} with rationale ≤300 chars."
         )
 
         messages = [
@@ -311,7 +320,7 @@ class GPTManager:
 
         logger.info("[GPT-Multi] aggregator_lines => %s", aggregator_lines)
         if self.log_gpt_calls:
-            self._save_prompt_files(user_prompt, request_dict)
+            self._save_prompt_files(user_prompt, system_instructions, request_dict)
 
         try:
             response = self.client.chat.completions.create(**request_dict)
@@ -403,7 +412,9 @@ class GPTManager:
     # --------------------------------------------------------------------------
     # LOGGING
     # --------------------------------------------------------------------------
-    def _save_prompt_files(self, user_prompt: str, request_dict: Dict[str, Any]) -> None:
+    def _save_prompt_files(
+            self, user_prompt: str, system_instructions: str, request_dict: Dict[str, Any]
+    ) -> None:
         """Saves user prompt and request dict to logs/{timestamp} for debugging."""
         timestamp_dir = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
         log_dir = os.path.join("logs", timestamp_dir)
@@ -412,6 +423,10 @@ class GPTManager:
         prompt_path = os.path.join(log_dir, "prompt.txt")
         with open(prompt_path, "w", encoding="utf-8") as f_prompt:
             f_prompt.write(user_prompt)
+
+        sys_path = os.path.join(log_dir, "system_instructions.txt")
+        with open(sys_path, "w", encoding="utf-8") as f_sys:
+            f_sys.write(system_instructions)
 
         req_path = os.path.join(log_dir, "request_body.txt")
         with open(req_path, "w", encoding="utf-8") as f_req:
