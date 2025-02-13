@@ -28,6 +28,7 @@ import time
 import logging
 import os
 from typing import List, Dict, Any
+from config_loader import ConfigLoader
 
 logger = logging.getLogger(__name__)
 
@@ -590,7 +591,7 @@ def store_kraken_asset_pair_info(pair_name: str, pair_info: Dict[str, Any]):
                 margin_call, margin_stop, ordermin, costmin, tick_size, status,
                 long_position_limit, short_position_limit, last_updated
             )
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             pair_name,
             altname,
@@ -625,3 +626,6 @@ def store_kraken_asset_pair_info(pair_name: str, pair_info: Dict[str, Any]):
         logger.exception(f"Error storing asset pair info for {pair_name}: {e}")
     finally:
         conn.close()
+
+if __name__ == "__main__":
+    init_db()
