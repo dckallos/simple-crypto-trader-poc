@@ -10,22 +10,20 @@ Enhanced AIStrategy with:
 2) Daily drawdown, risk constraints, sub-position logic via RiskManagerDB.
 3) Loads aggregator data from aggregator_summaries (and possibly other tables) to produce
    aggregator text **including percentage/absolute changes** from an older timestamp (e.g. 1 hour ago).
-4) No conversation context is used. All references to historical GPT conversation have been removed.
-5) On GPT decisions, we record them in 'ai_decisions' and create a row in the new
-   'pending_trades' table if the action is BUY or SELL. (No longer creating pending rows in 'trades'.)
+4) On GPT decisions, we record them in 'ai_decisions' and create a row in the new
+   'pending_trades' table if the action is BUY or SELL. The actual fill is handled by
+   the private WebSocket feed or your own logic.
+
+NEW INTEGRATION:
+   - We optionally send live orders to Kraken through 'private_ws_client.send_order()'.
+   - This is controlled by 'self.place_live_orders' and requires passing a private_ws_client
+     in AIStrategy's constructor.
 
 Basic Flow:
     - Single pair => call predict(market_data)
     - Multi pairs => call predict_multi(pairs_data)
     - Advanced => predict_multi_coins(...) for one-shot multi-coin GPT
 
-Now that we've introduced the 'pending_trades' table in db.py, references to
-create_pending_trade(...) call the new function that stores ephemeral trades
-( status='pending' ), instead of the old approach that wrote to 'trades'.
-
-Instead of storing final trades in the DB at GPT decision time, we now create
-a "pending" trade entry in 'pending_trades'. The actual fills or rejections
-happen later (see ws_data_feed.py or other back-end logic).
 """
 
 import logging
@@ -39,9 +37,7 @@ from dotenv import load_dotenv
 
 from db import (
     DB_FILE,
-    load_gpt_context_from_db,     # existing import for GPT context if needed
-    save_gpt_context_to_db,       # existing import for GPT context if needed
-    create_pending_trade          # CHANGED: now references the new function that writes to pending_trades
+    create_pending_trade
 )
 from risk_manager import RiskManagerDB
 from gpt_manager import GPTManager
@@ -53,18 +49,14 @@ logging.basicConfig(level=logging.DEBUG)
 class AIStrategy:
     """
     AIStrategy: A flexible class that decides trades for one or multiple pairs,
-    using GPT or fallback logic. We now remove conversation context entirely,
-    focusing on aggregator data that includes per-field changes. The GPT logic
-    in `gpt_manager.py` no longer references conversation context.
+    using GPT or fallback logic. We integrate RiskManagerDB for sub-position logic,
+    daily drawdown checks, and store final decisions in 'ai_decisions'. GPT-suggested
+    trades are only placed as 'pending' in 'pending_trades' until fills are confirmed
+    by Kraken.
 
-    Flow:
-      - single => predict(...)
-      - multi => predict_multi(...)
-      - advanced => predict_multi_coins(...)
-
-    We integrate RiskManagerDB for sub-position logic, daily drawdown checks,
-    and store final decisions in 'ai_decisions'. GPT-suggested trades are only
-    placed as 'pending' in 'pending_trades' until fills are confirmed by Kraken.
+    If you want to actually place the orders on Kraken, set:
+       place_live_orders=True
+    and pass private_ws_client=<KrakenPrivateWSClient> in the constructor.
     """
 
     def __init__(
@@ -79,7 +71,8 @@ class AIStrategy:
         gpt_model: str = "o1-mini",
         gpt_temperature: float = 1.0,
         gpt_max_tokens: int = 2000,
-        **gpt_client_options
+        private_ws_client=None,
+        place_live_orders: bool = False
     ):
         """
         :param pairs: e.g. ["ETH/USD","XBT/USD"] if you want a default set
@@ -92,7 +85,8 @@ class AIStrategy:
         :param gpt_model: override GPT model name after GPTManager creation
         :param gpt_temperature: sampling temperature
         :param gpt_max_tokens: max GPT tokens
-        :param gpt_client_options: for potential future expansions
+        :param private_ws_client: If provided, an instance of KrakenPrivateWSClient
+        :param place_live_orders: If True, calls private_ws_client.send_order(...) after creating pending trades
         """
         self.pairs = pairs if pairs else []
         self.use_openai = use_openai
@@ -122,7 +116,9 @@ class AIStrategy:
         )
         self.risk_manager_db.initialize()
 
-        # GPT conversation context is no longer used => no load_gpt_context_from_db() calls here
+        # NEW: store references to private WS and a toggle for placing real orders
+        self.private_ws_client = private_ws_client
+        self.place_live_orders = place_live_orders
 
         # ensure ai_decisions table
         self._create_ai_decisions_table()
@@ -184,15 +180,17 @@ class AIStrategy:
 
         rationale = f"GPT single => final={final_signal}, size={final_size}, aggregator=({aggregator_text})"
         if final_signal in ("BUY", "SELL") and final_size > 0:
-            # CHANGED: create_pending_trade now references the new function in db.py that writes to pending_trades
-            create_pending_trade(
+            # CHANGED: we create a pending trade AND optionally place a real order
+            pending_id = create_pending_trade(
                 side=final_signal,
                 requested_qty=final_size,
                 pair=pair,
                 reason="GPT_SINGLE_DECISION"
             )
-        self._store_decision(pair, final_signal, final_size, rationale)
+            # If place_live_orders is True, call private_ws_client
+            self._maybe_place_kraken_order(pair, final_signal, final_size)
 
+        self._store_decision(pair, final_signal, final_size, rationale)
         return (final_signal, final_size)
 
     def _fallback_logic(self, pair: str, market_data: Dict[str, Any]) -> Tuple[str, float]:
@@ -206,13 +204,13 @@ class AIStrategy:
             sig, sz = self.risk_manager_db.adjust_trade(sig, sz, pair, px)
             rationale = f"[FALLBACK] => px={px} <20000 => {sig} {sz}"
             if sig == "BUY" and sz > 0:
-                # CHANGED: switched to the new pending_trades approach
-                create_pending_trade(
+                pending_id = create_pending_trade(
                     side=sig,
                     requested_qty=sz,
                     pair=pair,
                     reason="FALLBACK_SINGLE"
                 )
+                self._maybe_place_kraken_order(pair, sig, sz)
             self._store_decision(pair, sig, sz, rationale)
             return (sig, sz)
         else:
@@ -266,12 +264,12 @@ class AIStrategy:
         max_trades: int,
         input_open_positions: List[str],
         current_balance: float = 0.0,
-        current_trade_balance:  dict[str, float] = None
+        current_trade_balance: dict[str, float] = None
     ) -> Dict[str, Tuple[str, float]]:
         """
         The advanced approach => single GPT call for multiple coins => returns
         final decisions => store them in 'ai_decisions' and optionally create
-        pending trades if action=BUY/SELL.
+        pending trades if action=BUY/SELL + place real orders if configured.
 
         aggregator_list => each item => {
            "pair":"ETH/USD","price":1850.0,
@@ -297,7 +295,6 @@ class AIStrategy:
             return results_set
 
         try:
-            # aggregator_data presumably includes changes from aggregator_summaries or other logic
             multi_resp = self.gpt_manager.generate_multi_trade_decision(
                 aggregator_lines=input_aggregator_list,
                 open_positions=input_open_positions,
@@ -327,7 +324,6 @@ class AIStrategy:
             action_raw = dec.get("action", "HOLD").upper()
             size_suggested = float(dec.get("size", 0.0))
 
-            # find current price
             found_item = next((x for x in input_aggregator_list if x.get("pair") == pair), None)
             px = found_item.get("price", 0.0) if found_item else 0.0
 
@@ -342,13 +338,14 @@ class AIStrategy:
             rationale = f"GPT multi => {pair} => final={final_signal}, size={final_size}"
 
             if final_signal in ("BUY", "SELL") and final_size > 0:
-                # CHANGED: use create_pending_trade from the new approach
-                create_pending_trade(
+                pending_id = create_pending_trade(
                     side=final_signal,
                     requested_qty=final_size,
                     pair=pair,
                     reason="GPT_MULTI_DECISION"
                 )
+                # If live orders are enabled, send to Kraken
+                self._maybe_place_kraken_order(pair, final_signal, final_size)
 
             self._store_decision(pair, final_signal, final_size, rationale)
             results_set[pair] = (final_signal, final_size)
@@ -361,20 +358,21 @@ class AIStrategy:
     def _build_aggregator_text_changes(self, pair: str) -> str:
         """
         Example function to return aggregator data with changes since the last hour.
-        This is a skeleton for aggregator_summaries. You can expand for actual numeric
-        fields, e.g. price or volume changes, or other aggregator metrics.
+        This is a skeleton for aggregator_summaries. You can expand for numeric fields.
         """
-        symbol = pair.split("/")[0].upper()
+        import time
+        import sqlite3
         now_ts = int(time.time())
         one_hour_ago = now_ts - 3600
 
+        import db_lookup
+        symbol = db_lookup.get_base_asset(pair)
         current_data = {"symbol": symbol, "galaxy_score": None, "alt_rank": None, "sentiment": None}
         old_data = {"symbol": symbol, "galaxy_score": None, "alt_rank": None, "sentiment": None}
 
         conn = sqlite3.connect(DB_FILE)
         try:
             c = conn.cursor()
-            # current aggregator_summaries => last row for symbol
             c.execute("""
             SELECT timestamp, galaxy_score, alt_rank, sentiment_label
             FROM aggregator_summaries
@@ -389,7 +387,6 @@ class AIStrategy:
                 current_data["alt_rank"] = float(ar) if ar else None
                 current_data["sentiment"] = slabel or "neutral"
 
-            # old aggregator_summaries => about an hour ago
             c.execute("""
             SELECT timestamp, galaxy_score, alt_rank, sentiment_label
             FROM aggregator_summaries
@@ -427,7 +424,7 @@ class AIStrategy:
         aggregator_text = (
             f"Pair={pair} => {gs_str}, {ar_str}, {sent_str}\n"
             "(Note: Example aggregator changes. "
-            "You can expand to other numeric fields like price or volume if stored.)"
+            "You can expand to other numeric fields if stored.)"
         )
         return aggregator_text
 
@@ -530,72 +527,34 @@ class AIStrategy:
 
         return "\n".join(out)
 
+    # --------------------------------------------------------------------------
+    # NEW: maybe_place_kraken_order
+    # --------------------------------------------------------------------------
+    def _maybe_place_kraken_order(self, pair: str, action: str, volume: float):
+        """
+        If self.place_live_orders is True and self.private_ws_client is set,
+        call the client's send_order(...) method to place the order on Kraken.
+        We'll assume market order for now.
+        Action is "BUY"/"SELL", but Kraken expects "buy"/"sell" strings.
+        """
+        if not self.place_live_orders:
+            return
 
-# ------------------------------------------------------------------------------
-# Example usage snippet
-# ------------------------------------------------------------------------------
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+        if not self.private_ws_client:
+            logger.warning(
+                f"[AIStrategy] place_live_orders=True but no private_ws_client provided. "
+                f"Cannot place real order for pair={pair}."
+            )
+            return
 
-    strategy = AIStrategy(
-        pairs=["ETH/USD", "XBT/USD"],
-        use_openai=True,
-        max_position_size=1.0,
-        stop_loss_pct=0.05,
-        take_profit_pct=0.01,
-        max_daily_drawdown=-0.02,
-        risk_controls={
-            "initial_spending_account": 100.0,
-            "minimum_buy_amount": 10.0,
-            "purchase_upper_limit_percent": 0.1,
-        },
-        gpt_model="gpt-4o-mini",
-        gpt_temperature=0.8,
-        gpt_max_tokens=1000
-    )
-
-    # Single pair usage
-    single_data = {
-        "pair": "ETH/USD",
-        "price": 1850.0,
-    }
-    action, size = strategy.predict(single_data)
-    print(f"[SinglePair] => action={action}, size={size}")
-
-    # Multi pair usage => calls predict(...) individually
-    multi_data = [
-        {"pair": "ETH/USD", "price": 1800.0},
-        {"pair": "XBT/USD", "price": 28000.0},
-    ]
-    results = strategy.predict_multi(multi_data)
-    print("Multi-pair =>", results)
-
-    # Advanced multi => aggregator_list => single GPT call
-    aggregator_list = [
-        {
-            "pair": "ETH/USD",
-            "price": 1800.0,
-            "aggregator_data": "price=1800.0 (+2.3%), galaxy_score=64 (+1.2), alt_rank=20 (-1), sentiment=slightly_positive"
-        },
-        {
-            "pair": "XBT/USD",
-            "price": 28000.0,
-            "aggregator_data": "price=28000 (+0.1%), galaxy_score=65 (+2.0), alt_rank=15 (+3), sentiment=neutral"
-        }
-    ]
-    trade_hist = [
-        "2025-01-20 10:15 BUY ETH/USD 0.001@25000",
-        "2025-01-21 SELL ETH/USD 0.001@25500"
-    ]
-    open_positions = [
-        "ETH/USD LONG 0.002, entry=1860.0",
-        "XBT/USD SHORT 0.001, entry=29500.0"
-    ]
-    final = strategy.predict_multi_coins(
-        aggregator_list,
-        trade_hist,
-        max_trades=5,
-        input_open_positions=open_positions,
-        current_balance=1000.0
-    )
-    print("Multi coins =>", final)
+        side_for_kraken = "buy" if action.upper() == "BUY" else "sell"
+        logger.info(
+            f"[AIStrategy] Sending real order => pair={pair}, side={side_for_kraken}, volume={volume}"
+        )
+        # We'll do a basic market order
+        self.private_ws_client.send_order(
+            pair=pair,
+            side=side_for_kraken,
+            ordertype="market",
+            volume=volume
+        )
