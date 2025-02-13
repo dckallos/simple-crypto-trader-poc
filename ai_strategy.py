@@ -5,25 +5,23 @@
 """
 ai_strategy.py
 
-Enhanced AIStrategy with:
-1) GPT logic (via GPTManager) or fallback logic for single or multi-coin GPT calls.
-2) Daily drawdown, risk constraints, sub-position logic via RiskManagerDB.
-3) Loads aggregator data from aggregator_summaries (and possibly other tables) to produce
-   aggregator text **including percentage/absolute changes** from an older timestamp (e.g. 1 hour ago).
-4) On GPT decisions, we record them in 'ai_decisions' and create a row in the new
-   'pending_trades' table if the action is BUY or SELL. The actual fill is handled by
-   the private WebSocket feed or your own logic.
+AIStrategy now:
+1) Uses GPT logic (via GPTManager) or fallback logic for single/multi-coin calls.
+2) Leans on RiskManagerDB for daily drawdown checks and per-trade size clamps.
+3) Stores final decisions in 'ai_decisions'.
+4) For BUY/SELL signals, creates a row in 'pending_trades' so the private feed can fill them.
 
-NEW INTEGRATION:
-   - We optionally send live orders to Kraken through 'private_ws_client.send_order()'.
-   - This is controlled by 'self.place_live_orders' and requires passing a private_ws_client
-     in AIStrategy's constructor.
+No local sub-position logic is present. Stop-loss / take-profit is handled
+externally (e.g. risk_manager.on_price_update(...) after each price tick).
+We still call risk_manager_db.adjust_trade(...) for daily drawdown checks
+and to confirm the user’s real-time capital/balance usage is valid for this
+new trade.
 
-Basic Flow:
-    - Single pair => call predict(market_data)
-    - Multi pairs => call predict_multi(pairs_data)
-    - Advanced => predict_multi_coins(...) for one-shot multi-coin GPT
-
+If you want to place real Kraken orders automatically:
+    - set place_live_orders=True
+    - pass private_ws_client=<KrakenPrivateWSClient> in the constructor
+      so we can call private_ws_client.send_order(...) after creating a
+      pending trade.
 """
 
 import logging
@@ -48,24 +46,23 @@ logging.basicConfig(level=logging.DEBUG)
 
 class AIStrategy:
     """
-    AIStrategy: A flexible class that decides trades for one or multiple pairs,
-    using GPT or fallback logic. We integrate RiskManagerDB for sub-position logic,
-    daily drawdown checks, and store final decisions in 'ai_decisions'. GPT-suggested
-    trades are only placed as 'pending' in 'pending_trades' until fills are confirmed
-    by Kraken.
+    AIStrategy: Decides trades for one or multiple pairs,
+    using GPT or fallback logic. We rely on:
 
-    If you want to actually place the orders on Kraken, set:
-       place_live_orders=True
-    and pass private_ws_client=<KrakenPrivateWSClient> in the constructor.
+      - RiskManagerDB for daily drawdown checks (adjust_trade)
+      - 'pending_trades' for ephemeral trade states
+      - 'trades' for final fill records (inserted by the private feed)
+      - stop-loss/take-profit is triggered outside this class if needed
+
+    Constructor:
+      - place_live_orders => if True, calls private_ws_client.send_order(...)
     """
 
     def __init__(
         self,
         pairs: List[str] = None,
         use_openai: bool = False,
-        max_position_size: float = 3,
-        stop_loss_pct: float = 0.05,
-        take_profit_pct: float = 0.01,
+        max_position_size: float = 3.0,
         max_daily_drawdown: float = -0.02,
         risk_controls: Optional[Dict[str, Any]] = None,
         gpt_model: str = "o1-mini",
@@ -75,18 +72,16 @@ class AIStrategy:
         place_live_orders: bool = False
     ):
         """
-        :param pairs: e.g. ["ETH/USD","XBT/USD"] if you want a default set
-        :param use_openai: True => GPT logic is used; else fallback logic
+        :param pairs: e.g. ["ETH/USD", "XBT/USD"]
+        :param use_openai: True => GPT logic is used; else fallback
         :param max_position_size: clamp on per-trade size
-        :param stop_loss_pct: e.g. 0.05 => auto-close if -5%
-        :param take_profit_pct: e.g. 0.01 => auto-close if +1%
-        :param max_daily_drawdown: e.g. -0.02 => skip new trades if daily < -2%
-        :param risk_controls: e.g. {"minimum_buy_amount":10.0}
-        :param gpt_model: override GPT model name after GPTManager creation
-        :param gpt_temperature: sampling temperature
-        :param gpt_max_tokens: max GPT tokens
-        :param private_ws_client: If provided, an instance of KrakenPrivateWSClient
-        :param place_live_orders: If True, calls private_ws_client.send_order(...) after creating pending trades
+        :param max_daily_drawdown: e.g. -0.02 => skip new trades if daily PnL < -2%
+        :param risk_controls: optional dict with custom fields, e.g. {"minimum_buy_amount":10.0}
+        :param gpt_model: model name override
+        :param gpt_temperature: model temperature
+        :param gpt_max_tokens: model max tokens
+        :param private_ws_client: an instance of KrakenPrivateWSClient if you want auto-order
+        :param place_live_orders: if True => we call private_ws_client.send_order(...)
         """
         self.pairs = pairs if pairs else []
         self.use_openai = use_openai
@@ -106,21 +101,22 @@ class AIStrategy:
             if gpt_model:
                 self.gpt_manager.model = gpt_model
 
-        # Risk manager
+        # Risk manager (handles daily drawdown, real-time balance checks, etc.)
+        # We no longer pass stop_loss_pct or take_profit_pct.
+        # If you want them, see risk_manager.on_price_update(...) in ws_data_feed.
         self.risk_manager_db = RiskManagerDB(
             db_path=DB_FILE,
             max_position_size=max_position_size,
-            stop_loss_pct=stop_loss_pct,
-            take_profit_pct=take_profit_pct,
-            max_daily_drawdown=max_daily_drawdown
+            max_daily_drawdown=max_daily_drawdown,
+            initial_spending_account=self.risk_controls.get("initial_spending_account", 100.0)
         )
         self.risk_manager_db.initialize()
 
-        # NEW: store references to private WS and a toggle for placing real orders
+        # Option to place real Kraken orders
         self.private_ws_client = private_ws_client
         self.place_live_orders = place_live_orders
 
-        # ensure ai_decisions table
+        # Ensure ai_decisions table
         self._create_ai_decisions_table()
 
     # --------------------------------------------------------------------------
@@ -128,7 +124,9 @@ class AIStrategy:
     # --------------------------------------------------------------------------
     def predict(self, market_data: Dict[str, Any]) -> Tuple[str, float]:
         """
-        Predict for a single pair => calls GPT or fallback => returns (action,size).
+        Predict for a single pair => returns (action, size).
+        If GPT is on => use GPT, else fallback.
+        Then calls risk_manager_db.adjust_trade(...) to do daily drawdown checks.
 
         :param market_data: e.g. {"pair":"ETH/USD", "price":1850.0, ...}
         :return: (action, size)
@@ -139,9 +137,6 @@ class AIStrategy:
             rationale = f"No valid price => HOLD {pair}"
             self._store_decision(pair, "HOLD", 0.0, rationale)
             return ("HOLD", 0.0)
-
-        # forcibly check sub-position stops (daily drawdown, etc.)
-        self.risk_manager_db.check_stop_loss_take_profit(pair, current_price)
 
         if self.use_openai and self.gpt_manager:
             try:
@@ -169,50 +164,57 @@ class AIStrategy:
             trade_history=trade_history_list,
             max_trades=10,
             risk_controls=self.risk_controls,
-            open_positions=None,
+            open_positions=None,      # no local open positions
             reflection_enabled=False
         )
-        action = result.get("action", "HOLD").upper()
+        action_raw = result.get("action", "HOLD").upper()
         suggested_size = float(result.get("size", 0.0))
 
-        final_signal, final_size = self._post_validate(action, suggested_size, current_px)
-        final_signal, final_size = self.risk_manager_db.adjust_trade(final_signal, final_size, pair, current_px)
+        # Optional local check => e.g. cost < minimum_buy_amount
+        final_action, final_size = self._post_validate(action_raw, suggested_size, current_px)
+        # Pass to risk_manager => daily drawdown, real-time balance checks
+        final_action, final_size = self.risk_manager_db.adjust_trade(
+            final_action, final_size, pair, current_px, kraken_balances={}   # or pass your balances
+        )
 
-        rationale = f"GPT single => final={final_signal}, size={final_size}, aggregator=({aggregator_text})"
-        if final_signal in ("BUY", "SELL") and final_size > 0:
-            # CHANGED: we create a pending trade AND optionally place a real order
+        rationale = (f"GPT single => final={final_action}, size={final_size}, "
+                     f"aggregator=({aggregator_text})")
+        if final_action in ("BUY", "SELL") and final_size > 0:
+            # Create pending trade + optionally place a real order
             pending_id = create_pending_trade(
-                side=final_signal,
+                side=final_action,
                 requested_qty=final_size,
                 pair=pair,
                 reason="GPT_SINGLE_DECISION"
             )
-            # If place_live_orders is True, call private_ws_client
-            self._maybe_place_kraken_order(pair, final_signal, final_size, pending_id)
+            self._maybe_place_kraken_order(pair, final_action, final_size, pending_id)
 
-        self._store_decision(pair, final_signal, final_size, rationale)
-        return (final_signal, final_size)
+        self._store_decision(pair, final_action, final_size, rationale)
+        return (final_action, final_size)
 
     def _fallback_logic(self, pair: str, market_data: Dict[str, Any]) -> Tuple[str, float]:
         """
         Dummy fallback logic if GPT is off or fails:
         If price<20k => BUY => 0.0005, else HOLD.
+        Then calls risk_manager to clamp & skip if daily drawdown is triggered.
         """
         px = market_data.get("price", 0.0)
         if px < 20000:
-            sig, sz = self._post_validate("BUY", 0.0005, px)
-            sig, sz = self.risk_manager_db.adjust_trade(sig, sz, pair, px)
-            rationale = f"[FALLBACK] => px={px} <20000 => {sig} {sz}"
-            if sig == "BUY" and sz > 0:
+            action, size = self._post_validate("BUY", 0.0005, px)
+            action, size = self.risk_manager_db.adjust_trade(
+                action, size, pair, px, kraken_balances={}  # your real balances
+            )
+            rationale = f"[FALLBACK] => px={px} <20000 => {action} {size}"
+            if action == "BUY" and size > 0:
                 pending_id = create_pending_trade(
-                    side=sig,
-                    requested_qty=sz,
+                    side=action,
+                    requested_qty=size,
                     pair=pair,
                     reason="FALLBACK_SINGLE"
                 )
-                self._maybe_place_kraken_order(pair, sig, sz, pending_id)
-            self._store_decision(pair, sig, sz, rationale)
-            return (sig, sz)
+                self._maybe_place_kraken_order(pair, action, size, pending_id)
+            self._store_decision(pair, action, size, rationale)
+            return (action, size)
         else:
             rationale = f"[FALLBACK] => px={px} >=20000 => HOLD"
             self._store_decision(pair, "HOLD", 0.0, rationale)
@@ -239,8 +241,11 @@ class AIStrategy:
         for pd in pairs_data:
             pair = pd.get("pair", "UNK")
             px = pd.get("price", 0.0)
-            if px > 0:
-                self.risk_manager_db.check_stop_loss_take_profit(pair, px)
+            if px <= 0:
+                rationale = f"No valid price => HOLD {pair}"
+                self._store_decision(pair, "HOLD", 0.0, rationale)
+                decisions[pair] = ("HOLD", 0.0)
+                continue
 
             if self.use_openai and self.gpt_manager:
                 try:
@@ -281,13 +286,6 @@ class AIStrategy:
             logger.warning("No aggregator_list => empty multi-coin decisions.")
             return results_set
 
-        # forcibly check sub-position stops
-        for item in input_aggregator_list:
-            pair = item.get("pair", "UNK")
-            px = item.get("price", 0.0)
-            if px > 0:
-                self.risk_manager_db.check_stop_loss_take_profit(pair, px)
-
         if not self.use_openai or not self.gpt_manager:
             logger.info("[AIStrategy] no GPT => fallback => hold all coins")
             for it in input_aggregator_list:
@@ -326,39 +324,42 @@ class AIStrategy:
 
             found_item = next((x for x in input_aggregator_list if x.get("pair") == pair), None)
             px = found_item.get("price", 0.0) if found_item else 0.0
-
             if px <= 0:
                 logger.warning(f"[AIStrategy] no valid price for {pair} => HOLD")
                 self._store_decision(pair, "HOLD", 0.0, "No price => hold")
                 results_set[pair] = ("HOLD", 0.0)
                 continue
 
-            final_signal, final_size = self._post_validate(action_raw, size_suggested, px)
-            final_signal, final_size = self.risk_manager_db.adjust_trade(final_signal, final_size, pair, px)
-            rationale = f"GPT multi => {pair} => final={final_signal}, size={final_size}"
+            # local post-validate
+            final_action, final_size = self._post_validate(action_raw, size_suggested, px)
+            # pass to risk_manager => daily drawdown check
+            final_action, final_size = self.risk_manager_db.adjust_trade(
+                final_action, final_size, pair, px, kraken_balances={}
+            )
+            rationale = f"GPT multi => {pair} => final={final_action}, size={final_size}"
 
-            if final_signal in ("BUY", "SELL") and final_size > 0:
+            if final_action in ("BUY", "SELL") and final_size > 0:
                 pending_id = create_pending_trade(
-                    side=final_signal,
+                    side=final_action,
                     requested_qty=final_size,
                     pair=pair,
                     reason="GPT_MULTI_DECISION"
                 )
-                # If live orders are enabled, send to Kraken
-                self._maybe_place_kraken_order(pair, final_signal, final_size, pending_id)
+                # Optionally place real order
+                self._maybe_place_kraken_order(pair, final_action, final_size, pending_id)
 
-            self._store_decision(pair, final_signal, final_size, rationale)
-            results_set[pair] = (final_signal, final_size)
+            self._store_decision(pair, final_action, final_size, rationale)
+            results_set[pair] = (final_action, final_size)
 
         return results_set
 
     # --------------------------------------------------------------------------
-    # HELPER: aggregator_text with changes
+    # HELPER: aggregator_text with changes (unchanged)
     # --------------------------------------------------------------------------
     def _build_aggregator_text_changes(self, pair: str) -> str:
         """
-        Example function to return aggregator data with changes since the last hour.
-        This is a skeleton for aggregator_summaries. You can expand for numeric fields.
+        Example aggregator_text builder, referencing aggregator_summaries for
+        1-hour-ago changes.
         """
         import time
         import sqlite3
@@ -401,7 +402,6 @@ class AIStrategy:
                 old_data["galaxy_score"] = float(gs2) if gs2 else None
                 old_data["alt_rank"] = float(ar2) if ar2 else None
                 old_data["sentiment"] = slabel2 or "neutral"
-
         except Exception as e:
             logger.exception(f"[AIStrategy] aggregator changes => {e}")
         finally:
@@ -433,8 +433,8 @@ class AIStrategy:
     # --------------------------------------------------------------------------
     def _post_validate(self, action: str, size_suggested: float, current_price: float) -> Tuple[str, float]:
         """
-        e.g. clamp or hold if cost < min buy.
-        Risk controls can be extended for more advanced checks.
+        A quick local clamp. For instance, skip BUY if cost < min_buy from risk_controls.
+        Subtle usage; daily drawdown is enforced by risk_manager_db.adjust_trade(...).
         """
         if action not in ("BUY", "SELL"):
             return ("HOLD", 0.0)
@@ -452,10 +452,9 @@ class AIStrategy:
         return (action, size_suggested)
 
     # --------------------------------------------------------------------------
-    # ai_decisions table
+    # Ensure ai_decisions table
     # --------------------------------------------------------------------------
     def _create_ai_decisions_table(self):
-        """Ensure 'ai_decisions' table for storing final GPT signals."""
         conn = sqlite3.connect(DB_FILE)
         try:
             c = conn.cursor()
@@ -476,7 +475,9 @@ class AIStrategy:
             conn.close()
 
     def _store_decision(self, pair: str, action: str, size: float, rationale: str):
-        """Insert a row into 'ai_decisions' with the final GPT or fallback decision."""
+        """
+        Insert a row into 'ai_decisions' with final GPT or fallback decision.
+        """
         logger.debug(f"Storing AI => pair={pair}, action={action}, size={size}, reason={rationale}")
         conn = sqlite3.connect(DB_FILE)
         try:
@@ -496,8 +497,10 @@ class AIStrategy:
     # --------------------------------------------------------------------------
     def _summarize_recent_trades(self, pair: str, limit: int = 3) -> str:
         """
-        Returns e.g. "1) 2025-01-01 10:00 BUY 0.001@2000\n2) ..."
-        referencing the final 'trades' table for completed trades only.
+        Returns a short summary of the last few trades from the 'trades' table.
+        e.g.:
+            "1) 2025-01-01 10:00 BUY 0.001@2000\n
+             2) 2025-01-02 11:00 SELL 0.001@2100\n"
         """
         conn = sqlite3.connect(DB_FILE)
         out = []
@@ -528,31 +531,28 @@ class AIStrategy:
         return "\n".join(out)
 
     # --------------------------------------------------------------------------
-    # NEW: maybe_place_kraken_order
+    # maybe_place_kraken_order
     # --------------------------------------------------------------------------
     def _maybe_place_kraken_order(self, pair: str, action: str, volume: float, pending_id: int = None):
         """
-        If self.place_live_orders is True and self.private_ws_client is set,
-        call the client's send_order(...) method to place the order on Kraken.
-        We'll do a basic market order. The 'pending_id' is used as 'userref'
-        so we can match the final 'txid' to our local DB row.
+        If place_live_orders=True and private_ws_client is set,
+        call the client's send_order(...) method on Kraken.
+        We'll do a basic market order. 'pending_id' is used as 'userref'.
         """
         if not self.place_live_orders:
             return
-
         if not self.private_ws_client:
             logger.warning(
-                f"[AIStrategy] place_live_orders=True but no private_ws_client provided. "
-                f"Cannot place real order for pair={pair}."
+                f"[AIStrategy] place_live_orders=True but no private_ws_client => cannot place real order."
             )
             return
 
         side_for_kraken = "buy" if action.upper() == "BUY" else "sell"
         logger.info(
-            f"[AIStrategy] Sending real order => pair={pair}, side={side_for_kraken}, volume={volume}, pending_id={pending_id}"
+            f"[AIStrategy] Sending real order => pair={pair}, side={side_for_kraken}, "
+            f"volume={volume}, pending_id={pending_id}"
         )
 
-        # userref = pending_id so we can match it later
         self.private_ws_client.send_order(
             pair=pair,
             side=side_for_kraken,
@@ -560,4 +560,3 @@ class AIStrategy:
             volume=volume,
             userref=str(pending_id) if pending_id else None
         )
-
