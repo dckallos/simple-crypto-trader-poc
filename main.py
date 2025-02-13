@@ -575,6 +575,8 @@ class HybridApp:
                         f"\tbase_asset = {db_lookup.get_base_asset(pair)}\n"
                         f"\tprice = {last_price:.2f}\n"
                         f"\tprice_bucket = {price_bucket}\n"
+                        f"\trecent_price_history_by_hour:\n"
+                        f"\t\t{json.dumps(db_lookup.get_recent_timeseries_for_coin(db_lookup.get_base_asset(pair)), indent=4)}\n"
                         f"\tminimum_purchase_quantity in {pair} = {db_lookup.get_ordermin(pair)}\n"
                         f"\tminimum_purchase in USD = {db_lookup.get_minimum_cost_in_usd(pair)}\n"
                         f"\ttick_size = {db_lookup.get_asset_value_for_pair(pair, 'tick_size')}\n"
