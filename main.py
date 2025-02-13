@@ -499,6 +499,7 @@ class HybridApp:
         a dict with 'pair', 'price', and 'aggregator_data' describing aggregator fields.
         """
         import db_lookup
+        lunarcrush_symbol = pair.split("/")[0].upper()
         symbol = db_lookup.get_base_asset(pair)
         last_price = 0.0
         aggregator_text = "No aggregator data found"
@@ -522,7 +523,7 @@ class HybridApp:
                 WHERE UPPER(symbol)=?
                 ORDER BY timestamp DESC
                 LIMIT 1
-            """, (symbol,))
+            """, (lunarcrush_symbol,))
             row_summ = c.fetchone()
 
             # lunarcrush_data => the latest price
@@ -540,7 +541,7 @@ class HybridApp:
                 WHERE UPPER(symbol)=?
                 ORDER BY timestamp DESC
                 LIMIT 1
-            """, (symbol,))
+            """, (lunarcrush_symbol,))
             row_price = c.fetchone()
             if row_price:
                 # row_price is a tuple if row_factory is default. We can do indexing or name-based.
@@ -568,11 +569,15 @@ class HybridApp:
                     ) = row_summ
 
                     aggregator_text = (
-                        f"[{symbol}]\n"
+                        f"[{pair}]\n"
+                        f"\tpair name = {db_lookup.get_asset_value_for_pair(pair, "pair_name")}\n"
+                        f"\talternative name = {db_lookup.get_asset_value_for_pair(pair, "altname")}\n"
+                        f"\tbase asset = {db_lookup.get_base_asset(pair)}\n"
                         f"\tprice = {last_price:.2f}\n"
                         f"\tprice bucket = {price_bucket}\n"
-                        f"\tminimum purchase in {symbol} = {db_lookup.get_ordermin(pair)}"
+                        f"\tminimum purchase quantity in {pair} = {db_lookup.get_ordermin(pair)}\n"
                         f"\tminimum purchase in USD = {db_lookup.get_minimum_cost_in_usd(pair)}\n"
+                        f"\ttick size = {db_lookup.get_asset_value_for_pair(pair, 'tick_size')}\n"
                         f"\tvolatility = {volatility}\n"
                         f"\tvolume_24h = {volume_24h:.2f}\n"
                         f"\tpercent_change_1h = {pct_1h:.2f}\n"
@@ -584,7 +589,7 @@ class HybridApp:
                         f"\tmarket_dominance = {market_dominance:.2f}\n"
                         f"\tdominance_bucket = {dominance_bucket}\n"
                         f"\tsocial_sentiment = {sentiment}\n"
-                        f"\tsentiment_label = {str(sentiment_label).upper()}\n"
+                        f"\tsentiment_label = {str(sentiment_label).upper()}\n\n"
                     )
             else:
                 aggregator_text = (
@@ -684,7 +689,6 @@ def main():
     risk_controls = ConfigLoader.get_value("risk_controls", {
         "initial_spending_account": 50.0,
         "purchase_upper_limit_percent": 75.0,
-        "minimum_buy_amount": 8.0,
         "max_position_value": 25.0
     })
 
@@ -714,10 +718,10 @@ def main():
 
         # Backfill timeseries for each symbol in traded_pairs => 6 months (adjust as needed)
         import db_lookup
-        coin_ids = [db_lookup.get_base_asset(pair) for pair in TRADED_PAIRS]
+        coin_ids = [pair.split("/")[0].upper() for pair in TRADED_PAIRS]
         fetcher.backfill_coins(
             coin_ids=coin_ids,
-            months=6,
+            months=1,
             bucket="hour",
             interval="1w"
         )
@@ -752,7 +756,7 @@ def main():
     token_str = None
     if token_json and "result" in token_json and "token" in token_json["result"]:
         token_str = token_json["result"]["token"]
-        logger.info(f"[Main] Got private WS token => {token_str[:10]}...")
+        logger.info(f"[Main] Got private WS token => {token_str[:5]}...")
 
     priv_client = None
     if token_str:
