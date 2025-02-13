@@ -212,6 +212,69 @@ def get_minimum_cost_in_usd(wsname: str) -> float:
     finally:
         conn.close()
 
+def get_recent_timeseries_for_coin(coin_id: str, limit: int = 5) -> dict:
+    """
+    Returns up to `limit` most recent records from lunarcrush_timeseries for the given `coin_id`.
+    The returned dictionary has timestamps (DESC order) as keys, and each value is another dict
+    with open_price, close_price, high_price, and low_price.
+
+    Example return format:
+    {
+      1675854200: {
+        "open_price": 123.45,
+        "close_price": 130.12,
+        "high_price": 135.50,
+        "low_price": 122.75
+      },
+      1675850600: {
+        "open_price": 120.00,
+        "close_price": 123.45,
+        ...
+      },
+      ...
+    }
+    """
+
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row  # So we can access row fields by name
+    results_dict = {}
+
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT
+                timestamp,
+                open_price,
+                close_price,
+                high_price,
+                low_price,
+                volatility
+            FROM lunarcrush_timeseries
+            WHERE coin_id = ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """, (coin_id.upper(), limit))
+        rows = c.fetchall()
+
+        # Populate the dictionary with timestamps as keys
+        for row in rows:
+            t = row["timestamp"]
+            results_dict[t] = {
+                "open_price":  round(row["open_price"], 2),
+                "close_price": round(row["close_price"], 2),
+                "high_price":  round(row["high_price"], 2),
+                "low_price":   round(row["low_price"], 2),
+                "volatility":  round(row["volatility"], 2)
+            }
+
+    except Exception as e:
+        logger.exception(f"[db_lookup] Error in get_recent_timeseries_for_coin(coin_id='{coin_id}'): {e}")
+    finally:
+        conn.close()
+
+    return results_dict
+
+
 
 if __name__ == "__main__":
     # Example usage / self-test
