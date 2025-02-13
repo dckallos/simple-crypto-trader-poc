@@ -18,14 +18,20 @@ Implements two separate WebSocket client classes:
    - Can place/cancel orders
    - Requires an API token from Kraken's REST call to GetWebSocketsToken
 
+ENHANCEMENT (RISK MANAGER INTEGRATION):
+   - If you pass a `risk_manager` instance to KrakenPrivateWSClient, we will call
+     `risk_manager.create_sub_position(...)` once an order is fully filled.
+   - This records an open sub-position in your 'sub_positions' table, in addition
+     to recording a final row in 'trades' (for legacy usage).
+
 **UPDATED**:
    - We remove partial fill references to the old 'trades' partial fill logic.
-   - We store ephemeral states in 'pending_trades', referencing new DB functions
-     (mark_pending_trade_open, mark_pending_trade_rejected, mark_pending_trade_closed, etc.).
-   - Once an order is fully filled (status='closed'), we record the final trade
-     in the 'trades' table via record_trade_in_db(...) and mark the pending trade closed.
-   - If an order is rejected or canceled, we mark the corresponding pending trade
-     as 'rejected' in that table.
+   - We store ephemeral states in 'pending_trades'.
+   - Once an order is fully filled (status='closed'), we:
+     1) Insert final trade record in 'trades'
+     2) Mark the pending trade as closed in 'pending_trades'
+     3) (NEW) Optionally create a new sub-position row in 'sub_positions' via risk_manager
+   - If an order is rejected or canceled, we mark the pending trade as 'rejected' in DB.
 """
 
 import ssl
@@ -46,6 +52,7 @@ from db import (
     mark_pending_trade_closed,
     create_pending_trade
 )
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -272,25 +279,32 @@ class KrakenPrivateWSClient:
     - Provide 'token' from the REST call to GetWebSocketsToken.
     - Provide an on_private_event_callback if you want custom logic
       in addition to ephemeral/final fill updates.
+    - (NEW) Provide a 'risk_manager' if you want sub_positions updated automatically.
 
     Updated logic (no partial fill tracking in 'trades' table):
       * 'pending_trades' is used for ephemeral states
       * final trades are only inserted in 'trades' once we see a fully closed fill
       * if rejected, we mark the pending trade as 'rejected'
+      * if closed with fill_size>0, we also call risk_manager.create_sub_position(...)
+        to record an open sub-position in 'sub_positions' (if risk_manager is provided).
     """
 
     def __init__(
         self,
         token: str,
-        on_private_event_callback=None
+        on_private_event_callback=None,
+        risk_manager=None
     ):
         """
         :param token: The token from REST => GetWebSocketsToken
         :param on_private_event_callback: optional function that receives private events
+        :param risk_manager: optional instance of RiskManagerDB to create sub-positions
+                             upon final fill (e.g. your updated risk_manager.py)
         """
         self.url_private = "wss://ws-auth.kraken.com"
         self.token = token
         self.on_private_event_callback = on_private_event_callback
+        self.risk_manager = risk_manager  # <--- NEW
 
         self.ssl_context = create_secure_ssl_context()
         self.loop = None
@@ -463,8 +477,6 @@ class KrakenPrivateWSClient:
             mark_pending_trade_rejected_by_kraken_id(txid, reason)
             return
 
-        # If "ok" => means order accepted => we might do mark_pending_trade_open,
-        # but let's see if there's more detail. If "closed" => do final fill logic.
         logger.debug(f"[PrivateWS] addOrderStatus => order_id={txid}, status={status_str}")
 
         vol_exec_str = msg.get("vol_exec", "0.0")
@@ -483,22 +495,20 @@ class KrakenPrivateWSClient:
             # Final fill => record trade + mark pending closed
             self._finalize_trade_from_kraken(txid, vol_exec, avg_px, fee_val)
         elif status_str == "ok":
-            # Possibly an 'open' order => mark pending as open if you want
-            # We'll do so if there's a pending trade row
+            # Possibly an 'open' order => mark pending as open
             mark_pending_trade_open_by_kraken_id(txid)
         else:
-            # Could be "open" or other. If we want to track open states, do it here.
-            # For partial fill we'd do advanced logic, but we're not tracking partials now.
+            # "open", "part_filled", or other states
             if status_str == "open":
                 mark_pending_trade_open_by_kraken_id(txid)
-            # "part_filled" or other states not used in our new approach
-            pass
+            # We do not track partial fill. If needed, you can expand logic here.
 
     def _process_open_orders(self, order_chunk):
         """
         If you subscribe to "openOrders", you'll get a list of orders with fields
         like 'vol_exec','avg_price','fee','status' etc. We do final fill or rejection
-        in 'pending_trades' as well. Then if final => record in 'trades'.
+        in 'pending_trades' as well. Then if final => record in 'trades' and optionally
+        create a sub-position via risk_manager.
 
         Example data chunk:
         [
@@ -544,7 +554,6 @@ class KrakenPrivateWSClient:
                         mark_pending_trade_rejected_by_kraken_id(txid, "canceled")
                     else:
                         logger.info(f"[PrivateWS] Order canceled after partial fill => {txid}")
-                        # finalize as closed with partial fill
                         self._finalize_trade_from_kraken(txid, vol_exec, avg_px, fee_val)
                     continue
 
@@ -552,7 +561,6 @@ class KrakenPrivateWSClient:
                     logger.info(f"[PrivateWS] Order closed => {txid}, vol_exec={vol_exec}")
                     self._finalize_trade_from_kraken(txid, vol_exec, avg_px, fee_val)
                 elif status_str == "open":
-                    # you may want to track an 'open' state in pending_trades
                     mark_pending_trade_open_by_kraken_id(txid)
                 else:
                     logger.debug(f"[PrivateWS] order_id={txid}, status={status_str}, ignoring beyond logs.")
@@ -560,7 +568,8 @@ class KrakenPrivateWSClient:
     def _finalize_trade_from_kraken(self, kraken_order_id: str, filled_size: float, avg_fill_price: float, fee: float):
         """
         Called when an order is definitely 'closed' or canceled-with-partial-fill from Kraken,
-        to insert final row in 'trades' and mark the pending trade as 'closed'.
+        to insert final row in 'trades', mark pending as closed, and (NEW) create a sub-position
+        if filled_size>0 and a RiskManager is present.
         """
         # 1) We find the pending trade row by kraken_order_id => see below helper
         row = _fetch_pending_trade_by_kraken_id(kraken_order_id)
@@ -573,9 +582,10 @@ class KrakenPrivateWSClient:
         side = row[2]     # might be 'BUY' or 'SELL'
         requested_qty = row[3]
 
-        # 2) Insert final trade in 'trades' if filled_size>0
+        # 2) If there's a final fill, record final trade in 'trades' table
+        #    and optionally create a sub-position.
         if filled_size > 0:
-            # record final trade
+            # Record final trade
             record_trade_in_db(
                 side=side,
                 quantity=filled_size,
@@ -583,8 +593,21 @@ class KrakenPrivateWSClient:
                 order_id=kraken_order_id,
                 pair=pair
             )
+            logger.info(f"[PrivateWS] Recorded final trade => side={side}, size={filled_size}, px={avg_fill_price}")
+
+            # (NEW) If we have a RiskManager => create sub_position
+            if self.risk_manager:
+                sub_side = "long" if side.upper() == "BUY" else "short"
+                sub_pos_id = self.risk_manager.create_sub_position(
+                    pair=pair,
+                    side=sub_side,
+                    entry_price=avg_fill_price,
+                    size=filled_size
+                )
+                logger.info(f"[PrivateWS] Created sub-position => id={sub_pos_id}, pair={pair}, side={sub_side}")
+
         else:
-            logger.info(f"[PrivateWS] final fill_size=0 => no trade to record, pair={pair}, side={side}")
+            logger.info(f"[PrivateWS] final fill_size=0 => no trade or sub-position creation, pair={pair}, side={side}")
 
         # 3) Mark the pending trade closed with optional reason
         reason_msg = f"final fill size={filled_size}, fee={fee}"
