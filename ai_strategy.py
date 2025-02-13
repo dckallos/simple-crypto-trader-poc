@@ -188,7 +188,7 @@ class AIStrategy:
                 reason="GPT_SINGLE_DECISION"
             )
             # If place_live_orders is True, call private_ws_client
-            self._maybe_place_kraken_order(pair, final_signal, final_size)
+            self._maybe_place_kraken_order(pair, final_signal, final_size, pending_id)
 
         self._store_decision(pair, final_signal, final_size, rationale)
         return (final_signal, final_size)
@@ -210,7 +210,7 @@ class AIStrategy:
                     pair=pair,
                     reason="FALLBACK_SINGLE"
                 )
-                self._maybe_place_kraken_order(pair, sig, sz)
+                self._maybe_place_kraken_order(pair, sig, sz, pending_id)
             self._store_decision(pair, sig, sz, rationale)
             return (sig, sz)
         else:
@@ -345,7 +345,7 @@ class AIStrategy:
                     reason="GPT_MULTI_DECISION"
                 )
                 # If live orders are enabled, send to Kraken
-                self._maybe_place_kraken_order(pair, final_signal, final_size)
+                self._maybe_place_kraken_order(pair, final_signal, final_size, pending_id)
 
             self._store_decision(pair, final_signal, final_size, rationale)
             results_set[pair] = (final_signal, final_size)
@@ -530,12 +530,12 @@ class AIStrategy:
     # --------------------------------------------------------------------------
     # NEW: maybe_place_kraken_order
     # --------------------------------------------------------------------------
-    def _maybe_place_kraken_order(self, pair: str, action: str, volume: float):
+    def _maybe_place_kraken_order(self, pair: str, action: str, volume: float, pending_id: int = None):
         """
         If self.place_live_orders is True and self.private_ws_client is set,
         call the client's send_order(...) method to place the order on Kraken.
-        We'll assume market order for now.
-        Action is "BUY"/"SELL", but Kraken expects "buy"/"sell" strings.
+        We'll do a basic market order. The 'pending_id' is used as 'userref'
+        so we can match the final 'txid' to our local DB row.
         """
         if not self.place_live_orders:
             return
@@ -549,12 +549,15 @@ class AIStrategy:
 
         side_for_kraken = "buy" if action.upper() == "BUY" else "sell"
         logger.info(
-            f"[AIStrategy] Sending real order => pair={pair}, side={side_for_kraken}, volume={volume}"
+            f"[AIStrategy] Sending real order => pair={pair}, side={side_for_kraken}, volume={volume}, pending_id={pending_id}"
         )
-        # We'll do a basic market order
+
+        # userref = pending_id so we can match it later
         self.private_ws_client.send_order(
             pair=pair,
             side=side_for_kraken,
             ordertype="market",
-            volume=volume
+            volume=volume,
+            userref=str(pending_id) if pending_id else None
         )
+
