@@ -310,6 +310,7 @@ class GPTManager:
             f"RECENTLY ACTIVE INVESTMENTS:\n{trades_summ}\n\n"
             "---END ACCOUNT DATA---\n\n"
             "---BEGIN COIN DATA---\n\n"
+            f"current_time: {int(time.time())}\n"
             f"{aggregator_text}\n\n"
             "---END COIN DATA---\n\n"
             "RETURN final JSON => {\"decisions\":[...],\"rationale\":\"...\"} with rationale ≤300 chars."
