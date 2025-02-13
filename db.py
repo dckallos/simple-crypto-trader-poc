@@ -64,15 +64,17 @@ def init_db():
         ## We'll create a simpler trades table for final records only.
         c.execute("""
             CREATE TABLE IF NOT EXISTS trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp INTEGER,
-                pair TEXT,
-                side TEXT,         -- 'BUY' or 'SELL'
-                quantity REAL,     -- final filled quantity
-                price REAL,        -- final average fill price
-                order_id TEXT,     -- Kraken order ID or reference if needed
-                fee REAL DEFAULT 0 -- total fee for the entire fill
-            )
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp INTEGER,
+                    kraken_trade_id TEXT,
+                    pair TEXT,
+                    side TEXT,         -- 'BUY' or 'SELL'
+                    quantity REAL,
+                    price REAL,
+                    order_id TEXT,
+                    fee REAL DEFAULT 0,
+                    realized_pnl REAL
+                )
         """)
 
         # ----------------------------------------------------------------------
@@ -276,28 +278,57 @@ def store_cryptopanic_data(title: str, url: str, sentiment_score: float):
 # ------------------------------------------------------------------------------
 # TRADES (FINAL) - We keep record_trade_in_db for legacy, but emphasize it's final
 # ------------------------------------------------------------------------------
-def record_trade_in_db(side: str, quantity: float, price: float, order_id: str, pair="ETH/USD"):
+def record_trade_in_db(
+    side: str,
+    quantity: float,
+    price: float,
+    order_id: str,
+    pair: str = "ETH/USD",
+    fee: float = 0.0,
+    kraken_trade_id: str = None
+):
     """
     Inserts a final, *fully executed* record into the 'trades' table.
-    Old usage might treat it as a fully filled trade (status='closed').
-    But we've removed partial fill columns; this is final record only.
+    Extended to include 'kraken_trade_id' so that we can store the unique
+    trade ID from ownTrades. 'order_id' typically refers to the Kraken
+    order ID for the overall order, while 'kraken_trade_id' can store the
+    fill-level ID.
+
+    :param side: 'BUY' or 'SELL'
+    :param quantity: final filled quantity
+    :param price: final average fill price (or fill price)
+    :param order_id: The Kraken order ID or some local reference
+    :param pair: e.g. 'ETH/USD'
+    :param fee: total fee paid for this fill
+    :param kraken_trade_id: The unique trade fill ID from ownTrades
     """
+    import time
+    import sqlite3
+
     conn = sqlite3.connect(DB_FILE)
     try:
         c = conn.cursor()
-        c.execute("""
+        c.execute(f"""
             INSERT INTO trades (
-                timestamp, pair, side, quantity, price, order_id, fee
+                timestamp,
+                pair,
+                side,
+                quantity,
+                price,
+                order_id,
+                fee,
+                kraken_trade_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            int(time.time()),
+            int(time.time()),  # or pass in an explicit fill timestamp if needed
             pair,
             side,
             quantity,
             price,
             order_id,
-            0.0  # fee can be updated if you have final info
+            fee,
+            kraken_trade_id
         ))
         conn.commit()
     except Exception as e:
