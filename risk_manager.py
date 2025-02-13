@@ -4,336 +4,268 @@
 """
 risk_manager.py
 
-Encapsulates a DB-based approach to risk management with multiple sub-positions
-per pair in 'sub_positions'. Each sub-position has:
-  - side ("long" or "short" or "BUY"/"SELL")
-  - entry_price
-  - size
-  - created_at
-  - closed_at (NULL if open)
-  - exit_price
-  - realized_pnl
-
-We track daily realized PnL; if it's below 'max_daily_drawdown', then new
-trades are forced to HOLD. Additionally, 'max_position_size' clamps the
-per-trade size, an optional 'max_position_value' can clamp cost in USD,
-and `initial_spending_account` ensures we don't exceed a total allocated capital.
-
-Usage flow:
-  1. AIStrategy calls `adjust_trade(...)` before creating a pending order,
-     to see if the trade is allowed under risk constraints.
-  2. If final_signal is BUY/SELL, AIStrategy creates a 'pending' order in 'pending_trades'.
-  3. Once the order is actually filled, your code calls `create_sub_position(...)`
-     to record the newly open sub-position in 'sub_positions'.
-  4. If the user closes or triggers a stop-loss/take-profit, call `close_sub_position(...)`.
-
-Stop-loss / Take-profit checks:
-  - 'check_stop_loss_take_profit(...)' scans all open sub-positions for a pair
-    to see if they must be closed. If triggered, 'close_sub_position(...)'
-    is called.
-
-Example:
-    risk_manager = RiskManagerDB(
-        db_path="trades.db",
-        max_position_size=3.0,
-        stop_loss_pct=0.05,
-        take_profit_pct=0.1,
-        max_daily_drawdown=-0.02,
-        max_position_value=500.0,
-        initial_spending_account=1000.0
-    )
-    risk_manager.initialize()
-
-    # Before sending a BUY order for 0.1 BTC at 20000:
-    final_signal, final_size = risk_manager.adjust_trade("BUY", 0.1, "XBT/USD", 20000)
-    # => returns ("BUY", 0.1) or ("HOLD",0.0) if not allowed
-
-    # Once the order is filled, record the sub-position:
-    risk_manager.create_sub_position("XBT/USD", "BUY", 20000, 0.1)
-
-    # If a stop-loss triggers a close:
-    risk_manager.close_sub_position(pos_id=123, exit_price=19000, realized_pnl=-100.0)
+Now includes on_price_update(...) which handles each new price from the
+public feed, checks stop-loss / take-profit thresholds, and, if triggered,
+places a SELL. This approach does not rely on local sub-positions; it
+derives net position and cost basis from the 'trades' table for each pair.
 """
 
 import logging
 import sqlite3
-import time
-import os
+import datetime
+from typing import Tuple
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-SUB_POSITIONS_TABLE = "sub_positions"
-
+DB_FILE = "trades.db"  # Ensure this matches your actual DB path
 
 class RiskManagerDB:
-    """
-    RiskManagerDB stores multiple sub-positions in the 'sub_positions' table and
-    applies constraints:
-      - daily drawdown limit => if daily realized < max_daily_drawdown => force HOLD
-      - clamp trade size by max_position_size
-      - optionally clamp cost (size * price) by max_position_value
-      - ensures total used capital doesn't exceed `initial_spending_account`
-      - optionally auto-close sub-positions in check_stop_loss_take_profit() if
-        stop_loss_pct or take_profit_pct are set.
-    """
-
     def __init__(
         self,
-        db_path: str,
-        max_position_size: float,
-        stop_loss_pct: float = None,
-        take_profit_pct: float = None,
+        db_path: str = DB_FILE,
+        max_position_size: float = 3.0,
         max_daily_drawdown: float = None,
-        max_position_value: float = None,
-        initial_spending_account: float = 40.0
+        initial_spending_account: float = 100.0
     ):
         """
         :param db_path: path to your trades.db
-        :param max_position_size: clamp for per-trade size (e.g. 0.001 BTC).
-        :param stop_loss_pct: e.g. 0.05 => auto-close if -5%
-        :param take_profit_pct: e.g. 0.10 => auto-close if +10%
-        :param max_daily_drawdown: e.g. -0.02 => skip new trades if daily realized < -2%
-        :param max_position_value: optional clamp on cost => trade_size * price <= this
-        :param initial_spending_account: total allowed capital for all open BUY positions
+        :param max_position_size: clamp for per-trade size (e.g. 3.0 means 3 coins).
+        :param max_daily_drawdown: e.g. -0.02 => skip trades if daily realized < -2%
+        :param initial_spending_account: max cost (USD) allowed per buy trade
         """
         self.db_path = db_path
         self.max_position_size = max_position_size
-        self.stop_loss_pct = stop_loss_pct
-        self.take_profit_pct = take_profit_pct
         self.max_daily_drawdown = max_daily_drawdown
-        self.max_position_value = max_position_value
         self.initial_spending_account = initial_spending_account
 
     def initialize(self) -> None:
         """
-        Ensures the 'sub_positions' table exists, storing open/closed sub-positions
-        with (side, entry_price, size, created_at, closed_at, exit_price, realized_pnl).
+        Ensure 'trades' table exists. No sub-positions creation is done.
         """
         conn = sqlite3.connect(self.db_path)
         try:
             c = conn.cursor()
-            c.execute(f"""
-                CREATE TABLE IF NOT EXISTS {SUB_POSITIONS_TABLE} (
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS trades (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp INTEGER,
+                    kraken_trade_id TEXT,
                     pair TEXT,
-                    side TEXT,
-                    entry_price REAL,
-                    size REAL,
-                    created_at INTEGER,
-                    closed_at INTEGER,
-                    exit_price REAL,
+                    side TEXT,         -- 'BUY' or 'SELL'
+                    quantity REAL,
+                    price REAL,
+                    order_id TEXT,
+                    fee REAL DEFAULT 0,
                     realized_pnl REAL
                 )
             """)
             conn.commit()
-            logger.info(f"Table '{SUB_POSITIONS_TABLE}' ensured in DB.")
+            logger.info("RiskManagerDB => 'trades' table ensured.")
         except Exception as e:
-            logger.exception(f"Error creating '{SUB_POSITIONS_TABLE}' table: {e}")
+            logger.exception(f"[RiskManager] Error ensuring trades table => {e}")
         finally:
             conn.close()
 
     # --------------------------------------------------------------------------
-    # MAIN ENTRY POINT FOR PRE-TRADE RISK CHECKS
+    # STOP-LOSS / TAKE-PROFIT TRIGGER VIA PRICE UPDATE
+    # --------------------------------------------------------------------------
+    def on_price_update(
+        self,
+        pair: str,
+        current_price: float,
+        kraken_balances: dict,
+        stop_loss_pct: float = 0.05,
+        take_profit_pct: float = 0.10
+    ):
+        """
+        Called each time a new price for `pair` arrives from the public feed.
+        1) We see if user has a net position in `pair` (via get_net_position_and_cost_basis).
+        2) If net_position > 0, we check if price <= cost_basis*(1-SL%) or >= cost_basis*(1+TP%).
+        3) If triggered, we attempt a SELL for the net_position (or partial).
+
+        :param pair: e.g. "ETH/USD"
+        :param current_price: market price from the feed
+        :param kraken_balances: dict from fetch_kraken_balance(...) => e.g. {"ZUSD":500.0,"XETH":2.0}
+        :param stop_loss_pct: e.g. 0.05 => -5% stop
+        :param take_profit_pct: e.g. 0.10 => +10% TP
+        """
+        net_position, cost_basis = self.get_net_position_and_cost_basis(pair)
+        if net_position <= 0:
+            # no net holdings => nothing to do
+            return
+
+        # If price crosses stop-loss or take-profit threshold, we place SELL
+        stop_trigger = (current_price <= cost_basis * (1.0 - stop_loss_pct))
+        tp_trigger = (current_price >= cost_basis * (1.0 + take_profit_pct))
+
+        if stop_trigger or tp_trigger:
+            # SELL everything we hold, or partial if you prefer
+            logger.info(
+                f"[RiskManager] on_price_update => SL/TP triggered for {pair}, "
+                f"net_pos={net_position:.4f}, cost_basis={cost_basis:.2f}, px={current_price:.2f}"
+            )
+            final_signal, final_size = self.adjust_trade(
+                "SELL", net_position, pair, current_price, kraken_balances
+            )
+            if final_signal == "SELL" and final_size > 0:
+                # Record pending trade or place actual order
+                reason = "STOP_LOSS" if stop_trigger else "TAKE_PROFIT"
+                pending_id = self._create_pending_trade(final_signal, final_size, pair, reason)
+                logger.info(f"[RiskManager] => Created SELL pending trade for {final_size} {pair}. reason={reason}")
+
+    def _create_pending_trade(self, side: str, qty: float, pair: str, reason: str) -> int:
+        """
+        Minimal placeholder method. You can call create_pending_trade(...) from db.py or
+        your own logic if you prefer. This just returns the row ID.
+        """
+        import time
+        conn = sqlite3.connect(self.db_path)
+        new_id = None
+        try:
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO pending_trades (
+                    created_at, pair, side, requested_qty, status, kraken_order_id, reason
+                )
+                VALUES (?, ?, ?, ?, 'pending', NULL, ?)
+            """, (int(time.time()), pair, side, qty, reason))
+            conn.commit()
+            new_id = c.lastrowid
+        except Exception as e:
+            logger.exception(f"[RiskManager] Error creating pending trade => {e}")
+        finally:
+            conn.close()
+        return new_id if new_id else 0
+
+    # --------------------------------------------------------------------------
+    # NET POSITION & COST BASIS (Weighed Approach)
+    # --------------------------------------------------------------------------
+    def get_net_position_and_cost_basis(self, pair: str) -> Tuple[float, float]:
+        """
+        Sums up all trades for this pair from the 'trades' table to find net_position
+        and approximate cost basis. If net_position=0 => cost_basis=0.
+        """
+        conn = sqlite3.connect(self.db_path)
+        rows = []
+        try:
+            c = conn.cursor()
+            c.execute("""
+                SELECT side, quantity, price
+                FROM trades
+                WHERE pair=?
+                ORDER BY timestamp ASC
+            """, (pair,))
+            rows = c.fetchall()
+        except Exception as e:
+            logger.exception(f"[RiskManager] get_net_position_and_cost_basis => {e}")
+        finally:
+            conn.close()
+
+        net_position = 0.0
+        weighted_cost_sum = 0.0
+
+        for (side, qty, px) in rows:
+            if side.upper() == "BUY":
+                net_position += qty
+                weighted_cost_sum += (qty * px)
+            elif side.upper() == "SELL":
+                net_position_before = net_position
+                net_position -= qty
+                if net_position_before > 0:
+                    fraction_sold = min(qty, net_position_before) / net_position_before
+                    weighted_cost_sum -= fraction_sold * weighted_cost_sum
+
+                if net_position <= 0:
+                    net_position = 0.0
+                    weighted_cost_sum = 0.0
+
+        if net_position <= 0:
+            return (0.0, 0.0)
+        cost_basis = weighted_cost_sum / net_position
+        return (net_position, cost_basis)
+
+    # --------------------------------------------------------------------------
+    # EXISTING adjust_trade(...) (unchanged from your new version)
     # --------------------------------------------------------------------------
     def adjust_trade(
         self,
         signal: str,
         suggested_size: float,
         pair: str,
-        current_price: float
+        current_price: float,
+        kraken_balances: dict
     ) -> (str, float):
         """
-        Validate/adjust an AI-proposed trade before creating a pending order:
-         1) If daily realized PnL <= max_daily_drawdown => force HOLD
-         2) If signal not in ("BUY","SELL") => HOLD
-         3) clamp size by self.max_position_size
-         4) if signal=BUY => check total spent so far, ensure (spent + cost) <= initial_spending_account
-         5) if self.max_position_value => clamp cost in USD
-         6) Return final_signal, final_size
-
-        We do NOT open sub-positions here. That happens only after the trade is filled
-        by calling create_sub_position(...).
+        Main pre-trade check from your updated risk_manager.
+        ...
         """
         # 1) daily drawdown check
         if self.max_daily_drawdown is not None:
             daily_pnl = self.get_daily_realized_pnl()
             if daily_pnl <= self.max_daily_drawdown:
                 logger.warning(
-                    f"Daily drawdown => realizedPnL={daily_pnl:.4f} <= {self.max_daily_drawdown}, forcing HOLD."
+                    f"[RiskManager] daily drawdown => realizedPnL={daily_pnl:.4f}"
+                    f" <= {self.max_daily_drawdown} => forcing HOLD."
                 )
                 return ("HOLD", 0.0)
 
-        # 2) If not BUY/SELL => hold
+        # 2) If the signal is not BUY/SELL => hold
         if signal not in ("BUY", "SELL"):
             return ("HOLD", 0.0)
 
-        # 3) clamp size
+        # 3) clamp trade size
         final_size = min(suggested_size, self.max_position_size)
         if final_size <= 0:
             return ("HOLD", 0.0)
 
-        cost = final_size * current_price
-
-        # 4) If BUY => ensure total spent doesn't exceed initial_spending_account
+        # BUY checks
         if signal == "BUY":
-            spent_so_far = self._sum_open_buy_positions()
-            if spent_so_far + cost > self.initial_spending_account:
+            cost = final_size * current_price
+            # check initial_spending_account limit
+            if cost > self.initial_spending_account:
                 logger.info(
-                    f"[RiskManager] Not enough capital => spent_so_far={spent_so_far:.2f}, "
-                    f"new_cost={cost:.2f}, limit={self.initial_spending_account:.2f}"
+                    f"[RiskManager] cost={cost:.2f} > initial_spending_account={self.initial_spending_account:.2f}"
                 )
                 return ("HOLD", 0.0)
 
-        # 5) clamp cost if max_position_value is set
-        if self.max_position_value and self.max_position_value > 0:
-            if cost > self.max_position_value:
-                new_size = self.max_position_value / max(current_price, 1e-9)
+            # check real-time USD
+            quote_asset = self._guess_quote_symbol(pair)
+            free_usd = kraken_balances.get(quote_asset, 0.0)
+            if cost > free_usd:
                 logger.info(
-                    f"[RiskManager] Clamping => cost {cost:.2f} > max_position_value={self.max_position_value}, "
-                    f"new size={new_size:.6f}"
+                    f"[RiskManager] Not enough {quote_asset} => cost={cost:.2f}, free={free_usd:.2f}"
                 )
-                final_size = new_size
-                if final_size <= 0:
-                    return ("HOLD", 0.0)
+                return ("HOLD", 0.0)
+
+        # SELL checks
+        if signal == "SELL":
+            base_symbol = pair.split("/")[0].upper()
+            kraken_base = self._guess_base_symbol(base_symbol)
+            free_coins = kraken_balances.get(kraken_base, 0.0)
+            if final_size > free_coins:
+                logger.info(
+                    f"[RiskManager] Not enough {kraken_base} => requested={final_size}, have={free_coins}"
+                )
+                return ("HOLD", 0.0)
 
         return (signal, final_size)
 
-    # --------------------------------------------------------------------------
-    # PUBLIC METHOD FOR CREATING A SUB-POSITION ONCE A TRADE IS FILLED
-    # --------------------------------------------------------------------------
-    def create_sub_position(self, pair: str, side: str, entry_price: float, size: float) -> int:
-        """
-        Insert a new row in 'sub_positions' to reflect an open sub-position.
-        Typically called once an order is definitely filled (final fill).
-        If partial fills are relevant, you can adjust the logic to handle them.
-
-        :param pair: e.g. "ETH/USD"
-        :param side: e.g. "BUY" or "long", or "SELL"/"short"
-        :param entry_price: fill price
-        :param size: quantity filled
-        :return: the newly inserted row's ID
-        """
-        conn = sqlite3.connect(self.db_path)
-        row_id = None
-        try:
-            c = conn.cursor()
-            now_ts = int(time.time())
-            c.execute(f"""
-                INSERT INTO {SUB_POSITIONS_TABLE} (
-                    pair, side, entry_price, size, created_at, closed_at, exit_price, realized_pnl
-                )
-                VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL)
-            """, (pair, side, entry_price, size, now_ts))
-            conn.commit()
-            row_id = c.lastrowid
-            logger.info(f"[RiskManager] Inserted new sub-position => id={row_id}, pair={pair}, side={side}, size={size}")
-        except Exception as e:
-            logger.exception(f"[RiskManager] Error inserting sub-position => {e}")
-        finally:
-            conn.close()
-
-        return row_id if row_id else 0
-
-    # --------------------------------------------------------------------------
-    # PUBLIC METHOD FOR CLOSING A SUB-POSITION
-    # --------------------------------------------------------------------------
-    def close_sub_position(self, pos_id: int, exit_price: float, realized_pnl: float) -> None:
-        """
-        Mark sub-position as closed => sets closed_at, exit_price, realized_pnl
-        for that row. Typically called upon final close or triggered by stop-loss/TP.
-
-        :param pos_id: the ID of the sub-position row in 'sub_positions'
-        :param exit_price: final fill price at close
-        :param realized_pnl: net PnL from entry to exit
-        """
-        conn = sqlite3.connect(self.db_path)
-        try:
-            c = conn.cursor()
-            now_ts = int(time.time())
-            c.execute(f"""
-                UPDATE {SUB_POSITIONS_TABLE}
-                SET closed_at=?, exit_price=?, realized_pnl=?
-                WHERE id=?
-            """, (now_ts, exit_price, realized_pnl, pos_id))
-            conn.commit()
-            if c.rowcount > 0:
-                logger.info(
-                    f"[RiskManager] Closed sub-position => id={pos_id}, exit_price={exit_price}, realized_pnl={realized_pnl}"
-                )
-            else:
-                logger.warning(f"[RiskManager] No sub-position found with id={pos_id}")
-        except Exception as e:
-            logger.exception(f"[RiskManager] Error closing sub-position => {e}")
-        finally:
-            conn.close()
-
-    # --------------------------------------------------------------------------
-    # STOP-LOSS/TAKE-PROFIT CHECK
-    # --------------------------------------------------------------------------
-    def check_stop_loss_take_profit(self, pair: str, current_price: float) -> None:
-        """
-        If stop_loss_pct or take_profit_pct is configured, we check each open sub-position:
-         - if side=long => unrealized = (current_price - entry_price)/entry_price
-         - if side=short => unrealized = (entry_price - current_price)/entry_price
-         If below -stop_loss_pct => close
-         If above take_profit_pct => close
-        """
-        if not self.stop_loss_pct and not self.take_profit_pct:
-            return
-
-        open_positions = self.get_open_positions_for_pair(pair)
-        if not open_positions:
-            return
-
-        for pos in open_positions:
-            pos_id = pos["id"]
-            side = pos["side"]
-            entry = pos["entry_price"]
-            size = pos["size"]
-
-            # compute unrealized percentage
-            if side.lower() in ("long", "buy"):
-                pct = (current_price - entry) / (entry + 1e-9)
-            else:
-                pct = (entry - current_price) / (entry + 1e-9)
-
-            triggered = False
-            reason = ""
-            if self.stop_loss_pct and pct <= -abs(self.stop_loss_pct):
-                triggered = True
-                reason = f"Stop-loss => {pct*100:.2f}%"
-            elif self.take_profit_pct and pct >= self.take_profit_pct:
-                triggered = True
-                reason = f"Take-profit => {pct*100:.2f}%"
-
-            if triggered:
-                realized = self._compute_realized_pnl(side, entry, current_price, size)
-                self.close_sub_position(pos_id, current_price, realized)
-                logger.info(
-                    f"[RiskManager] {reason}; closed sub-position id={pos_id}, pair={pair}, realized_pnl={realized:.4f}"
-                )
-
-    # --------------------------------------------------------------------------
-    # PUBLIC: GET DAILY REALIZED PNL
-    # --------------------------------------------------------------------------
     def get_daily_realized_pnl(self, date_str: str = None) -> float:
         """
-        Sums realized_pnl from sub_positions *closed* on 'date_str' (UTC). If None,
-        uses today's UTC date. Returns 0.0 if none closed that day.
+        Sums realized_pnl from 'trades' for the specified UTC date.
+        If no date_str => use today's date (UTC).
         """
-        import datetime
         if not date_str:
             date_str = datetime.datetime.utcnow().strftime("%Y-%m-%d")
-
         conn = sqlite3.connect(self.db_path)
         try:
             c = conn.cursor()
-            q = f"""
+            q = """
                 SELECT IFNULL(SUM(realized_pnl), 0.0)
-                FROM {SUB_POSITIONS_TABLE}
-                WHERE closed_at IS NOT NULL
-                  AND DATE(closed_at, 'unixepoch') = ?
+                FROM trades
+                WHERE realized_pnl IS NOT NULL
+                  AND DATE(timestamp, 'unixepoch') = ?
             """
             c.execute(q, (date_str,))
             row = c.fetchone()
@@ -341,80 +273,21 @@ class RiskManagerDB:
                 return float(row[0])
             return 0.0
         except Exception as e:
-            logger.exception(f"Error computing daily realized pnl: {e}")
+            logger.exception(f"[RiskManager] get_daily_realized_pnl => {e}")
             return 0.0
         finally:
             conn.close()
 
-    # --------------------------------------------------------------------------
-    # HELPER: GET ALL OPEN POSITIONS FOR A PAIR
-    # --------------------------------------------------------------------------
-    def get_open_positions_for_pair(self, pair: str) -> list:
-        """
-        Returns a list of open sub-positions for 'pair', each as a dict:
-         {
-           "id": int,
-           "side": str,     # "BUY"/"long" or "SELL"/"short"
-           "entry_price": float,
-           "size": float,
-           "created_at": int
-         }
-        """
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        try:
-            c = conn.cursor()
-            q = f"""
-                SELECT id, side, entry_price, size, created_at
-                FROM {SUB_POSITIONS_TABLE}
-                WHERE pair=? AND closed_at IS NULL
-            """
-            c.execute(q, (pair,))
-            rows = c.fetchall()
-            return [dict(r) for r in rows]
-        except Exception as e:
-            logger.exception(f"[RiskManager] Error loading open sub-positions for {pair}: {e}")
-            return []
-        finally:
-            conn.close()
+    # Helpers for buy/sell checks
+    def _guess_quote_symbol(self, pair: str) -> str:
+        quote_raw = pair.split("/")[-1].upper()
+        if quote_raw == "USD":
+            return "ZUSD"
+        if quote_raw == "EUR":
+            return "ZEUR"
+        return quote_raw
 
-    # --------------------------------------------------------------------------
-    # PRIVATE: SUM OPEN BUY POSITIONS
-    # --------------------------------------------------------------------------
-    def _sum_open_buy_positions(self) -> float:
-        """
-        Returns total cost of all open BUY (or 'long') sub-positions => sum(entry_price * size).
-        Used to ensure we don't exceed `initial_spending_account`.
-        """
-        conn = sqlite3.connect(self.db_path)
-        try:
-            c = conn.cursor()
-            query = f"""
-                SELECT IFNULL(SUM(entry_price * size), 0.0)
-                FROM {SUB_POSITIONS_TABLE}
-                WHERE closed_at IS NULL
-                  AND side IN ('long','BUY')
-            """
-            c.execute(query)
-            row = c.fetchone()
-            if row and row[0]:
-                return float(row[0])
-            return 0.0
-        except Exception as e:
-            logger.exception(f"[RiskManager] Error summing open buy positions => {e}")
-            return 0.0
-        finally:
-            conn.close()
-
-    # --------------------------------------------------------------------------
-    # PRIVATE: REALIZED PNL CALC
-    # --------------------------------------------------------------------------
-    def _compute_realized_pnl(self, side: str, entry_price: float, exit_price: float, size: float) -> float:
-        """
-        If side is "long"/"buy" => realized PnL = (exit_price - entry_price)*size
-        If side is "short"/"sell" => realized PnL = (entry_price - exit_price)*size
-        """
-        if side.lower() in ("long", "buy"):
-            return (exit_price - entry_price) * size
-        else:
-            return (entry_price - exit_price) * size
+    def _guess_base_symbol(self, base_symbol: str) -> str:
+        if base_symbol in ("XBT", "BTC"):
+            return "XXBT"
+        return "X" + base_symbol
