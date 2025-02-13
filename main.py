@@ -570,14 +570,14 @@ class HybridApp:
 
                     aggregator_text = (
                         f"[{pair}]\n"
-                        f"\tpair name = {db_lookup.get_asset_value_for_pair(pair, "pair_name")}\n"
-                        f"\talternative name = {db_lookup.get_asset_value_for_pair(pair, "altname")}\n"
-                        f"\tbase asset = {db_lookup.get_base_asset(pair)}\n"
+                        f"\tpair_name = {db_lookup.get_asset_value_for_pair(pair, "pair_name")}\n"
+                        f"\talternative_name = {db_lookup.get_asset_value_for_pair(pair, "altname")}\n"
+                        f"\tbase_asset = {db_lookup.get_base_asset(pair)}\n"
                         f"\tprice = {last_price:.2f}\n"
-                        f"\tprice bucket = {price_bucket}\n"
-                        f"\tminimum purchase quantity in {pair} = {db_lookup.get_ordermin(pair)}\n"
-                        f"\tminimum purchase in USD = {db_lookup.get_minimum_cost_in_usd(pair)}\n"
-                        f"\ttick size = {db_lookup.get_asset_value_for_pair(pair, 'tick_size')}\n"
+                        f"\tprice_bucket = {price_bucket}\n"
+                        f"\tminimum_purchase_quantity in {pair} = {db_lookup.get_ordermin(pair)}\n"
+                        f"\tminimum_purchase in USD = {db_lookup.get_minimum_cost_in_usd(pair)}\n"
+                        f"\ttick_size = {db_lookup.get_asset_value_for_pair(pair, 'tick_size')}\n"
                         f"\tvolatility = {volatility}\n"
                         f"\tvolume_24h = {volume_24h:.2f}\n"
                         f"\tpercent_change_1h = {pct_1h:.2f}\n"
@@ -733,6 +733,17 @@ def main():
     if ENABLE_TRAINING:
         logger.info("[Main] Potential training step here. (Omitted for brevity)")
 
+    # Risk manager
+    from risk_manager import RiskManagerDB
+    risk_manager_db = RiskManagerDB(
+        db_path=DB_FILE,
+        max_position_size=3,
+        stop_loss_pct=0.05,
+        take_profit_pct=0.01,
+        max_daily_drawdown=-0.02
+    )
+    risk_manager_db.initialize()
+
     # 4) Create AIStrategy => now can place live orders if place_live_orders=True
     ai_strategy = AIStrategy(
         pairs=TRADED_PAIRS,
@@ -765,7 +776,8 @@ def main():
 
         priv_client = KrakenPrivateWSClient(
             token=token_str,
-            on_private_event_callback=on_private_event
+            on_private_event_callback=on_private_event,
+            risk_manager=risk_manager_db
         )
 
         # Attach the private client to AIStrategy if we want real orders
