@@ -97,6 +97,36 @@ def get_base_asset(wsname: str) -> str:
     finally:
         conn.close()
 
+def get_asset_value_for_pair(wsname: str, value: str) -> str:
+    """
+    Returns the 'base' column from kraken_asset_pairs where wsname = ?.
+
+    :param value:
+    :param wsname: The WebSocket name of the pair, e.g. "ETH/USD" or "XBT/USD".
+    :type wsname: str
+    :return: The raw 'base' value from the table, e.g. "XETH", "XXBT", or "" if not found.
+    :rtype: str
+    """
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        c = conn.cursor()
+        c.execute(f"""
+            SELECT {value.upper()}
+            FROM kraken_asset_pairs
+            WHERE wsname = ?
+            LIMIT 1
+        """, (wsname,))
+        row = c.fetchone()
+        if row:
+            return row[0]  # e.g. "XETH"
+        logger.warning(f"[db_lookup] No matching base asset for wsname={wsname}")
+        return ""
+    except Exception as e:
+        logger.exception(f"[db_lookup] Error in get_base_asset(wsname='{wsname}'): {e}")
+        return ""
+    finally:
+        conn.close()
+
 
 def get_ordermin(wsname: str) -> float:
     """
@@ -185,7 +215,7 @@ def get_minimum_cost_in_usd(wsname: str) -> float:
 
 if __name__ == "__main__":
     # Example usage / self-test
-    example_wsname = "ETH/USD"
+    example_wsname = "DOGE/USD"
 
     print(f"Testing db_lookup.py for wsname={example_wsname} ...")
 
@@ -197,3 +227,6 @@ if __name__ == "__main__":
 
     min_cost_usd = get_minimum_cost_in_usd(example_wsname)
     print(f"Minimum cost in USD => {min_cost_usd}")
+
+    tick_size = get_asset_value_for_pair(example_wsname, "tick_size")
+    print(f"tick_size => {tick_size}")
