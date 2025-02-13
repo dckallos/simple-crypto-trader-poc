@@ -41,6 +41,8 @@ logs/
 __pycache__/
 *.pyc
 
+prompt.txt
+
 # Jupyter Notebook files
 .ipynb_checkpoints/
 
