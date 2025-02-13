@@ -13,16 +13,25 @@ per pair in 'sub_positions'. Each sub-position has:
   - closed_at (NULL if open)
   - exit_price, realized_pnl when closed
 
-We also track daily realized PnL; if it's below 'max_daily_drawdown', then new
+We track daily realized PnL; if it's below 'max_daily_drawdown', then new
 trades are forced to HOLD. Additionally, 'max_position_size' clamps the
-per-trade size, an optional 'max_position_value' can clamp cost in USD, and
-`initial_spending_account` ensures we don't exceed a total allocated capital.
+per-trade size, an optional 'max_position_value' can clamp cost in USD,
+and `initial_spending_account` ensures we don't exceed a total allocated capital.
 
-NOTE: As of the newer approach, we do NOT immediately insert a sub-position
-upon an AI "BUY" or "SELL" decision. The AIStrategy now creates an order as
-'pending' in the 'trades' table, then we only create a sub-position here if/when
-the order is actually filled. That typically happens in the private feed
-handling code, which can call `_insert_sub_position()` once a fill is confirmed.
+**UPDATED**:
+ - Removed references to 'pending' or partial fill logic from older approaches.
+ - We don't insert sub-positions until a final fill is confirmed (the private
+   feed or another part of code calls `_insert_sub_position()`).
+ - Once a sub-position is created (opened), we do automatic close if a stop-loss
+   or take-profit threshold is reached.
+
+Usage flow:
+  - AIStrategy calls `final_signal, final_size = adjust_trade("BUY", size, "ETH/USD", price)`
+    to see if the trade is allowed.
+  - If final_signal is BUY/SELL, AIStrategy creates a 'pending' order in 'pending_trades'.
+  - Once the order is actually filled, the private feed (or other code) calls
+    `_insert_sub_position(...)` to record the newly open sub-position, or calls
+    `_close_sub_position(...)` when the position is later exited.
 """
 
 import logging
@@ -40,7 +49,7 @@ class RiskManagerDB:
     """
     RiskManagerDB stores multiple sub-positions in the 'sub_positions' table and
     applies constraints:
-      - daily drawdown limit => if daily realized PnL < max_daily_drawdown => force HOLD
+      - daily drawdown limit => if daily realized < max_daily_drawdown => force HOLD
       - clamp trade size by max_position_size
       - optionally clamp cost (size * price) by max_position_value
       - ensures total used capital doesn't exceed `initial_spending_account`
@@ -48,12 +57,9 @@ class RiskManagerDB:
         stop_loss_pct or take_profit_pct are set.
 
     Typical usage flow:
-      - AIStrategy calls `final_signal, final_size = adjust_trade("BUY", size, "ETH/USD", price)`
-        to see if the trade is allowed and properly clamped.
-      - If the final_signal is BUY/SELL, the AIStrategy creates a pending order in `trades`.
-      - Once the private feed (or other code) sees the order fill, it can call
-        `_insert_sub_position()` to record the actual open sub-position, or call
-        `_close_sub_position()` when the position is later exited.
+      - AIStrategy calls `adjust_trade(...)` before creating a pending order.
+      - If fill is confirmed, code calls `_insert_sub_position(...)`.
+      - If the user closes or triggers a stop-loss/take-profit, we call `_close_sub_position(...)`.
     """
 
     def __init__(
@@ -69,11 +75,11 @@ class RiskManagerDB:
         """
         :param db_path: path to your trades.db
         :param max_position_size: clamp for per-trade size (e.g. 0.001 BTC).
-        :param stop_loss_pct: e.g. 0.05 => auto-close if sub-position is -5% from entry.
-        :param take_profit_pct: e.g. 0.10 => auto-close if +10%.
-        :param max_daily_drawdown: e.g. -0.02 => skip new trades if daily realized < -2%.
-        :param max_position_value: optional clamp on cost => trade_size * price <= this.
-        :param initial_spending_account: total allowed capital for all open buy positions.
+        :param stop_loss_pct: e.g. 0.05 => auto-close if -5%
+        :param take_profit_pct: e.g. 0.10 => auto-close if +10%
+        :param max_daily_drawdown: e.g. -0.02 => skip new trades if daily realized < -2%
+        :param max_position_value: optional clamp on cost => trade_size * price <= this
+        :param initial_spending_account: total allowed capital for all open BUY positions
         """
         self.db_path = db_path
         self.max_position_size = max_position_size
@@ -95,7 +101,7 @@ class RiskManagerDB:
                 CREATE TABLE IF NOT EXISTS {SUB_POSITIONS_TABLE} (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     pair TEXT,
-                    side TEXT,       -- "long" or "short"
+                    side TEXT,       -- "long" or "short" (or 'BUY'/'SELL')
                     entry_price REAL,
                     size REAL,
                     created_at INTEGER,
@@ -119,28 +125,26 @@ class RiskManagerDB:
         current_price: float
     ) -> (str, float):
         """
-        Adjust an AI-proposed trade to comply with risk constraints. Returns
-        a final_signal and final_size. If final_signal is "BUY"/"SELL" and final_size > 0,
-        AIStrategy will likely create a "pending" order in 'trades' for future fill.
+        Validate/adjust an AI-proposed trade before creating a pending order:
+         1) If daily realized PnL <= max_daily_drawdown => force HOLD
+         2) If signal not in ("BUY","SELL") => HOLD
+         3) clamp size by self.max_position_size
+         4) if signal=BUY => check total spent so far, ensure (spent + cost) <= initial_spending_account
+         5) if self.max_position_value => clamp cost in USD
+         6) Return final_signal, final_size
 
-        Steps:
-          1) If daily realized PnL <= max_daily_drawdown => force HOLD
-          2) If signal not in ("BUY","SELL") => return HOLD
-          3) clamp size by self.max_position_size
-          4) if signal=BUY => check total spent so far, ensure (spent + cost) <= initial_spending_account
-          5) if self.max_position_value => clamp cost in USD
-          6) Return final_signal, final_size (the sub-position is opened if/when the order is filled).
+        We do not open sub-positions here. That happens only after the trade is filled.
         """
         # 1) daily drawdown check
         if self.max_daily_drawdown is not None:
             daily_pnl = self.get_daily_realized_pnl()
             if daily_pnl <= self.max_daily_drawdown:
                 logger.warning(
-                    f"Daily drawdown limit => realizedPnL={daily_pnl:.4f} <= {self.max_daily_drawdown}, forcing HOLD."
+                    f"Daily drawdown => realizedPnL={daily_pnl:.4f} <= {self.max_daily_drawdown}, forcing HOLD."
                 )
                 return ("HOLD", 0.0)
 
-        # 2) If not BUY/SELL => we hold
+        # 2) If not BUY/SELL => hold
         if signal not in ("BUY", "SELL"):
             return ("HOLD", 0.0)
 
@@ -151,7 +155,7 @@ class RiskManagerDB:
 
         cost = final_size * current_price
 
-        # 4) If signal is BUY => check total spent
+        # 4) If BUY => ensure total spent doesn't exceed initial_spending_account
         if signal == "BUY":
             spent_so_far = self._sum_open_buy_positions()
             if spent_so_far + cost > self.initial_spending_account:
@@ -161,31 +165,27 @@ class RiskManagerDB:
                 )
                 return ("HOLD", 0.0)
 
-        # 5) clamp cost in USD if max_position_value is set
+        # 5) clamp cost if max_position_value is set
         if self.max_position_value and self.max_position_value > 0:
             if cost > self.max_position_value:
                 new_size = self.max_position_value / max(current_price, 1e-9)
                 logger.info(
-                    f"[RiskManager] Clamping trade => cost {cost:.2f} > max_position_value={self.max_position_value}, "
+                    f"[RiskManager] Clamping => cost {cost:.2f} > max_position_value={self.max_position_value}, "
                     f"new size={new_size:.6f}"
                 )
                 final_size = new_size
                 if final_size <= 0:
                     return ("HOLD", 0.0)
-                cost = final_size * current_price
 
-        # Return final_signal/final_size here. We do NOT open a sub-position yet.
-        # That happens only if/when the order is actually filled (triggered by private feed).
         return (signal, final_size)
 
     def check_stop_loss_take_profit(self, pair: str, current_price: float) -> None:
         """
-        Optionally close sub-positions if they cross stop_loss_pct or take_profit_pct.
-        For each open sub-position:
-           - if side=long => unrealized % = (current_price - entry_price)/entry_price
-           - if side=short => unrealized % = (entry_price - current_price)/entry_price
-           If unrealized <= -stop_loss_pct => close
-           If unrealized >= take_profit_pct => close
+        If stop_loss_pct or take_profit_pct is configured, we check each open sub-position:
+         - if side=long => unrealized = (current_price - entry_price)/entry_price
+         - if side=short => unrealized = (entry_price - current_price)/entry_price
+         If below -stop_loss_pct => close
+         If above take_profit_pct => close
         """
         if not self.stop_loss_pct and not self.take_profit_pct:
             return
@@ -201,7 +201,7 @@ class RiskManagerDB:
             size = pos["size"]
 
             # compute unrealized
-            if side == "long":
+            if side in ("long", "BUY"):
                 pct = (current_price - entry) / (entry + 1e-9)
             else:
                 pct = (entry - current_price) / (entry + 1e-9)
@@ -225,7 +225,7 @@ class RiskManagerDB:
     def get_daily_realized_pnl(self, date_str: str = None) -> float:
         """
         Sums realized_pnl from sub_positions *closed* on 'date_str' (UTC). If None,
-        uses today's UTC date. Return 0.0 if none closed that day.
+        uses today's UTC date. Returns 0.0 if none closed that day.
         """
         import datetime
         if not date_str:
@@ -234,13 +234,13 @@ class RiskManagerDB:
         conn = sqlite3.connect(self.db_path)
         try:
             c = conn.cursor()
-            query = f"""
+            q = f"""
                 SELECT IFNULL(SUM(realized_pnl), 0.0)
                 FROM {SUB_POSITIONS_TABLE}
                 WHERE closed_at IS NOT NULL
                   AND DATE(closed_at, 'unixepoch') = ?
             """
-            c.execute(query, (date_str,))
+            c.execute(q, (date_str,))
             row = c.fetchone()
             if row and row[0] is not None:
                 return float(row[0])
@@ -256,8 +256,7 @@ class RiskManagerDB:
     # --------------------------------------------------------------------------
     def _sum_open_buy_positions(self) -> float:
         """
-        Returns the total cost of all open BUY sub-positions, i.e. sum(entry_price * size).
-        This helps ensure we don't exceed initial_spending_account.
+        Returns total cost of all open BUY sub-positions => sum(entry_price * size).
         """
         conn = sqlite3.connect(self.db_path)
         try:
@@ -274,15 +273,16 @@ class RiskManagerDB:
                 return float(row[0])
             return 0.0
         except Exception as e:
-            logger.exception(f"Error summing open buy positions => {e}")
+            logger.exception(f"[RiskManager] Error summing open buy positions => {e}")
             return 0.0
         finally:
             conn.close()
 
     def _insert_sub_position(self, pair: str, side: str, entry_price: float, size: float):
         """
-        Creates an open sub-position row in the DB. Typically called once an
-        order is actually filled (or partially filled).
+        Create an open sub-position row in 'sub_positions'. Typically called once
+        an order is definitely filled (final fill). If partial fill, you can adapt
+        or skip partial logic; this example focuses on final fill only.
         """
         conn = sqlite3.connect(self.db_path)
         try:
@@ -296,14 +296,14 @@ class RiskManagerDB:
             """, (pair, side, entry_price, size, now_ts))
             conn.commit()
         except Exception as e:
-            logger.exception(f"Error inserting sub-position => {e}")
+            logger.exception(f"[RiskManager] Error inserting sub-position => {e}")
         finally:
             conn.close()
 
     def _close_sub_position(self, pos_id: int, exit_price: float, realized_pnl: float):
         """
         Mark sub-position as closed => sets closed_at, exit_price, realized_pnl
-        for the row with ID=pos_id.
+        for that row. Typically called upon final close or triggered by stop-loss/TP.
         """
         conn = sqlite3.connect(self.db_path)
         try:
@@ -316,7 +316,7 @@ class RiskManagerDB:
             """, (now_ts, exit_price, realized_pnl, pos_id))
             conn.commit()
         except Exception as e:
-            logger.exception(f"Error closing sub-position => {e}")
+            logger.exception(f"[RiskManager] Error closing sub-position => {e}")
         finally:
             conn.close()
 
@@ -340,7 +340,7 @@ class RiskManagerDB:
             rows = c.fetchall()
             return [dict(r) for r in rows]
         except Exception as e:
-            logger.exception(f"Error loading open sub-positions for {pair}: {e}")
+            logger.exception(f"[RiskManager] Error loading open sub-positions for {pair}: {e}")
             return []
         finally:
             conn.close()
@@ -350,9 +350,8 @@ class RiskManagerDB:
     # --------------------------------------------------------------------------
     def _compute_realized_pnl(self, side: str, entry_price: float, exit_price: float, size: float) -> float:
         """
-        For a single closed position, realized PnL in base currency terms:
-          if side=long => (exit_price - entry_price) * size
-          if side=short => (entry_price - exit_price) * size
+        If side=long => (exit_price - entry_price)*size
+        If side=short => (entry_price - exit_price)*size
         """
         if side.lower() in ("long", "buy"):
             return (exit_price - entry_price) * size
