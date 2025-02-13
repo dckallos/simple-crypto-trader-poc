@@ -46,6 +46,7 @@ import sqlite3
 
 from db import (
     store_price_history,
+    set_kraken_order_id_for_pending_trade,
     record_trade_in_db,             # for final trade insertion
     mark_pending_trade_open,
     mark_pending_trade_rejected,
@@ -469,6 +470,7 @@ class KrakenPrivateWSClient:
 
         txid = msg.get("txid", "")
         status_str = msg.get("status", "")
+        userref = msg.get("userref")
 
         if status_str == "error":
             # Rejected => mark pending trade as 'rejected'
@@ -496,7 +498,17 @@ class KrakenPrivateWSClient:
             self._finalize_trade_from_kraken(txid, vol_exec, avg_px, fee_val)
         elif status_str == "ok":
             # Possibly an 'open' order => mark pending as open
+            if userref:  # set the kraken_order_id on that pending row
+                set_kraken_order_id_for_pending_trade(int(userref), txid)
             mark_pending_trade_open_by_kraken_id(txid)
+        elif status_str in ("canceled", "expired"):
+            # If vol_exec > 0 => partial fill happened before cancellation
+            # If vol_exec == 0 => fully unfilled => treat as 'rejected' or 'closed' no fill
+            if vol_exec == 0:
+                mark_pending_trade_rejected_by_kraken_id(txid, reason=status_str)
+            else:
+                self._finalize_trade_from_kraken(txid, vol_exec, avg_px, fee_val)
+            return
         else:
             # "open", "part_filled", or other states
             if status_str == "open":
@@ -616,7 +628,15 @@ class KrakenPrivateWSClient:
     # --------------------------------------------------------------------------
     # send_order / cancel_order for private feed
     # --------------------------------------------------------------------------
-    def send_order(self, pair: str, side: str, ordertype: str, volume: float, price: float=None):
+    def send_order(
+            self,
+            pair: str,
+            side: str,
+            ordertype: str,
+            volume: float,
+            price: float = None,
+            userref: int = None
+    ):
         """
         e.g. self.send_order("XBT/USD", "buy", "market", 0.01)
         This results in an 'addOrder' event => 'addOrderStatus' messages indicating success or error.
@@ -639,6 +659,8 @@ class KrakenPrivateWSClient:
             }
             if price is not None:
                 msg["price"] = str(price)
+            if userref is not None:
+                msg["userref"] = userref
             logger.info(f"[PrivateWS] Sending addOrder => {msg}")
             await self._ws.send(json.dumps(msg))
 
