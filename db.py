@@ -448,6 +448,55 @@ def mark_pending_trade_rejected(pending_id: int, reason: str = None):
         conn.close()
 
 
+# def set_pending_trade_kraken_id(pending_id: int, kraken_order_id: str):
+#     """
+#     Sets kraken_order_id on an existing pending trade row by its local 'id'.
+#     This is used right after we receive 'status':'ok' with a new Kraken txid,
+#     so future updates can match by kraken_order_id.
+#     """
+#     conn = sqlite3.connect(DB_FILE)
+#     try:
+#         c = conn.cursor()
+#         c.execute("""
+#             UPDATE pending_trades
+#             SET kraken_order_id = ?
+#             WHERE id = ?
+#         """, (kraken_order_id, pending_id))
+#         conn.commit()
+#         if c.rowcount < 1:
+#             logger.warning(f"No pending_trades row found with id={pending_id} to set kraken_order_id.")
+#         else:
+#             logger.info(f"Set kraken_order_id={kraken_order_id} for pending_id={pending_id}.")
+#     except Exception as e:
+#         logger.exception(f"Error setting pending trade kraken_order_id: {e}")
+#     finally:
+#         conn.close()
+
+
+def set_kraken_order_id_for_pending_trade(pending_id: int, kraken_order_id: str):
+    """
+    Assigns the kraken_order_id (txid from Kraken) to our local pending_trades row
+    once we know which pending_id it belongs to.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        c = conn.cursor()
+        c.execute("""
+            UPDATE pending_trades
+               SET kraken_order_id = ?
+             WHERE id = ?
+        """, (kraken_order_id, pending_id))
+        conn.commit()
+        if c.rowcount < 1:
+            logger.warning(f"[DB] No pending_trades row found with id={pending_id} to set kraken_order_id.")
+        else:
+            logger.info(f"[DB] Assigned kraken_order_id={kraken_order_id} to pending_id={pending_id}.")
+    except Exception as e:
+        logger.exception(f"Error setting kraken_order_id: {e}")
+    finally:
+        conn.close()
+
+
 def mark_pending_trade_closed(pending_id: int, reason: str = None):
     """
     If the trade is fully filled, mark status='closed'.
