@@ -183,31 +183,7 @@ def init_db():
         """)
 
         # ----------------------------------------------------------------------
-        # 8) LUNARCRUSH_TIMESERIES
-        # ----------------------------------------------------------------------
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS lunarcrush_timeseries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                coin_id TEXT,
-                timestamp INTEGER,
-                open_price REAL,
-                close_price REAL,
-                high_price REAL,
-                low_price REAL,
-                volume_24h REAL,
-                market_cap REAL,
-                sentiment REAL,
-                spam REAL,
-                galaxy_score REAL,
-                alt_rank INTEGER,
-                volatility REAL,
-                interactions REAL,
-                social_dominance REAL
-            )
-        """)
-
-        # ----------------------------------------------------------------------
-        # 9) KRAKEN_ASSET_PAIRS (NEW or EXPANDED)
+        # 8) KRAKEN_ASSET_PAIRS (NEW or EXPANDED)
         # ----------------------------------------------------------------------
         create_kraken_asset_pairs_table(conn)
 
