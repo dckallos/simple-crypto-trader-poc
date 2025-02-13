@@ -18,31 +18,14 @@ Implements two separate WebSocket client classes:
    - Can place/cancel orders
    - Requires an API token from Kraken's REST call to GetWebSocketsToken
 
-**ENHANCEMENT**:
-   - We now parse certain private feed messages to handle partial fills, final fills, or rejections
-     in the 'trades' table. For instance, if an "addOrderStatus" message indicates "error",
-     we call `set_trade_rejected(...)`. If it indicates a partial or final fill, we call
-     `update_trade_fill(...)`. This ensures your 'trades' table is kept up-to-date with
-     actual fill size, fees, and status.
-
-Usage in your main code:
-    # A) For public data
-    pub_client = KrakenPublicWSClient(
-        pairs=["XBT/USD","ETH/USD"],
-        feed_type="ticker",             # or "trade"
-        on_ticker_callback=some_function,
-    )
-    pub_client.start()
-
-    # B) For private data
-    priv_client = KrakenPrivateWSClient(
-        token="YOUR_WEBSOCKETS_TOKEN",
-        on_private_event_callback=some_function_for_open_orders
-    )
-    priv_client.start()
-
-Important: Do **not** attempt to subscribe to public feeds using the private endpoint,
-or vice versa. This is why we maintain two different classes.
+**UPDATED**:
+   - We remove partial fill references to the old 'trades' partial fill logic.
+   - We store ephemeral states in 'pending_trades', referencing new DB functions
+     (mark_pending_trade_open, mark_pending_trade_rejected, mark_pending_trade_closed, etc.).
+   - Once an order is fully filled (status='closed'), we record the final trade
+     in the 'trades' table via record_trade_in_db(...) and mark the pending trade closed.
+   - If an order is rejected or canceled, we mark the corresponding pending trade
+     as 'rejected' in that table.
 """
 
 import ssl
@@ -57,10 +40,12 @@ import sqlite3
 
 from db import (
     store_price_history,
-    update_trade_fill,
-    set_trade_rejected
+    record_trade_in_db,             # for final trade insertion
+    mark_pending_trade_open,
+    mark_pending_trade_rejected,
+    mark_pending_trade_closed,
+    create_pending_trade
 )
-
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -259,9 +244,8 @@ class KrakenPublicWSClient:
     async def _handle_trade(self, trades_list, pair: str):
         """
         For 'trade' feed => each item => [price, volume, time, side, orderType, misc].
-        We'll store partial or call a callback. We'll do a simplistic approach => store as last price.
+        We do a simplistic approach => store as last price in price_history table.
         """
-        # We'll just store the last price from each trade in price_history. This is naive
         for trade in trades_list:
             price = float(trade[0])
             vol = float(trade[1])
@@ -287,12 +271,12 @@ class KrakenPrivateWSClient:
 
     - Provide 'token' from the REST call to GetWebSocketsToken.
     - Provide an on_private_event_callback if you want custom logic
-      in addition to our partial fill / final fill updates.
+      in addition to ephemeral/final fill updates.
 
-    We'll parse certain events:
-      * "addOrderStatus" => if "error" => set trade rejected; if "closed" => fully filled
-                            (and we store final fill in 'trades'), if "open" => partial fill.
-      * "openOrders" => can also contain partial fill info (vol_exec, etc.) if you subscribe to it.
+    Updated logic (no partial fill tracking in 'trades' table):
+      * 'pending_trades' is used for ephemeral states
+      * final trades are only inserted in 'trades' once we see a fully closed fill
+      * if rejected, we mark the pending trade as 'rejected'
     """
 
     def __init__(
@@ -403,7 +387,7 @@ class KrakenPrivateWSClient:
         """
         Handle each message from the private feed. We call on_private_event_callback
         if provided. Additionally, we parse "addOrderStatus" or "openOrders" to
-        handle partial fills or rejections in our 'trades' table.
+        update 'pending_trades' and possibly finalize trades in 'trades'.
         """
         try:
             data = json.loads(raw_msg)
@@ -419,7 +403,6 @@ class KrakenPrivateWSClient:
             else:
                 # e.g. addOrderStatus, cancelOrderStatus, error, etc.
                 logger.debug(f"[PrivateWS] Possibly private system => {data}")
-                # attempt to process a recognized structure
                 self._process_private_order_message(data)
 
             if self.on_private_event_callback:
@@ -433,63 +416,60 @@ class KrakenPrivateWSClient:
                 return
 
             feed_name = data[1]
-            # If feed_name == "openOrders" => parse partial fill data from data[0]
             if feed_name == "openOrders":
                 self._process_open_orders(data[0])
 
-            # user callback
             if self.on_private_event_callback:
                 self.on_private_event_callback({"feed_name": feed_name, "data": data})
 
     def _process_private_order_message(self, msg: dict):
         """
-        Attempt to parse an 'addOrderStatus' or similar event to handle partial/final fill or rejections.
-        For example:
+        Attempt to parse 'addOrderStatus' or similar event to handle
+        final fill or rejections in 'pending_trades' table. Then if closed,
+        create a final record in 'trades'.
+
+        Example:
           {
             "event": "addOrderStatus",
             "status": "error",
             "errorMessage": "EGeneral:Invalid arguments:volume minimum not met",
             "txid": "OOS2OH-BFAD3-LQ2LUD"
           }
-
           or
-
           {
             "event":"addOrderStatus",
             "status":"ok",
             "txid":"OOS2OH-BFAD3-LQ2LUD",
             "descr":"buy 0.04000000 AAVEUSD @ market"
           }
-
-          or final data might also be included. If "status":"closed", you might see
-          "vol_exec":"0.04000000","fee":"0.04","avg_price":"280.47"
+          or
+          {
+            "event":"addOrderStatus",
+            "status":"closed",
+            "txid":"OOS2OH-BFAD3-LQ2LUD",
+            "vol_exec":"0.04000000","avg_price":"280.47","fee":"0.04488"
+          }
         """
         if msg.get("event") != "addOrderStatus":
             return
 
-        order_id = msg.get("txid", "")
+        txid = msg.get("txid", "")
         status_str = msg.get("status", "")
 
-        # if "error" => the 'errorMessage' might have the reason
         if status_str == "error":
-            # rejected
-            logger.info(f"[PrivateWS] Order rejected => order_id={order_id}, reason={msg.get('errorMessage','')}")
-            set_trade_rejected(order_id)
+            # Rejected => mark pending trade as 'rejected'
+            reason = msg.get("errorMessage", "")
+            logger.info(f"[PrivateWS] Order rejected => order_id={txid}, reason={reason}")
+            mark_pending_trade_rejected_by_kraken_id(txid, reason)
             return
 
-        # if "ok" => means order is accepted or open; we might not do anything yet
-        # We'll look for partial or final fills in the separate feed "openOrders" or
-        # we might see them here if 'vol_exec' is included.
-        logger.debug(f"[PrivateWS] addOrderStatus => order_id={order_id}, status={status_str}")
+        # If "ok" => means order accepted => we might do mark_pending_trade_open,
+        # but let's see if there's more detail. If "closed" => do final fill logic.
+        logger.debug(f"[PrivateWS] addOrderStatus => order_id={txid}, status={status_str}")
 
-        # If the order is immediately closed or partially filled, we might get
-        # 'vol_exec','avg_price','fee' here. Example:
-        # { "status":"closed","vol_exec":"0.04000000","avg_price":"280.47000", "fee":"0.04488" }
-        # But often that arrives in openOrders feed. We'll parse it here if present:
         vol_exec_str = msg.get("vol_exec", "0.0")
         avg_price_str = msg.get("avg_price", "0.0")
         fee_str = msg.get("fee", "0.0")
-
         try:
             vol_exec = float(vol_exec_str)
             avg_px = float(avg_price_str)
@@ -499,33 +479,28 @@ class KrakenPrivateWSClient:
             avg_px = 0.0
             fee_val = 0.0
 
-        # we can define an internal status for partial fill vs. closed
-        # e.g. "closed" if vol_exec > 0 and status_str == "closed"
-        # or "part_filled" if vol_exec > 0 but status='open'
-        # For minimal approach: if status='closed', we do "closed",
-        # otherwise if vol_exec>0 => "part_filled", else "open".
         if status_str == "closed":
-            new_status = "closed"
-        elif vol_exec > 0:
-            new_status = "part_filled"
+            # Final fill => record trade + mark pending closed
+            self._finalize_trade_from_kraken(txid, vol_exec, avg_px, fee_val)
+        elif status_str == "ok":
+            # Possibly an 'open' order => mark pending as open if you want
+            # We'll do so if there's a pending trade row
+            mark_pending_trade_open_by_kraken_id(txid)
         else:
-            new_status = "open"
-
-        if order_id:
-            update_trade_fill(
-                order_id=order_id,
-                filled_size=vol_exec,
-                avg_fill_price=avg_px,
-                fee=fee_val,
-                status=new_status
-            )
+            # Could be "open" or other. If we want to track open states, do it here.
+            # For partial fill we'd do advanced logic, but we're not tracking partials now.
+            if status_str == "open":
+                mark_pending_trade_open_by_kraken_id(txid)
+            # "part_filled" or other states not used in our new approach
+            pass
 
     def _process_open_orders(self, order_chunk):
         """
         If you subscribe to "openOrders", you'll get a list of orders with fields
-        like 'vol_exec', 'avg_price', 'status', 'cost', 'fee', etc.
+        like 'vol_exec','avg_price','fee','status' etc. We do final fill or rejection
+        in 'pending_trades' as well. Then if final => record in 'trades'.
 
-        Example data structure:
+        Example data chunk:
         [
           {
             "OOS2OH-BFAD3-LQ2LUD": {
@@ -538,9 +513,6 @@ class KrakenPrivateWSClient:
             }
           }
         ]
-        Then there's an array like ["openOrders", {sequence:...}] afterward.
-
-        We'll parse each order in the chunk => update 'trades' table partial/final fill if present.
         """
         if not isinstance(order_chunk, list):
             return
@@ -549,8 +521,8 @@ class KrakenPrivateWSClient:
             # each item should be a dict with key=order_id
             if not isinstance(item, dict):
                 continue
-            for order_id, order_info in item.items():
-                # parse fields
+
+            for txid, order_info in item.items():
                 status_str = order_info.get("status", "")
                 vol_exec_str = order_info.get("vol_exec", "0.0")
                 avg_price_str = order_info.get("avg_price", "0.0")
@@ -566,42 +538,57 @@ class KrakenPrivateWSClient:
                     fee_val = 0.0
 
                 if status_str == "canceled":
-                    # treat as rejected or closed with vol_exec partial?
-                    # For simplicity, let's treat it as 'rejected' if vol_exec=0 else 'closed'
+                    # if vol_exec==0 => fully rejected. else => partial fill then canceled => treat as closed final fill
                     if vol_exec == 0:
-                        logger.info(f"[PrivateWS] Order canceled => {order_id}")
-                        set_trade_rejected(order_id)
-                        continue
+                        logger.info(f"[PrivateWS] Order canceled => {txid}, no fill => reject")
+                        mark_pending_trade_rejected_by_kraken_id(txid, "canceled")
                     else:
-                        # partial fill then canceled => set final fill
-                        logger.info(f"[PrivateWS] Order canceled after partial fill => {order_id}")
-                        update_trade_fill(
-                            order_id=order_id,
-                            filled_size=vol_exec,
-                            avg_fill_price=avg_px,
-                            fee=fee_val,
-                            status="closed"
-                        )
-                        continue
+                        logger.info(f"[PrivateWS] Order canceled after partial fill => {txid}")
+                        # finalize as closed with partial fill
+                        self._finalize_trade_from_kraken(txid, vol_exec, avg_px, fee_val)
+                    continue
 
-                # possibly "open", "closed", or other
-                if status_str == "open":
-                    if vol_exec > 0:
-                        new_status = "part_filled"
-                    else:
-                        new_status = "open"
-                elif status_str == "closed":
-                    new_status = "closed"
+                if status_str == "closed":
+                    logger.info(f"[PrivateWS] Order closed => {txid}, vol_exec={vol_exec}")
+                    self._finalize_trade_from_kraken(txid, vol_exec, avg_px, fee_val)
+                elif status_str == "open":
+                    # you may want to track an 'open' state in pending_trades
+                    mark_pending_trade_open_by_kraken_id(txid)
                 else:
-                    new_status = status_str  # e.g. "expired", "canceled"
+                    logger.debug(f"[PrivateWS] order_id={txid}, status={status_str}, ignoring beyond logs.")
 
-                update_trade_fill(
-                    order_id=order_id,
-                    filled_size=vol_exec,
-                    avg_fill_price=avg_px,
-                    fee=fee_val,
-                    status=new_status
-                )
+    def _finalize_trade_from_kraken(self, kraken_order_id: str, filled_size: float, avg_fill_price: float, fee: float):
+        """
+        Called when an order is definitely 'closed' or canceled-with-partial-fill from Kraken,
+        to insert final row in 'trades' and mark the pending trade as 'closed'.
+        """
+        # 1) We find the pending trade row by kraken_order_id => see below helper
+        row = _fetch_pending_trade_by_kraken_id(kraken_order_id)
+        if not row:
+            logger.warning(f"[PrivateWS] No pending_trades row found for kraken_order_id={kraken_order_id}")
+            return
+
+        pending_id = row[0]
+        pair = row[1]
+        side = row[2]     # might be 'BUY' or 'SELL'
+        requested_qty = row[3]
+
+        # 2) Insert final trade in 'trades' if filled_size>0
+        if filled_size > 0:
+            # record final trade
+            record_trade_in_db(
+                side=side,
+                quantity=filled_size,
+                price=avg_fill_price,
+                order_id=kraken_order_id,
+                pair=pair
+            )
+        else:
+            logger.info(f"[PrivateWS] final fill_size=0 => no trade to record, pair={pair}, side={side}")
+
+        # 3) Mark the pending trade closed with optional reason
+        reason_msg = f"final fill size={filled_size}, fee={fee}"
+        mark_pending_trade_closed(pending_id, reason=reason_msg)
 
     # --------------------------------------------------------------------------
     # send_order / cancel_order for private feed
@@ -609,7 +596,7 @@ class KrakenPrivateWSClient:
     def send_order(self, pair: str, side: str, ordertype: str, volume: float, price: float=None):
         """
         e.g. self.send_order("XBT/USD", "buy", "market", 0.01)
-        This results in an 'addOrder' event => you get 'addOrderStatus' messages indicating success or error.
+        This results in an 'addOrder' event => 'addOrderStatus' messages indicating success or error.
         """
         if not self.token:
             logger.warning("[PrivateWS] No token => cannot place order.")
@@ -655,3 +642,71 @@ class KrakenPrivateWSClient:
 
         if self.loop:
             asyncio.run_coroutine_threadsafe(_cancel(), self.loop)
+
+
+# ------------------------------------------------------------------------------
+# HELPER: fetch pending_trades row by kraken_order_id
+# ------------------------------------------------------------------------------
+def _fetch_pending_trade_by_kraken_id(kraken_order_id: str):
+    """
+    Returns a tuple (id, pair, side, requested_qty) for the row in 'pending_trades'
+    with kraken_order_id=?.
+    """
+    conn = sqlite3.connect("trades.db")
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT id, pair, side, requested_qty
+            FROM pending_trades
+            WHERE kraken_order_id=?
+        """, (kraken_order_id,))
+        row = c.fetchone()
+        return row
+    except Exception as e:
+        logger.exception(f"Error fetching pending_trades row by kraken_order_id={kraken_order_id}: {e}")
+        return None
+    finally:
+        conn.close()
+
+
+def mark_pending_trade_open_by_kraken_id(kraken_order_id: str):
+    """
+    If an order is accepted or recognized as open, update pending_trades => status='open'.
+    We don't do partial fill logic, just a quick status update if we have the row.
+    """
+    conn = sqlite3.connect("trades.db")
+    try:
+        c = conn.cursor()
+        c.execute("""
+            UPDATE pending_trades
+            SET status='open'
+            WHERE kraken_order_id=?
+        """, (kraken_order_id,))
+        conn.commit()
+        if c.rowcount < 1:
+            logger.debug(f"No pending_trades row found with kraken_order_id={kraken_order_id} to mark open.")
+    except Exception as e:
+        logger.exception(f"Error marking pending trade open by kraken_order_id={kraken_order_id}: {e}")
+    finally:
+        conn.close()
+
+
+def mark_pending_trade_rejected_by_kraken_id(kraken_order_id: str, reason: str = None):
+    """
+    If order is rejected by Kraken, set status='rejected'.
+    """
+    conn = sqlite3.connect("trades.db")
+    try:
+        c = conn.cursor()
+        c.execute("""
+            UPDATE pending_trades
+            SET status='rejected', reason=?
+            WHERE kraken_order_id=?
+        """, (reason, kraken_order_id))
+        conn.commit()
+        if c.rowcount < 1:
+            logger.debug(f"No pending_trades row found with kraken_order_id={kraken_order_id} to reject.")
+    except Exception as e:
+        logger.exception(f"Error marking pending trade rejected by kraken_order_id={kraken_order_id}: {e}")
+    finally:
+        conn.close()
