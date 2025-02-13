@@ -143,7 +143,7 @@ class LunarCrushFetcher:
                 posts_created REAL,
                 interactions REAL,
                 social_dominance REAL,
-                UNIQUE(coin_id, timestamp) ON CONFLICT REPLACE
+                UNIQUE(coin_id, timestamp)
             )
             """)
 
