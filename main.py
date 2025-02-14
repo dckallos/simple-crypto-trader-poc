@@ -60,6 +60,16 @@ logging.basicConfig(level=logging.DEBUG)
 
 warnings.simplefilter(action="ignore", category=pd.errors.SettingWithCopyWarning)
 
+class NoHeartbeatFilter(logging.Filter):
+    """
+    A custom logging filter that excludes any records containing 'heartbeat'
+    in their message (case-insensitive). This helps remove repetitive messages
+    from ws_data_feed.py without raising the log level or altering other logs.
+    """
+    def filter(self, record: logging.LogRecord) -> bool:
+        # If 'heartbeat' appears, return False to discard that log
+        return "heartbeat" not in record.getMessage().lower()
+
 LOG_CONFIG = {
     'version': 1,
     'disable_existing_loggers': False,
@@ -94,6 +104,27 @@ LOG_CONFIG = {
         },
     }
 }
+
+def setup_logging():
+    """
+    Sets up Python logging using the existing LOG_CONFIG, then attaches
+    a NoHeartbeatFilter to the logger used by ws_data_feed.py. This
+    ensures that only 'heartbeat' messages are suppressed, preserving all
+    other logs at their current levels.
+    """
+    import logging.config
+
+    # Apply your existing dictConfig from main.py (LOG_CONFIG)
+    logging.config.dictConfig(LOG_CONFIG)
+
+    ws_logger = logging.getLogger("ws_data_feed")
+    wc_logger = logging.getLogger("websockets.client")
+    main_logger = logging.getLogger("__main__")
+    ws_logger.addFilter(NoHeartbeatFilter())
+    wc_logger.addFilter(NoHeartbeatFilter())
+    main_logger.addFilter(NoHeartbeatFilter())
+
+    logging.getLogger(__name__).info("Logging setup complete; heartbeat messages are now suppressed.")
 
 
 def fetch_kraken_balance(api_key: str, api_secret: str) -> Dict[str, float]:
@@ -415,57 +446,52 @@ class HybridApp:
 
     def _format_price_history(self, pair: str, limit: int = 10) -> str:
         """
-        Given rows (descending order), build a list of lines containing:
-          - Timestamp in multiple formats
-          - Bid/Ask/Last
-          - Percentage change from row n to n-1
-        Returns a list of strings instead of printing them.
+        1) Fetches rows (descending order).
+        2) For row i, compares it to row i+1 (the next older row), computing % changes.
+        3) Omits the final row, since it has no row i+1 for comparison.
+        4) Returns a single string with each line in the desired format:
+           Timestamp => Unix: {ts}: Bid=..., Ask=..., Last=...
         """
-        rows = db.fetch_price_history_desc(pair, limit=limit)
+        rows = db.fetch_price_history_desc(pair=pair, limit=limit + 1)
+        if len(rows) < 2:
+            return "Not enough rows to calculate percentage changes."
+
         output_lines = []
-        prev_bid = prev_ask = prev_last = None
 
-        for i, row in enumerate(rows):
-            ts = row["timestamp"]
-            bid = float(row["bid_price"] or 0)
-            ask = float(row["ask_price"] or 0)
-            last = float(row["last_price"] or 0)
+        # We'll loop from i=0 up to i=(len(rows)-2) so row i+1 always exists
+        for i in range(len(rows) - 1):
+            # Row i is the "newer" row
+            row_newer = rows[i]
+            # Row i+1 is the "older" row
+            row_older = rows[i+1]
 
-            # Show the timestamp in multiple ways
-            unix_ts_str = f"Unix: {ts}"
-            local_dt = datetime.datetime.fromtimestamp(ts)
-            local_dt_str = local_dt.strftime("%c")  # e.g. 'Mon Feb 14 08:37:12 2025'
-            custom_dt_str = local_dt.strftime("%Y-%m-%d %H:%M")
+            # Extract the new row's timestamp & prices
+            ts_new = row_newer["timestamp"]
+            bid_new = float(row_newer["bid_price"] or 0)
+            ask_new = float(row_newer["ask_price"] or 0)
+            last_new = float(row_newer["last_price"] or 0)
 
-            if i == 0:
-                lines = [
-                    f"==== Most Recent Prices (Row #{i + 1}) ====",
-                    f"Timestamp => {unix_ts_str} | {local_dt_str} | {custom_dt_str}",
-                    f"Bid={bid:.4f}, Ask={ask:.4f}, Last={last:.4f} | No previous row => no % change."
-                ]
-            else:
-                bid_pct = ((bid - prev_bid) / prev_bid) * 100 if prev_bid else 0
-                ask_pct = ((ask - prev_ask) / prev_ask) * 100 if prev_ask else 0
-                last_pct = ((last - prev_last) / prev_last) * 100 if prev_last else 0
+            # Extract the older row's prices for comparison
+            bid_old = float(row_older["bid_price"] or 0)
+            ask_old = float(row_older["ask_price"] or 0)
+            last_old = float(row_older["last_price"] or 0)
 
-                lines = [
-                    f"==== Row #{i + 1} ====",
-                    f"Timestamp => {unix_ts_str} | {local_dt_str} | {custom_dt_str}",
-                    (
-                        f"Bid={bid:.4f} ({bid_pct:+.2f}%), "
-                        f"Ask={ask:.4f} ({ask_pct:+.2f}%), "
-                        f"Last={last:.4f} ({last_pct:+.2f}%)"
-                    )
-                ]
+            # Compute percentage changes relative to older row
+            # e.g. (current - old)/old * 100
+            bid_pct = ((bid_new - bid_old) / bid_old * 100) if bid_old else 0
+            ask_pct = ((ask_new - ask_old) / ask_old * 100) if ask_old else 0
+            last_pct = ((last_new - last_old) / last_old * 100) if last_old else 0
 
-            # accumulate lines
-            output_lines.extend(lines)
-            output_lines.append("")  # blank line for readability
+            # Format the line per your specs
+            line_str = (
+                f"Timestamp => Unix: {ts_new}: "
+                f"Bid={bid_new:.4f} ({bid_pct}%), "
+                f"Ask={ask_new:.4f} ({ask_pct}%), "
+                f"Last={last_new:.4f} ({last_pct}%)"
+            )
+            output_lines.append(line_str)
 
-            prev_bid = bid
-            prev_ask = ask
-            prev_last = last
-
+        # Join them into a single output string
         return "\n".join(output_lines)
 
     def _build_aggregator_for_pair(self, pair: str) -> Dict[str, Any]:
@@ -546,7 +572,8 @@ class HybridApp:
                         f"pair_name = {db_lookup.get_asset_value_for_pair(pair, 'pair_name')}\n"
                         f"alternative_name = {db_lookup.get_asset_value_for_pair(pair, 'altname')}\n"
                         f"base_asset = {db_lookup.get_base_asset(pair)}\n"
-                        f"price_for_one {pair} = {last_price:.2f}\n"
+                        f"formatted_name = {db_lookup.get_formatted_name_from_pair_name(pair)}\n"
+                        f"price_for_one {pair} = ${last_price}\n"
                         f"price_bucket = {price_bucket}\n"
                         f"ticker_price_history summary for {pair}:\n\n"
                         f"{self._format_price_history(pair=pair, limit=15)}\n\n"
@@ -558,10 +585,10 @@ class HybridApp:
                         f"tick_size = {db_lookup.get_asset_value_for_pair(pair, 'tick_size')}\n"
                         f"volatility = {volatility}\n"
                         f"volume_24h = {volume_24h:.2f}\n"
-                        f"percent_change_1h = {pct_1h:.2f}\n"
-                        f"percent_change_24h = {pct_24h:.2f}\n"
-                        f"percent_change_7d = {pct_7d:.2f}\n"
-                        f"percent_change_30d = {pct_30d:.2f}\n"
+                        f"percent_change_1h = {pct_1h}%\n"
+                        f"percent_change_24h = {pct_24h}%\n"
+                        f"percent_change_7d = {pct_7d:.4f}%\n"
+                        f"percent_change_30d = {pct_30d:.2f}%\n"
                         f"galaxy_score = {galaxy_score} (previous_value = {galaxy_score_previous})\n"
                         f"alt_rank = {alt_rank} (previous_value = {alt_rank_previous})\n"
                         f"market_dominance = {market_dominance:.2f}\n"
@@ -629,13 +656,15 @@ def main():
       5) Subscribes to KrakenPublicWSClient => on_ticker => aggregator cycle
       6) If a valid WS token => also subscribe to private feed => confirm/cancel orders
     """
-    logging.config.dictConfig(LOG_CONFIG)
+    setup_logging()
+    import db_lookup
 
     # 1) Load config
     ENABLE_TRAINING = ConfigLoader.get_value("enable_training", True)
     ENABLE_GPT = ConfigLoader.get_value("enable_gpt_integration", True)
     TRADED_PAIRS = ConfigLoader.get_traded_pairs()
     AGG_INTERVAL = ConfigLoader.get_value("trade_interval_seconds", 300)
+    PRE_POPULATE_DB = ConfigLoader.get_value("pre_populate_db_tables", True)
     risk_controls = ConfigLoader.get_value("risk_controls", {
         "initial_spending_account": 50.0,
         "purchase_upper_limit_percent": 75.0,
@@ -652,6 +681,20 @@ def main():
     # 2) init DB => includes new pending_trades, trades, ledger_entries, etc.
     init_db()
 
+    IS_TIMESERIES_UNDERPOPULATED = db_lookup.is_table_underpopulated(
+        table_name="lunarcrush_timeseries",
+        db_file="trades.db",
+        grouping_vars=["coin_id"],
+        min_row_count=100
+    )
+
+    IS_ASSETS_UNDERPOPULATED = db_lookup.is_table_underpopulated(
+        table_name="kraken_asset_name_lookup",
+        db_file="trades.db",
+        grouping_vars=[],
+        min_row_count=100
+    )
+
     fetch_and_store_kraken_public_asset_pairs(
         info="info",
         country_code="US:MI"
@@ -660,11 +703,8 @@ def main():
     # 3) Possibly fetch Kraken public asset pairs
     logger.info("[Main] Optionally fetching Kraken public asset pairs at startup...")
     rest_manager = KrakenRestManager(api_key=KRAKEN_API_KEY, api_secret=KRAKEN_API_SECRET)
-    # rest_manager.store_asset_pairs_in_db(
-    #     rest_manager.fetch_public_asset_pairs(pair_list=TRADED_PAIRS)
-    # )
-    # fetch_and_store_kraken_public_asset_pairs(pair_list=TRADED_PAIRS)
-    rest_manager.build_coin_name_lookup_from_db()
+    if PRE_POPULATE_DB | IS_ASSETS_UNDERPOPULATED:
+        rest_manager.build_coin_name_lookup_from_db()
     # Also update LunarCrush data & possibly backfill timeseries for each symbol in TRADED_PAIRS
     logger.info("[Main] Updating local lunarcrush_data + timeseries for configured symbols...")
     try:
@@ -674,12 +714,13 @@ def main():
         # Backfill timeseries for each symbol => e.g. 1 month
         import db_lookup
         coin_ids = [db_lookup.get_formatted_name_from_pair_name(pair) for pair in TRADED_PAIRS]
-        fetcher.backfill_coins(
-            coin_ids=coin_ids,
-            months=1,
-            bucket="hour",
-            interval="1w"
-        )
+        if PRE_POPULATE_DB | IS_TIMESERIES_UNDERPOPULATED:
+            fetcher.backfill_coins(
+                coin_ids=coin_ids,
+                months=1,
+                bucket="hour",
+                interval="1w"
+            )
         logger.info("[Main] Successfully updated lunarcrush_data & backfilled timeseries.")
     except Exception as e:
         logger.exception(f"[Main] Error updating lunarcrush => {e}")
