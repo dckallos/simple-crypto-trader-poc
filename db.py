@@ -601,6 +601,35 @@ def create_kraken_asset_pairs_table(conn=None):
         if close_conn:
             conn.close()
 
+
+def fetch_price_history_desc(pair: str, limit: int = 10):
+    """
+    Fetch the most recent `limit` rows of price history for a given pair,
+    sorted by timestamp DESC (newest first).
+    """
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT 
+                timestamp,
+                bid_price, 
+                ask_price,
+                last_price
+            FROM price_history
+            WHERE pair = ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """, (pair, limit))
+        rows = c.fetchall()
+        return rows
+    except Exception as e:
+        print(f"Error fetching price history: {e}")
+        return []
+    finally:
+        conn.close()
+
 def store_kraken_asset_pair_info(pair_name: str, pair_info: Dict[str, Any]):
     """
     Insert or replace the row in kraken_asset_pairs with the data from pair_info.
