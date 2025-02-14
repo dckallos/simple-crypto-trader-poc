@@ -2,9 +2,10 @@ enable_training: true
 enable_live_ai_inference: true
 place_live_orders: true
 enable_gpt_integration: true
-trade_interval_seconds: 120
+trade_interval_seconds: 1200
 min_data_rows: 100
 openai_model: "o1-mini"
+pre_populate_db_tables: false
 
 stop_loss_percent: 0.05
 take_profit_percent: 0.02
