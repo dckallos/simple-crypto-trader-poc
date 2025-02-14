@@ -607,6 +607,69 @@ class KrakenPrivateWSClient:
         #     # no local position updates needed
         #     pass
 
+    # --------------------------------------------------------------------------
+    # send_order / cancel_order for private feed
+    # --------------------------------------------------------------------------
+    def send_order(
+            self,
+            pair: str,
+            side: str,
+            ordertype: str,
+            volume: float,
+            price: float = None,
+            userref: int = None
+    ):
+        """
+        e.g. self.send_order("XBT/USD", "buy", "market", 0.01)
+        This results in an 'addOrder' event => 'addOrderStatus' messages indicating success or error.
+        """
+        if not self.token:
+            logger.warning("[PrivateWS] No token => cannot place order.")
+            return
+        if not self.running or not self._ws:
+            logger.warning("[PrivateWS] Not connected => cannot place order.")
+            return
+
+        async def _send():
+            msg = {
+                "event": "addOrder",
+                "token": self.token,
+                "pair": pair,
+                "ordertype": ordertype,
+                "type": side,
+                "volume": str(volume),
+            }
+            if price is not None:
+                msg["price"] = str(price)
+            if userref is not None:
+                msg["userref"] = userref
+            logger.info(f"[PrivateWS] Sending addOrder => {msg}")
+            await self._ws.send(json.dumps(msg))
+
+        if self.loop:
+            asyncio.run_coroutine_threadsafe(_send(), self.loop)
+
+    def cancel_order(self, txids: list):
+        """Cancel orders => e.g. self.cancel_order(["O6S6CF-ABC123-XYZ987"])"""
+        if not self.token:
+            logger.warning("[PrivateWS] No token => cannot cancel order.")
+            return
+        if not self.running or not self._ws:
+            logger.warning("[PrivateWS] Not connected => cannot cancel order.")
+            return
+
+        async def _cancel():
+            msg = {
+                "event": "cancelOrder",
+                "token": self.token,
+                "txid": txids
+            }
+            logger.info(f"[PrivateWS] Sending cancelOrder => {msg}")
+            await self._ws.send(json.dumps(msg))
+
+        if self.loop:
+            asyncio.run_coroutine_threadsafe(_cancel(), self.loop)
+
     def _finalize_trade_from_kraken(self, kraken_order_id: str, filled_size: float, avg_fill_price: float, fee: float):
         """
         Called from openOrders or addOrderStatus for partial/canceled orders,
