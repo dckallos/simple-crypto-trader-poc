@@ -11,9 +11,14 @@ derives net position and cost basis from the 'trades' table for each pair.
 """
 
 import logging
+import os
 import sqlite3
 import datetime
 from typing import Tuple
+
+import db_lookup
+from ai_strategy import rest_manager
+from config_loader import ConfigLoader
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -75,8 +80,8 @@ class RiskManagerDB:
         pair: str,
         current_price: float,
         kraken_balances: dict,
-        stop_loss_pct: float = 0.05,
-        take_profit_pct: float = 0.10
+        stop_loss_pct: float = ConfigLoader.get_value("stop_loss_percent"),
+        take_profit_pct: float = ConfigLoader.get_value("take_profit_percent")
     ):
         """
         Called each time a new price for `pair` arrives from the public feed.
@@ -230,8 +235,9 @@ class RiskManagerDB:
                 return ("HOLD", 0.0)
 
             # check real-time USD
-            quote_asset = self._guess_quote_symbol(pair)
-            free_usd = kraken_balances.get(quote_asset, 0.0)
+            quote_asset = self._get_quote_symbol(pair)
+            balances = rest_manager.fetch_balance()
+            free_usd = balances.get(quote_asset, 0.0)
             if cost > free_usd:
                 logger.info(
                     f"[RiskManager] Not enough {quote_asset} => cost={cost:.2f}, free={free_usd:.2f}"
@@ -240,12 +246,12 @@ class RiskManagerDB:
 
         # SELL checks
         if signal == "SELL":
-            base_symbol = pair.split("/")[0].upper()
-            kraken_base = self._guess_base_symbol(base_symbol)
-            free_coins = kraken_balances.get(kraken_base, 0.0)
+            base_symbol = self._get_base_symbol(pair)
+            balances = rest_manager.fetch_balance()
+            free_coins = balances.get(base_symbol, 0.0)
             if final_size > free_coins:
                 logger.info(
-                    f"[RiskManager] Not enough {kraken_base} => requested={final_size}, have={free_coins}"
+                    f"[RiskManager] Not enough {base_symbol} => requested={final_size}, have={free_coins}"
                 )
                 return ("HOLD", 0.0)
 
@@ -278,16 +284,23 @@ class RiskManagerDB:
         finally:
             conn.close()
 
-    # Helpers for buy/sell checks
-    def _guess_quote_symbol(self, pair: str) -> str:
-        quote_raw = pair.split("/")[-1].upper()
-        if quote_raw == "USD":
-            return "ZUSD"
-        if quote_raw == "EUR":
-            return "ZEUR"
-        return quote_raw
+    # # Helpers for buy/sell checks
+    # def _guess_quote_symbol(self, pair: str) -> str:
+    #     import db_lookup
+    #     quote_raw = db_lookup.get_asset_value_for_pair(pair, value="quote")
+    #     if quote_raw == "USD":
+    #         return "ZUSD"
+    #     if quote_raw == "EUR":
+    #         return "ZEUR"
+    #     return quote_raw
 
-    def _guess_base_symbol(self, base_symbol: str) -> str:
-        if base_symbol in ("XBT", "BTC"):
-            return "XXBT"
-        return "X" + base_symbol
+    def _get_quote_symbol(self, pair: str) -> str:
+        return db_lookup.get_asset_value_for_pair(pair, value="quote")
+
+    # def _guess_base_symbol(self, base_symbol: str) -> str:
+    #     if base_symbol in ("XBT", "BTC"):
+    #         return "XXBT"
+    #     return "X" + base_symbol
+
+    def _get_base_symbol(self, pair: str) -> str:
+        return db_lookup.get_base_asset(pair)
