@@ -39,6 +39,8 @@ import openai
 from openai import OpenAI
 from openai import APIConnectionError, APIStatusError, RateLimitError
 
+from config_loader import ConfigLoader
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -281,13 +283,22 @@ class GPTManager:
             "\t\t1. The chosen quantity must be relayed in the base currency.\n"
             "\t\t2. The chosen quantity must be higher than the \"minimum purchase quantity\" of the base asset.\n"
             "\t\t3. The chosen quantity must respect the \"tick size\" in determining quantity increment.\n"
-            "\t\t4. The chosen quantity must have considered the implications of this trade given the corresponding "
+            "\t\t4. Do not be shaken by small price fluctuations once a coin is purchased with USD. "
+            "The volatility of the coin is extremely high, and significant fluctuations are expected by design. \n"
+            f"\t\t\tThe stop-loss percent is {float(ConfigLoader.get_value("stop_loss_percent"))*100}%.\n"
+            f"\t\t\tThe take-profit percent is {float(ConfigLoader.get_value("take_profit_percent"))*100}%.\n"
+            "\t\t5. Do not become aggressive with trading decisions in each response. "
+            "It is important to allow investments time to increase in value, given your recommendations "
+            "to invest in these coins in the first place. You are not making decisions for the next 24 hours. "
+            f"You will be asked to repeat your response in {ConfigLoader.get_value("trade_interval_seconds", 900)} seconds. "
+            "Additionally, stop-loss and take-profit exit strategies are handled by this application on a continuous basis.\n"
+            "\t\t6. The chosen quantity must have considered the implications of this trade given the corresponding "
             "value in USD, and how buy/sell decisions directly increase or decrease the amount in USD that is "
             "available for trades.\n"
-            "\t3. Return final JSON => {\n"
-            " \"decisions\":[{\"pair\":\"...\",\"action\":\"BUY|SELL|HOLD\",\"size\":float},...],\n"
-            " \"rationale\":\"...\"\n"
-            "}\n\n"
+            "\t3. Return final JSON => \n\t{\n"
+            " \t\"decisions\":[{\"pair\":\"...\",\"action\":\"BUY|SELL|HOLD\",\"size\":float},...],\n"
+            " \t\"rationale\":\"...\"\n"
+            "\t}\n\n"
             "Rationale must be ≤300 chars, numeric or technical justifications.\n"
             "EXAMPLE:\n"
             "Work out your own reasoning => <hidden>\n"
