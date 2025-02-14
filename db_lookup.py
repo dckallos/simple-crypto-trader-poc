@@ -68,34 +68,133 @@ def _normalize_symbol(symbol: str) -> str:
     return symbol
 
 
-def get_base_asset(wsname: str) -> str:
+def is_table_underpopulated(
+    table_name: str,
+    db_file: str,
+    grouping_vars: list[str],
+    min_row_count: int
+) -> bool:
     """
-    Returns the 'base' column from kraken_asset_pairs where wsname = ?.
+    Checks whether a table has enough rows overall (if no grouping vars)
+    or enough rows on average per group (if grouping vars exist).
 
-    :param wsname: The WebSocket name of the pair, e.g. "ETH/USD" or "XBT/USD".
-    :type wsname: str
-    :return: The raw 'base' value from the table, e.g. "XETH", "XXBT", or "" if not found.
-    :rtype: str
+    :param table_name: The name of the SQLite table to query.
+    :param db_file: Path to the SQLite database file.
+    :param grouping_vars: A list of column names on which to GROUP BY.
+                         E.g. ["symbol","side"] or [] if none.
+    :param min_row_count: The threshold:
+       - If grouping_vars is empty, the table's total row count must exceed this.
+       - If grouping_vars is non-empty, the average (mean) row count across all groups must exceed this.
+    :return: True if the condition is satisfied, False otherwise.
     """
-    conn = sqlite3.connect(DB_FILE)
+    if not table_name:
+        logger.error("No table_name provided.")
+        return False
+
+    conn = sqlite3.connect(db_file)
     try:
         c = conn.cursor()
-        c.execute("""
-            SELECT base
+
+        # CASE 1: No grouping variables => total row count
+        if not grouping_vars:
+            query = f"SELECT COUNT(*) FROM {table_name}"
+            c.execute(query)
+            row = c.fetchone()
+            total_rows = row[0] if row else 0
+
+            logger.debug(f"[check_table_minimum_rows] {table_name} => total_rows={total_rows}")
+            return total_rows < min_row_count
+
+        # CASE 2: We have grouping variables => average row count per group
+        # e.g. SELECT col1, col2, COUNT(*) as cnt FROM table_name GROUP BY col1, col2
+        col_list = ",".join(grouping_vars)
+        query = (
+            f"SELECT {col_list}, COUNT(*) as group_count "
+            f"FROM {table_name} "
+            f"GROUP BY {col_list}"
+        )
+        c.execute(query)
+        rows = c.fetchall()
+        if not rows:
+            # If grouping yields no rows, average is effectively zero
+            logger.debug(f"[check_table_minimum_rows] {table_name} => no groups found.")
+            return False
+
+        # compute average of group_count
+        sum_counts = 0
+        for r in rows:
+            # last column is group_count (index = len(grouping_vars))
+            group_count = r[len(grouping_vars)]
+            sum_counts += group_count
+
+        avg_count = float(sum_counts) / len(rows)
+        logger.debug(
+            f"[check_table_minimum_rows] {table_name} => found {len(rows)} groups, avg_count={avg_count:.2f}"
+        )
+
+        return avg_count < min_row_count
+
+    except Exception as e:
+        logger.exception(f"Error checking row counts for table={table_name}: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def map_kraken_asset_pairs(
+        search_value: str,
+        input_colname: str = "wsname",
+        output_colname: str = "base",
+        db_file: str = DB_FILE
+) -> str:
+    """
+    Retrieves a specific column value (`output_colname`) from the `kraken_asset_pairs` table,
+    by matching `input_colname` against a given `search_value`.
+
+    Example: If you're storing pairs with "wsname"="ETH/USD", calling
+    map_kraken_asset_pairs("ETH/USD", "wsname", "base") might return "XETH".
+
+    :param search_value: The actual value to look up in `input_colname`.
+                        e.g. "ETH/USD" if input_colname="wsname".
+    :type search_value: str
+    :param input_colname: The column name to match in the query. Defaults to "wsname".
+                         Other valid columns might be "altname", etc.
+    :type input_colname: str
+    :param output_colname: The column name to retrieve if a match is found. Defaults to "base".
+                           e.g. "base", "quote", "wsname", etc.
+    :type output_colname: str
+    :param db_file: Path to your SQLite database. Defaults to the module-level DB_FILE.
+    :type db_file: str
+
+    :return: The string value of `output_colname` if found, otherwise "".
+    :rtype: str
+    """
+    conn = sqlite3.connect(db_file)
+    try:
+        c = conn.cursor()
+        query = f"""
+            SELECT {output_colname}
             FROM kraken_asset_pairs
-            WHERE wsname = ?
+            WHERE {input_colname} = ?
             LIMIT 1
-        """, (wsname,))
+        """
+        c.execute(query, (search_value,))
         row = c.fetchone()
         if row:
-            return row[0]  # e.g. "XETH"
-        logger.warning(f"[db_lookup] No matching base asset for wsname={wsname}")
+            return row[0]  # e.g. "XETH" or "XXBT"
+        logger.warning(
+            f"[db_lookup] No matching row in 'kraken_asset_pairs' "
+            f"for {input_colname}='{search_value}' => cannot retrieve '{output_colname}'."
+        )
         return ""
     except Exception as e:
-        logger.exception(f"[db_lookup] Error in get_base_asset(wsname='{wsname}'): {e}")
+        logger.exception(
+            f"[db_lookup] Error retrieving '{output_colname}' where {input_colname}='{search_value}': {e}"
+        )
         return ""
     finally:
         conn.close()
+
 
 def get_asset_value_for_pair(wsname: str, value: str) -> str:
     """
@@ -190,6 +289,36 @@ def get_formatted_name_from_pair_name(wsname: str) -> str | None:
         conn.close()
 
 
+def get_base_asset(wsname: str) -> str:
+    """
+    Returns the 'base' column from kraken_asset_pairs where wsname = ?.
+
+    :param wsname: The WebSocket name of the pair, e.g. "ETH/USD" or "XBT/USD".
+    :type wsname: str
+    :return: The raw 'base' value from the table, e.g. "XETH", "XXBT", or "" if not found.
+    :rtype: str
+    """
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT base
+            FROM kraken_asset_pairs
+            WHERE wsname = ?
+            LIMIT 1
+        """, (wsname,))
+        row = c.fetchone()
+        if row:
+            return row[0]  # e.g. "XETH"
+        logger.warning(f"[db_lookup] No matching base asset for wsname={wsname}")
+        return ""
+    except Exception as e:
+        logger.exception(f"[db_lookup] Error in get_base_asset(wsname='{wsname}'): {e}")
+        return ""
+    finally:
+        conn.close()
+
+
 def get_minimum_cost_in_usd(wsname: str) -> float:
     """
     Calculate the minimum cost in USD by:
@@ -213,7 +342,7 @@ def get_minimum_cost_in_usd(wsname: str) -> float:
         return 0.0
 
     # Normalize base to match how it's stored in lunarcrush_data.symbol
-    symbol = _normalize_symbol(base)
+    symbol = get_formatted_name_from_pair_name(wsname)
 
     conn = sqlite3.connect(DB_FILE)
     try:
