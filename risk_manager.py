@@ -15,13 +15,20 @@ import os
 import sqlite3
 import datetime
 from typing import Tuple
+from dotenv import load_dotenv
 
 import db_lookup
-from ai_strategy import rest_manager
 from config_loader import ConfigLoader
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+from kraken_rest_manager import KrakenRestManager
+load_dotenv()
+rest_manager = KrakenRestManager(
+    api_key=os.getenv("KRAKEN_API_KEY"),
+    api_secret=os.getenv("KRAKEN_SECRET_API_KEY")
+)
 
 DB_FILE = "trades.db"  # Ensure this matches your actual DB path
 
