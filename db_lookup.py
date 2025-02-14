@@ -159,6 +159,37 @@ def get_ordermin(wsname: str) -> float:
         conn.close()
 
 
+def get_formatted_name_from_pair_name(wsname: str) -> str | None:
+    """
+    Returns the 'ordermin' value (minimum order size in coin units) from kraken_asset_pairs
+    for a given wsname. The 'ordermin' is stored as text in the DB, so we convert it to float.
+
+    :param wsname: The WebSocket name of the pair, e.g. "ETH/USD".
+    :type wsname: str
+    :return: The minimum order size as a float. Returns 0.0 if not found or on error.
+    :rtype: float
+    """
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT formatted_base_asset_name
+            FROM kraken_asset_name_lookup
+            WHERE wsname = ?
+            LIMIT 1
+        """, (wsname,))
+        row = c.fetchone()
+        if row and row[0] is not None:
+            return str(row[0])
+        logger.warning(f"[db_lookup] Could not find ordermin for wsname={wsname}")
+        return None
+    except Exception as e:
+        logger.exception(f"[db_lookup] Error in get_ordermin(wsname='{wsname}'): {e}")
+        return None
+    finally:
+        conn.close()
+
+
 def get_minimum_cost_in_usd(wsname: str) -> float:
     """
     Calculate the minimum cost in USD by:
