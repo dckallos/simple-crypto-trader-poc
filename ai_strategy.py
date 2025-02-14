@@ -39,9 +39,16 @@ from db import (
 )
 from risk_manager import RiskManagerDB
 from gpt_manager import GPTManager
+from kraken_rest_manager import KrakenRestManager
+from dotenv import load_dotenv
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.DEBUG)
+rest_manager = KrakenRestManager(
+    os.getenv("KRAKEN_API_KEY"),
+    os.getenv("KRAKEN_SECRET_API_KEY")
+)
 
 
 class AIStrategy:
@@ -67,7 +74,7 @@ class AIStrategy:
         risk_controls: Optional[Dict[str, Any]] = None,
         gpt_model: str = "o1-mini",
         gpt_temperature: float = 1.0,
-        gpt_max_tokens: int = 2000,
+        gpt_max_tokens: int = 5000,
         private_ws_client=None,
         place_live_orders: bool = False
     ):
@@ -174,7 +181,7 @@ class AIStrategy:
         final_action, final_size = self._post_validate(action_raw, suggested_size, current_px)
         # Pass to risk_manager => daily drawdown, real-time balance checks
         final_action, final_size = self.risk_manager_db.adjust_trade(
-            final_action, final_size, pair, current_px, kraken_balances={}   # or pass your balances
+            final_action, final_size, pair, current_px, rest_manager.fetch_balance()
         )
 
         rationale = (f"GPT single => final={final_action}, size={final_size}, "
@@ -202,7 +209,7 @@ class AIStrategy:
         if px < 20000:
             action, size = self._post_validate("BUY", 0.0005, px)
             action, size = self.risk_manager_db.adjust_trade(
-                action, size, pair, px, kraken_balances={}  # your real balances
+                action, size, pair, px, rest_manager.fetch_balance()
             )
             rationale = f"[FALLBACK] => px={px} <20000 => {action} {size}"
             if action == "BUY" and size > 0:
@@ -334,7 +341,7 @@ class AIStrategy:
             final_action, final_size = self._post_validate(action_raw, size_suggested, px)
             # pass to risk_manager => daily drawdown check
             final_action, final_size = self.risk_manager_db.adjust_trade(
-                final_action, final_size, pair, px, kraken_balances={}
+                final_action, final_size, pair, px, rest_manager.fetch_balance()
             )
             rationale = f"GPT multi => {pair} => final={final_action}, size={final_size}"
 
@@ -444,10 +451,10 @@ class AIStrategy:
         if not rc:
             return (action, size_suggested)
 
-        min_buy = rc.get("minimum_buy_amount", 6.0)
-        if action == "BUY" and cost < min_buy:
-            logger.info(f"[post_validate] cost={cost:.2f} < min_buy={min_buy:.2f} => hold")
-            return ("HOLD", 0.0)
+        # min_buy = rc.get("minimum_buy_amount", 6.0)
+        # if action == "BUY" and cost < min_buy:
+        #     logger.info(f"[post_validate] cost={cost:.2f} < min_buy={min_buy:.2f} => hold")
+        #     return ("HOLD", 0.0)
 
         return (action, size_suggested)
 
