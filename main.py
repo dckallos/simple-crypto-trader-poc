@@ -43,7 +43,9 @@ import warnings
 import sqlite3
 import pandas as pd
 from typing import Optional, Dict, Any, List
+import datetime
 
+import db
 # Local modules
 from db import init_db, DB_FILE
 from ai_strategy import AIStrategy
@@ -295,38 +297,6 @@ def fetch_and_store_kraken_public_asset_pairs(
         logger.exception(f"[AssetPairs] Unexpected => {e}")
 
 
-# def fetch_and_store_kraken_public_asset_pairs(
-#     pair_list: Optional[List[str]] = None
-# ) -> None:
-#     """
-#     Example function to fetch & store Kraken public asset pairs in 'kraken_asset_pairs'.
-#     """
-#     from db import store_kraken_asset_pair_info
-#
-#     url = "https://api.kraken.com/0/public/AssetPairs"
-#     params = {}
-#     if pair_list:
-#         joined = ",".join(pair_list)
-#         params["pair"] = joined
-#     logger.info(f"[AssetPairs] GET => {url} with params={params}")
-#
-#     try:
-#         resp = requests.get(url, params=params, timeout=10)
-#         resp.raise_for_status()
-#         j = resp.json()
-#         if j.get("error"):
-#             logger.error(f"[AssetPairs] error => {j['error']}")
-#             return
-#         results = j.get("result", {})
-#         count = 0
-#         for pair_name, pair_info in results.items():
-#             store_kraken_asset_pair_info(pair_name, pair_info)
-#             count += 1
-#         logger.info(f"[AssetPairs] Upserted {count} pairs.")
-#     except Exception as e:
-#         logger.exception(f"[AssetPairs] => {e}")
-
-
 class HybridApp:
     """
     A combined aggregator that:
@@ -413,7 +383,7 @@ class HybridApp:
 
         # Example trade_history + open_positions usage for AIStrategy => multi-coin approach
         trade_history = self._build_global_trade_history(limit=10)
-        open_positions_txt = self._build_open_positions_list()
+        open_positions_txt = []
 
         zero_count = sum(1 for p in self.pairs if self.latest_prices[p] == 0.0)
         if zero_count > 0:
@@ -423,7 +393,7 @@ class HybridApp:
         decisions = self.strategy.predict_multi_coins(
             input_aggregator_list=aggregator_list,
             trade_history=trade_history,
-            max_trades=5,
+            max_trades=25,
             input_open_positions=open_positions_txt,
             current_balance=current_usd_balance,
             current_trade_balance=trade_balances
@@ -442,13 +412,69 @@ class HybridApp:
         except Exception as e:
             logger.exception(f"[Aggregator] Error updating lunarcrush_data => {e}")
 
+
+    def _format_price_history(self, pair: str, limit: int = 10) -> str:
+        """
+        Given rows (descending order), build a list of lines containing:
+          - Timestamp in multiple formats
+          - Bid/Ask/Last
+          - Percentage change from row n to n-1
+        Returns a list of strings instead of printing them.
+        """
+        rows = db.fetch_price_history_desc(pair, limit=limit)
+        output_lines = []
+        prev_bid = prev_ask = prev_last = None
+
+        for i, row in enumerate(rows):
+            ts = row["timestamp"]
+            bid = float(row["bid_price"] or 0)
+            ask = float(row["ask_price"] or 0)
+            last = float(row["last_price"] or 0)
+
+            # Show the timestamp in multiple ways
+            unix_ts_str = f"Unix: {ts}"
+            local_dt = datetime.datetime.fromtimestamp(ts)
+            local_dt_str = local_dt.strftime("%c")  # e.g. 'Mon Feb 14 08:37:12 2025'
+            custom_dt_str = local_dt.strftime("%Y-%m-%d %H:%M")
+
+            if i == 0:
+                lines = [
+                    f"==== Most Recent Prices (Row #{i + 1}) ====",
+                    f"Timestamp => {unix_ts_str} | {local_dt_str} | {custom_dt_str}",
+                    f"Bid={bid:.4f}, Ask={ask:.4f}, Last={last:.4f} | No previous row => no % change."
+                ]
+            else:
+                bid_pct = ((bid - prev_bid) / prev_bid) * 100 if prev_bid else 0
+                ask_pct = ((ask - prev_ask) / prev_ask) * 100 if prev_ask else 0
+                last_pct = ((last - prev_last) / prev_last) * 100 if prev_last else 0
+
+                lines = [
+                    f"==== Row #{i + 1} ====",
+                    f"Timestamp => {unix_ts_str} | {local_dt_str} | {custom_dt_str}",
+                    (
+                        f"Bid={bid:.4f} ({bid_pct:+.2f}%), "
+                        f"Ask={ask:.4f} ({ask_pct:+.2f}%), "
+                        f"Last={last:.4f} ({last_pct:+.2f}%)"
+                    )
+                ]
+
+            # accumulate lines
+            output_lines.extend(lines)
+            output_lines.append("")  # blank line for readability
+
+            prev_bid = bid
+            prev_ask = ask
+            prev_last = last
+
+        return "\n".join(output_lines)
+
     def _build_aggregator_for_pair(self, pair: str) -> Dict[str, Any]:
         """
         Gathers aggregator_summaries info and recent price from lunarcrush_data. Returns
         a dict with 'pair', 'price', and 'aggregator_data' describing aggregator fields.
         """
         import db_lookup
-        lunarcrush_symbol = pair.split("/")[0].upper()
+        lunarcrush_symbol = db_lookup.get_formatted_name_from_pair_name(pair)
         symbol = db_lookup.get_base_asset(pair)
         last_price = 0.0
         aggregator_text = "No aggregator data found"
@@ -522,6 +548,8 @@ class HybridApp:
                         f"base_asset = {db_lookup.get_base_asset(pair)}\n"
                         f"price_for_one {pair} = {last_price:.2f}\n"
                         f"price_bucket = {price_bucket}\n"
+                        f"ticker_price_history summary for {pair}:\n\n"
+                        f"{self._format_price_history(pair=pair, limit=15)}\n\n"
                         f"recent_price_history_by_hour:\n"
                         f"{json.dumps(db_lookup.get_recent_timeseries_for_coin(db_lookup.get_base_asset(pair)), indent=4)}\n"
                         f"minimum_purchase_quantity for {pair} = {db_lookup.get_ordermin(pair)}\n"
@@ -534,8 +562,8 @@ class HybridApp:
                         f"percent_change_24h = {pct_24h:.2f}\n"
                         f"percent_change_7d = {pct_7d:.2f}\n"
                         f"percent_change_30d = {pct_30d:.2f}\n"
-                        f"galaxy_score={galaxy_score} (previous_value = {galaxy_score_previous})\n"
-                        f"alt_rank={alt_rank} (previous_value = {alt_rank_previous})\n"
+                        f"galaxy_score = {galaxy_score} (previous_value = {galaxy_score_previous})\n"
+                        f"alt_rank = {alt_rank} (previous_value = {alt_rank_previous})\n"
                         f"market_dominance = {market_dominance:.2f}\n"
                         f"dominance_bucket = {dominance_bucket}\n"
                         f"social_sentiment = {sentiment}\n"
