@@ -616,35 +616,6 @@ class HybridApp:
             conn.close()
         return lines
 
-    def _build_open_positions_list(self) -> List[str]:
-        """
-        Return textual list of open sub_positions.
-        If you truly removed sub_positions, this might be empty or legacy.
-        We'll keep it intact for minimal code disturbance.
-        """
-        lines = []
-        conn = sqlite3.connect(DB_FILE)
-        try:
-            conn.row_factory = sqlite3.Row
-            c = conn.cursor()
-            c.execute("""
-            SELECT pair, side, entry_price, size
-            FROM sub_positions
-            WHERE closed_at IS NULL
-            """)
-            rows = c.fetchall()
-            for r in rows:
-                p = r["pair"]
-                s = r["side"]
-                e = r["entry_price"]
-                z = r["size"]
-                lines.append(f"{p} {s.upper()} {z}, entry={e}")
-        except Exception as e:
-            logger.exception(f"[Aggregator] error building open_positions => {e}")
-        finally:
-            conn.close()
-        return lines
-
 
 def main():
     """
