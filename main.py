@@ -247,37 +247,84 @@ def get_latest_zusd_balance(db_path="trades.db") -> float:
     finally:
         conn.close()
 
-
 def fetch_and_store_kraken_public_asset_pairs(
-    pair_list: Optional[List[str]] = None
-) -> None:
+    pair_list: Optional[List[str]] = None,
+    info: str = "info",
+    country_code: Optional[str] = None
+):
     """
-    Example function to fetch & store Kraken public asset pairs in 'kraken_asset_pairs'.
+    (Truncated doc) => Retrieves and stores kraken asset pairs in 'kraken_asset_pairs'.
     """
     from db import store_kraken_asset_pair_info
 
-    url = "https://api.kraken.com/0/public/AssetPairs"
+    base_url = "https://api.kraken.com/0/public/AssetPairs"
     params = {}
     if pair_list:
-        joined = ",".join(pair_list)
-        params["pair"] = joined
-    logger.info(f"[AssetPairs] GET => {url} with params={params}")
+        joined_pairs = ",".join(pair_list)
+        params["pair"] = joined_pairs
+    if info:
+        params["info"] = info
+    if country_code:
+        params["country_code"] = country_code
 
+    logger.info(f"[AssetPairs] GET => {base_url}, params={params}")
     try:
-        resp = requests.get(url, params=params, timeout=10)
+        resp = requests.get(base_url, params=params, timeout=10)
         resp.raise_for_status()
         j = resp.json()
-        if j.get("error"):
-            logger.error(f"[AssetPairs] error => {j['error']}")
+        err_arr = j.get("error", [])
+        if err_arr:
+            logger.error(f"[AssetPairs] Returned error => {err_arr}")
             return
+
         results = j.get("result", {})
+        if not results:
+            logger.warning("[AssetPairs] result is empty => no asset pairs returned.")
+            return
+
         count = 0
         for pair_name, pair_info in results.items():
             store_kraken_asset_pair_info(pair_name, pair_info)
             count += 1
-        logger.info(f"[AssetPairs] Upserted {count} pairs.")
+        logger.info(f"[AssetPairs] Upserted {count} pairs into kraken_asset_pairs.")
+    except requests.exceptions.RequestException as e:
+        logger.exception(f"[AssetPairs] HTTP request error => {e}")
+    except json.JSONDecodeError as e:
+        logger.exception(f"[AssetPairs] Non-JSON response => {e}")
     except Exception as e:
-        logger.exception(f"[AssetPairs] => {e}")
+        logger.exception(f"[AssetPairs] Unexpected => {e}")
+
+
+# def fetch_and_store_kraken_public_asset_pairs(
+#     pair_list: Optional[List[str]] = None
+# ) -> None:
+#     """
+#     Example function to fetch & store Kraken public asset pairs in 'kraken_asset_pairs'.
+#     """
+#     from db import store_kraken_asset_pair_info
+#
+#     url = "https://api.kraken.com/0/public/AssetPairs"
+#     params = {}
+#     if pair_list:
+#         joined = ",".join(pair_list)
+#         params["pair"] = joined
+#     logger.info(f"[AssetPairs] GET => {url} with params={params}")
+#
+#     try:
+#         resp = requests.get(url, params=params, timeout=10)
+#         resp.raise_for_status()
+#         j = resp.json()
+#         if j.get("error"):
+#             logger.error(f"[AssetPairs] error => {j['error']}")
+#             return
+#         results = j.get("result", {})
+#         count = 0
+#         for pair_name, pair_info in results.items():
+#             store_kraken_asset_pair_info(pair_name, pair_info)
+#             count += 1
+#         logger.info(f"[AssetPairs] Upserted {count} pairs.")
+#     except Exception as e:
+#         logger.exception(f"[AssetPairs] => {e}")
 
 
 class HybridApp:
@@ -330,7 +377,7 @@ class HybridApp:
         """
         self.latest_prices[pair] = last_price
         now = time.time()
-        if (now - self.last_agg_ts) >= self.aggregator_interval:
+        if (now - self.last_agg_ts) >= ConfigLoader.get_value("trade_interval_seconds", 300):
             self.aggregator_cycle_all_coins()
             self.last_agg_ts = now
 
@@ -470,28 +517,29 @@ class HybridApp:
                     import json
                     aggregator_text = (
                         f"[{pair}]\n"
-                        f"\tpair_name = {db_lookup.get_asset_value_for_pair(pair, 'pair_name')}\n"
-                        f"\talternative_name = {db_lookup.get_asset_value_for_pair(pair, 'altname')}\n"
-                        f"\tbase_asset = {db_lookup.get_base_asset(pair)}\n"
-                        f"\tprice = {last_price:.2f}\n"
-                        f"\tprice_bucket = {price_bucket}\n"
-                        f"\trecent_price_history_by_hour:\n"
-                        f"\t\t{json.dumps(db_lookup.get_recent_timeseries_for_coin(db_lookup.get_base_asset(pair)), indent=4)}\n"
-                        f"\tminimum_purchase_quantity in {pair} = {db_lookup.get_ordermin(pair)}\n"
-                        f"\tminimum_purchase in USD = {db_lookup.get_minimum_cost_in_usd(pair)}\n"
-                        f"\ttick_size = {db_lookup.get_asset_value_for_pair(pair, 'tick_size')}\n"
-                        f"\tvolatility = {volatility}\n"
-                        f"\tvolume_24h = {volume_24h:.2f}\n"
-                        f"\tpercent_change_1h = {pct_1h:.2f}\n"
-                        f"\tpercent_change_24h = {pct_24h:.2f}\n"
-                        f"\tpercent_change_7d = {pct_7d:.2f}\n"
-                        f"\tpercent_change_30d = {pct_30d:.2f}\n"
-                        f"\tgalaxy_score={galaxy_score} (previous_value = {galaxy_score_previous})\n"
-                        f"\talt_rank={alt_rank} (previous_value = {alt_rank_previous})\n"
-                        f"\tmarket_dominance = {market_dominance:.2f}\n"
-                        f"\tdominance_bucket = {dominance_bucket}\n"
-                        f"\tsocial_sentiment = {sentiment}\n"
-                        f"\tsentiment_label = {str(sentiment_label).upper()}\n\n"
+                        f"pair_name = {db_lookup.get_asset_value_for_pair(pair, 'pair_name')}\n"
+                        f"alternative_name = {db_lookup.get_asset_value_for_pair(pair, 'altname')}\n"
+                        f"base_asset = {db_lookup.get_base_asset(pair)}\n"
+                        f"price_for_one {pair} = {last_price:.2f}\n"
+                        f"price_bucket = {price_bucket}\n"
+                        f"recent_price_history_by_hour:\n"
+                        f"{json.dumps(db_lookup.get_recent_timeseries_for_coin(db_lookup.get_base_asset(pair)), indent=4)}\n"
+                        f"minimum_purchase_quantity for {pair} = {db_lookup.get_ordermin(pair)}\n"
+                        f"minimum_purchase in USD = {db_lookup.get_minimum_cost_in_usd(pair)}\n"
+                        "\tNote: minimum_purchase_quantity applies to both buying and selling this investment.\n"
+                        f"tick_size = {db_lookup.get_asset_value_for_pair(pair, 'tick_size')}\n"
+                        f"volatility = {volatility}\n"
+                        f"volume_24h = {volume_24h:.2f}\n"
+                        f"percent_change_1h = {pct_1h:.2f}\n"
+                        f"percent_change_24h = {pct_24h:.2f}\n"
+                        f"percent_change_7d = {pct_7d:.2f}\n"
+                        f"percent_change_30d = {pct_30d:.2f}\n"
+                        f"galaxy_score={galaxy_score} (previous_value = {galaxy_score_previous})\n"
+                        f"alt_rank={alt_rank} (previous_value = {alt_rank_previous})\n"
+                        f"market_dominance = {market_dominance:.2f}\n"
+                        f"dominance_bucket = {dominance_bucket}\n"
+                        f"social_sentiment = {sentiment}\n"
+                        f"sentiment_label = {str(sentiment_label).upper()}\n\n"
                     )
             else:
                 aggregator_text = (
@@ -605,12 +653,17 @@ def main():
     # 2) init DB => includes new pending_trades, trades, ledger_entries, etc.
     init_db()
 
+    fetch_and_store_kraken_public_asset_pairs(
+        info="info",
+        country_code="US:MI"
+    )
+
     # 3) Possibly fetch Kraken public asset pairs
     logger.info("[Main] Optionally fetching Kraken public asset pairs at startup...")
     rest_manager = KrakenRestManager(api_key=KRAKEN_API_KEY, api_secret=KRAKEN_API_SECRET)
-    rest_manager.store_asset_pairs_in_db(
-        rest_manager.fetch_public_asset_pairs(pair_list=TRADED_PAIRS)
-    )
+    # rest_manager.store_asset_pairs_in_db(
+    #     rest_manager.fetch_public_asset_pairs(pair_list=TRADED_PAIRS)
+    # )
     # fetch_and_store_kraken_public_asset_pairs(pair_list=TRADED_PAIRS)
     rest_manager.build_coin_name_lookup_from_db()
     # Also update LunarCrush data & possibly backfill timeseries for each symbol in TRADED_PAIRS
