@@ -256,9 +256,10 @@ class KrakenRestManager:
     # --------------------------------------------------------------------------
     def fetch_balance(self) -> Dict[str, float]:
         """
-        Calls /0/private/Balance => returns a dict of {asset: float_balance}.
-        Example:
-            balances = manager.fetch_balance()
+        Calls /0/private/Balance => returns a dict {asset: float_balance},
+        and also stores them into the DB via store_kraken_balances(...).
+
+        The rest of your logic is the same, but now we incorporate DB storage.
         """
         endpoint = "/0/private/Balance"
         payload = {}
@@ -266,13 +267,20 @@ class KrakenRestManager:
         if not result or "result" not in result:
             return {}
         raw_dict = result["result"]
+
         out = {}
         for k, v in raw_dict.items():
             try:
                 out[k] = float(v)
             except:
                 out[k] = 0.0
+
         logger.info(f"[KrakenRestManager] fetch_balance => {out}")
+
+        # --- NEW: store in DB so we have a historical record ---
+        from db import store_kraken_balances
+        store_kraken_balances(out)  # uses default DB_FILE path
+
         return out
 
     def fetch_and_store_ledger(
