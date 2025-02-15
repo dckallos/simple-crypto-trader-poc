@@ -68,6 +68,57 @@ def _normalize_symbol(symbol: str) -> str:
     return symbol
 
 
+def get_symbols_for_time_series(
+    traded_pairs: list[str],
+    db_path: str = DB_FILE
+) -> list[str]:
+    """
+    Given a list of Kraken wsname pairs (e.g. ["ETH/USD", "SOL/USD"]),
+    fetches the 'formatted_base_asset_name' from 'kraken_asset_name_lookup'
+    for each pair. Returns a list of symbols (e.g. ["ETH","SOL"]) in
+    the same order, or None for any that are not found.
+
+    :param traded_pairs: A list of wsname strings (e.g. ["ETH/USD","SOL/USD"]).
+    :param db_path: Path to the SQLite database. Defaults to DB_FILE.
+    :return: A list of symbols (e.g. ["ETH","SOL","ADA"]), or None entries if missing.
+    """
+    if not traded_pairs:
+        return []
+
+    conn = sqlite3.connect(db_path)
+    try:
+        c = conn.cursor()
+        # Build a parameterized query: SELECT wsname, formatted_base_asset_name ...
+        placeholders = ",".join("?" for _ in traded_pairs)
+        query = f"""
+            SELECT wsname, formatted_base_asset_name
+            FROM kraken_asset_name_lookup
+            WHERE wsname IN ({placeholders})
+        """
+        c.execute(query, traded_pairs)
+        rows = c.fetchall()
+
+        # Put results into a dict => { "ETH/USD": "ETH", "SOL/USD": "SOL" }
+        wsname_to_symbol = {}
+        for (ws, formatted_name) in rows:
+            wsname_to_symbol[ws] = formatted_name
+
+    except Exception as e:
+        logger.exception(f"[db_lookup] Error in get_symbols_for_time_series => {e}")
+        return []
+    finally:
+        conn.close()
+
+    # Build the output list in the same order as `traded_pairs`
+    result = []
+    for ws in traded_pairs:
+        symbol = wsname_to_symbol.get(ws, None)
+        result.append(symbol)
+
+    return result
+
+
+
 def is_table_underpopulated(
     table_name: str,
     db_file: str,
