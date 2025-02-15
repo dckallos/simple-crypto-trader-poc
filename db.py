@@ -28,6 +28,7 @@ import time
 import logging
 import os
 from typing import List, Dict, Any
+import asyncio
 from config_loader import ConfigLoader
 
 logger = logging.getLogger(__name__)
@@ -188,6 +189,11 @@ def init_db():
         # 8) KRAKEN_ASSET_PAIRS (NEW or EXPANDED)
         # ----------------------------------------------------------------------
         create_kraken_asset_pairs_table(conn)
+
+        # ----------------------------------------------------------------------
+        # 9) KRAKEN_BALANCE_HISTORY
+        # ----------------------------------------------------------------------
+        create_kraken_balance_table(conn)
 
         conn.commit()
         logger.info("All DB tables ensured in init_db().")
@@ -397,7 +403,8 @@ def create_pending_trades_table(conn=None):
                 requested_qty REAL,
                 status TEXT,               -- 'pending','open','closed','rejected'
                 kraken_order_id TEXT,
-                reason TEXT
+                reason TEXT,
+                lot_id INTEGER
             )
         """)
         conn.commit()
@@ -526,6 +533,120 @@ def set_kraken_order_id_for_pending_trade(pending_id: int, kraken_order_id: str)
         logger.exception(f"Error setting kraken_order_id: {e}")
     finally:
         conn.close()
+
+
+def create_kraken_balance_table(conn=None):
+    """
+    Ensures a table 'kraken_balance_history' exists for storing snapshots
+    of fetched Kraken balances over time.
+
+    Columns:
+      - id: primary key
+      - timestamp: integer epoch time of the snapshot
+      - asset: text (e.g. "ZUSD", "XXBT", etc.)
+      - balance: real (the float balance at that snapshot)
+    """
+    close_conn = False
+    if conn is None:
+        conn = sqlite3.connect(DB_FILE)
+        close_conn = True
+
+    try:
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS kraken_balance_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER,
+                asset TEXT,
+                balance REAL
+            )
+        """)
+        conn.commit()
+        logger.info("[DB] kraken_balance_history table ensured.")
+    except Exception as e:
+        logger.exception(f"[DB] Error creating kraken_balance_history table: {e}")
+    finally:
+        if close_conn:
+            conn.close()
+
+
+def store_kraken_balances(balances: Dict[str, float], db_path: str = DB_FILE):
+    """
+    Appends a snapshot of balances to the 'kraken_balance_history' table.
+    Each asset gets one row, so if you have 5 assets, you’ll insert 5 rows.
+
+    :param balances: dict like {"ZUSD": 100.25, "XXBT": 0.015, ...}
+    :param db_path: path to SQLite file
+    """
+    if not balances:
+        logger.warning("[DB] store_kraken_balances called with empty dict => skipping.")
+        return
+
+    conn = sqlite3.connect(db_path)
+    try:
+        c = conn.cursor()
+        now_ts = int(time.time())
+
+        rows_to_insert = []
+        for asset, bal in balances.items():
+            rows_to_insert.append((now_ts, asset, bal))
+
+        c.executemany("""
+            INSERT INTO kraken_balance_history (timestamp, asset, balance)
+            VALUES (?, ?, ?)
+        """, rows_to_insert)
+
+        conn.commit()
+        logger.info(f"[DB] Inserted {len(rows_to_insert)} asset balances at ts={now_ts}.")
+    except Exception as e:
+        logger.exception(f"[DB] Error inserting kraken balances: {e}")
+    finally:
+        conn.close()
+
+
+async def background_balance_updater(
+    kraken_rest_manager,
+    refresh_interval: float = 60.0,
+    db_path: str = DB_FILE
+):
+    """
+    A background coroutine that loops indefinitely:
+      1) fetches current Kraken balances via `kraken_rest_manager.fetch_balance()`
+      2) stores them in the DB
+      3) sleeps for refresh_interval seconds
+      4) repeats
+
+    You can import & call this from risk_manager.py if you want your RiskManager
+    to handle periodic refresh. For example:
+
+        import asyncio
+        from db import background_balance_updater
+
+        async def run_risk_manager_cycle():
+            # create your rest_manager, risk_manager, etc.
+            # then start the balance-updater in a background task:
+            asyncio.create_task(
+                background_balance_updater(kraken_rest_manager, 60.0)
+            )
+            # proceed with your main loop or other logic
+            # ...
+
+    :param kraken_rest_manager: An instance of your KrakenRestManager
+    :param refresh_interval: how many seconds to wait between each fetch
+    :param db_path: path to the SQLite database
+    """
+    logger.info("[BalanceUpdater] Starting background coroutine to poll balances.")
+    while True:
+        try:
+            # 1) fetch
+            current_balances = kraken_rest_manager.fetch_balance()
+            # 2) store in DB
+            store_kraken_balances(current_balances, db_path=db_path)
+        except Exception as e:
+            logger.exception(f"[BalanceUpdater] Error in fetch/store loop => {e}")
+
+        # 3) Sleep before next poll
+        await asyncio.sleep(refresh_interval)
 
 
 def mark_pending_trade_closed(pending_id: int, reason: str = None):
