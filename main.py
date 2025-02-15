@@ -482,7 +482,6 @@ class HybridApp:
             ask_pct = ((ask_new - ask_old) / ask_old * 100) if ask_old else 0
             last_pct = ((last_new - last_old) / last_old * 100) if last_old else 0
 
-            # Format the line per your specs
             line_str = (
                 f"Timestamp => Unix: {ts_new}: "
                 f"Bid={bid_new:.4f} ({bid_pct}%), "
@@ -491,7 +490,6 @@ class HybridApp:
             )
             output_lines.append(line_str)
 
-        # Join them into a single output string
         return "\n".join(output_lines)
 
     def _build_aggregator_for_pair(self, pair: str) -> Dict[str, Any]:
@@ -712,7 +710,6 @@ def main():
         fetcher.fetch_snapshot_data_filtered(limit=100)
 
         # Backfill timeseries for each symbol => e.g. 1 month
-        import db_lookup
         coin_ids = [db_lookup.get_formatted_name_from_pair_name(pair) for pair in TRADED_PAIRS]
         if PRE_POPULATE_DB | IS_TIMESERIES_UNDERPOPULATED:
             fetcher.backfill_coins(
@@ -747,7 +744,7 @@ def main():
         risk_controls=risk_controls,
         gpt_model="o1-mini",
         gpt_temperature=1.0,
-        gpt_max_tokens=5000,
+        gpt_max_tokens=40000,
         private_ws_client=None,   # Will attach if we get a valid token
         place_live_orders=PLACE_LIVE_ORDERS
     )
@@ -829,6 +826,8 @@ def main():
         feed_type="ticker",
         on_ticker_callback=aggregator_app.on_ticker
     )
+    pub_client.risk_manager = risk_manager_db
+    pub_client.kraken_balances = rest_manager.fetch_balance()
     pub_client.start()
 
     # start private feed if we have token
