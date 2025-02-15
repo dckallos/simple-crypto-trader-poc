@@ -33,6 +33,7 @@ import hashlib
 import hmac
 import base64
 import logging
+import asyncio
 import logging.config
 import os
 import urllib
@@ -672,6 +673,8 @@ def main():
     # If we want to place real orders
     PLACE_LIVE_ORDERS = ConfigLoader.get_value("place_live_orders", False)
 
+    RISK_MANAGER_CHECK = ConfigLoader.get_value("risk_manager_interval_seconds", 60)
+
     load_dotenv()
     KRAKEN_API_KEY = os.getenv("KRAKEN_API_KEY", "")
     KRAKEN_API_SECRET = os.getenv("KRAKEN_SECRET_API_KEY", "")
@@ -722,6 +725,12 @@ def main():
     except Exception as e:
         logger.exception(f"[Main] Error updating lunarcrush => {e}")
 
+    from train_model import run_full_training_pipeline
+    run_full_training_pipeline(
+        db_path="trades.db",
+        symbols_for_timeseries=db_lookup.get_symbols_for_time_series(TRADED_PAIRS)
+    )
+
     # If we do local training
     if ENABLE_TRAINING:
         logger.info("[Main] Potential training step here. (Omitted)")
@@ -734,6 +743,13 @@ def main():
         initial_spending_account=risk_controls.get("initial_spending_account", 0.0)
     )
     risk_manager_db.initialize()
+    loop = asyncio.get_event_loop()
+    loop.create_task(
+        risk_manager_db.start_db_price_check_cycle(
+            pairs=TRADED_PAIRS,
+            interval=ConfigLoader.get_value("risk_manager_interval_seconds", 60),
+        )
+    )
 
     # Create AIStrategy
     ai_strategy = AIStrategy(
@@ -742,6 +758,7 @@ def main():
         max_position_size=3,
         max_daily_drawdown=-0.02,
         risk_controls=risk_controls,
+        risk_manager=risk_manager_db,
         gpt_model="o1-mini",
         gpt_temperature=1.0,
         gpt_max_tokens=40000,
@@ -836,8 +853,8 @@ def main():
 
     logger.info("[Main] aggregator approach running. Press Ctrl+C to exit.")
     try:
-        while True:
-            time.sleep(1)
+        # Instead of a 'while True: time.sleep(1)', run the asyncio loop forever
+        loop.run_forever()
     except KeyboardInterrupt:
         logger.info("[Main] user exit => stopping.")
     finally:
