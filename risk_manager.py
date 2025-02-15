@@ -4,28 +4,26 @@
 """
 Production version of risk_manager.py
 
-Implements a "lots-based" risk model for managing stop-loss and take-profit:
+Key Points:
+-----------
+1) Lots-based stop-loss and take-profit logic. Each BUY either creates a new
+   lot in `holding_lots` or merges with an existing one if `has_sold_in_between=0`.
+2) The `on_price_update(...)` method scans all open lots for a given pair, checking
+   if the current price triggers a stop-loss or take-profit event. If triggered, we
+   create a SELL entry in `pending_trades` and remove/update the lot.
+3) `adjust_trade(...)` enforces daily drawdown and ensures the user has sufficient
+   balances for each new trade.
+4) We now have an async background loop (`start_db_price_check_cycle(...)`) that
+   periodically queries `price_history` for each pair's newest price, then calls
+   `on_price_update(...)`.
 
-1) Each BUY finalization either creates a new row in `holding_lots` or combines with
-   an existing lot if no partial sells have occurred since the last purchase of that pair.
+This approach means the risk manager is wholly reliant on the DB data that
+`ws_data_feed.py` is populating with real-time ticker updates. We do NOT call
+any REST endpoints here for price.
 
-2) The `on_price_update(...)` method checks each open lot for:
-   - Stop-Loss: If current_price <= (lot_price * (1 - stop_loss_percent)) => SELL entire lot
-   - Take-Profit: If current_price >= (lot_price * (1 + take_profit_percent)) => SELL quantity
-     equal to the lot’s original purchased size (“initial_quantity”).
-
-3) If a partial take-profit occurs, the leftover quantity remains in the same row, but is
-   flagged `has_sold_in_between=1`, ensuring that any new buy does not merge cost basis
-   with that partial position.
-
-4) A daily drawdown check remains in `adjust_trade(...)`, halting new buys if the user’s
-   daily realized PnL is below the configured threshold.
-
-Database Tables:
-- `trades`: for final fill records (inserts come from the private feed)
-- `pending_trades`: ephemeral states (for new SELL actions placed by stop-loss or take-profit)
-- `holding_lots`: new table that tracks each open lot of a purchased coin. Columns:
-    id, pair, purchase_price, initial_quantity, quantity, date_purchased, has_sold_in_between
+You can also choose how you supply user balances. For example, you might query
+another DB table of up-to-date balances, or pass them in from external code.
+In this version, we pass an empty dictionary for `kraken_balances` as a placeholder.
 """
 
 import logging
@@ -33,35 +31,34 @@ import os
 import sqlite3
 import time
 import datetime
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List, Dict, Any
 
 from dotenv import load_dotenv
+
 from config_loader import ConfigLoader
-from kraken_rest_manager import KrakenRestManager
 import db_lookup
 from db import create_pending_trade
 
 load_dotenv()
 
-# Configure logger for production usage
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-DB_FILE = "trades.db"  # Path to your trades DB file
+DB_FILE = "trades.db"  # Path to your SQLite DB file (must contain 'price_history', etc.)
 
-
-# --------------------------------------------------------------------------
-# Utility to initialize holding_lots
-# --------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Utility to initialize 'holding_lots' table
+# ------------------------------------------------------------------------------
 def init_holding_lots_table(db_path: str = DB_FILE) -> None:
     """
     Ensures the holding_lots table exists in the SQLite database.
     Each row represents a distinct “lot” of an asset purchased, with:
       - purchase_price: Weighted cost basis (including fees) for this lot
-      - initial_quantity: Original quantity bought (used to limit partial take-profit sells)
+      - initial_quantity: Original quantity bought (used to limit partial T/P sells)
       - quantity: Current quantity of this lot still open
-      - has_sold_in_between: 0 => future buys can combine with this lot's cost basis;
-                             1 => some portion sold, so no further cost-basis merges.
+      - date_purchased: integer (epoch time)
+      - has_sold_in_between: 0 => future buys can merge cost basis;
+                             1 => partial sells, so no further merges
     """
     conn = sqlite3.connect(db_path)
     try:
@@ -80,52 +77,48 @@ def init_holding_lots_table(db_path: str = DB_FILE) -> None:
         conn.commit()
         logger.info("[RiskManager] holding_lots table ensured.")
     except Exception as exc:
-        logger.exception(f"Error creating holding_lots table => {exc}")
+        logger.exception(f"[RiskManager] Error creating holding_lots table => {exc}")
     finally:
         conn.close()
 
-
-# --------------------------------------------------------------------------
-# RiskManagerDB Class
-# --------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# RiskManagerDB
+# ------------------------------------------------------------------------------
 class RiskManagerDB:
     """
-    The primary class for risk management and stop-loss / take-profit logic in production.
-    - Each buy is tracked as a lot, or combined with a previous lot if we haven't sold any portion
-      in between.
-    - on_price_update(...) checks each open lot for SL/TP triggers and creates SELL orders
-      in 'pending_trades' if triggered.
-    - adjust_trade(...) enforces a daily drawdown limit and ensures the user has sufficient
-      USD/coins for each new buy/sell.
+    The core class for your stop-loss and take-profit logic. Key features:
+      - 'on_price_update(...)' => if current_price hits SL or TP => create SELL in 'pending_trades'.
+      - 'adjust_trade(...)' => daily drawdown + user capacity checks.
+      - 'start_db_price_check_cycle(...)' => new async loop that queries price_history for
+        each pair's latest price, calls on_price_update(...).
+
+    We assume:
+      - 'ws_data_feed.py' continuously stores ticker data in 'price_history'.
+      - You have a separate approach for user balances (maybe a separate DB table, or pass it in).
     """
 
     def __init__(
-            self,
-            db_path: str = DB_FILE,
-            max_position_size: float = 3.0,
-            max_daily_drawdown: float = None,
-            initial_spending_account: float = 100.0
+        self,
+        db_path: str = DB_FILE,
+        max_position_size: float = 3.0,
+        max_daily_drawdown: float = None,
+        initial_spending_account: float = 100.0
     ):
         """
-        :param db_path: SQLite DB path. Must contain 'trades', 'pending_trades', 'holding_lots' tables.
-        :param max_position_size: Hard limit on the per-trade size (e.g., 3.0 coins).
-        :param max_daily_drawdown: If the daily realized PnL is below this threshold (e.g. -0.02 => -2%),
-                                   do not allow new buys for that day.
-        :param initial_spending_account: A per-trade budget in USD. For instance, 100 => no single buy
-                                         can exceed $100 total cost.
+        :param db_path: SQLite DB path containing price_history, trades, pending_trades, holding_lots
+        :param max_position_size: Hard limit on per-trade size (e.g. 3 coins).
+        :param max_daily_drawdown: If daily realized PnL <= this threshold => skip new BUYs.
+        :param initial_spending_account: A budget cap for each trade in USD, if relevant to you.
         """
         self.db_path = db_path
         self.max_position_size = max_position_size
         self.max_daily_drawdown = max_daily_drawdown
         self.initial_spending_account = initial_spending_account
 
-    # ----------------------------------------------------------------------
-    # Initialize required tables
-    # ----------------------------------------------------------------------
     def initialize(self) -> None:
         """
-        Creates 'trades' if missing, plus ensures 'holding_lots' for the lots-based approach.
-        'pending_trades' is assumed to be created in db.py.
+        Ensures 'trades' table and 'holding_lots' are present.
+        'pending_trades' is presumably created in db.py.
         """
         conn = sqlite3.connect(self.db_path)
         try:
@@ -147,37 +140,108 @@ class RiskManagerDB:
             conn.commit()
             logger.info("[RiskManager] 'trades' table ensured.")
         except Exception as e:
-            logger.exception(f"[RiskManager] Error ensuring 'trades' table => {e}")
+            logger.exception(f"[RiskManager] Error ensuring 'trades' => {e}")
         finally:
             conn.close()
 
-        # Also ensure holding_lots
         init_holding_lots_table(self.db_path)
 
     # ----------------------------------------------------------------------
-    # 1) Stop-Loss / Take-Profit: Called on each price update
+    # (NEW) => Start a background loop that reads the last known price from DB
+    #          then calls on_price_update(...) for each pair.
+    # ----------------------------------------------------------------------
+    async def start_db_price_check_cycle(
+        self,
+        pairs: List[str],
+        interval: float = 30.0
+    ):
+        """
+        An asynchronous loop that does the following forever:
+          1) For each pair in 'pairs':
+              - query price_history => find the newest row => get 'last_price'
+              - call on_price_update(pair, that_price, <balances dict>)
+          2) Sleep for 'interval' seconds
+          3) Repeat
+
+        This means your risk manager will keep checking stop-loss/take-profit
+        using only the local 'price_history' data, updated by ws_data_feed.py.
+        """
+        import asyncio
+
+        logger.info(
+            f"[RiskManager] Starting DB-based price check cycle for {pairs}, interval={interval}s"
+        )
+
+        while True:
+            try:
+                for pair in pairs:
+                    latest_price = self._fetch_latest_price_for_pair(pair)
+                    if latest_price > 0:
+                        # Typically you'd retrieve or pass in user balances from somewhere.
+                        # For demonstration, we do an empty dict.
+                        # If you store balances in a table, you'd do `_fetch_latest_balance()` or something.
+                        dummy_balances = {}
+                        self.on_price_update(
+                            pair=pair,
+                            current_price=latest_price,
+                            kraken_balances=dummy_balances
+                        )
+            except Exception as e:
+                logger.exception(f"[RiskManager] DB price check cycle => error => {e}")
+
+            await asyncio.sleep(interval)
+
+    def _fetch_latest_price_for_pair(self, pair: str) -> float:
+        """
+        Reads the newest 'price_history' row for the given pair from the DB,
+        returning last_price. Returns 0.0 if not found or error.
+
+        We assume 'price_history' schema => (id, timestamp, pair, bid_price, ask_price, last_price, volume).
+        We order by 'timestamp' or 'id' desc, whichever is best.
+        """
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            c = conn.cursor()
+            # We'll pick the row with the greatest 'timestamp' for that pair
+            c.execute("""
+                SELECT last_price
+                FROM price_history
+                WHERE pair=?
+                ORDER BY timestamp DESC
+                LIMIT 1
+            """, (pair,))
+            row = c.fetchone()
+            if row is None:
+                # no data
+                return 0.0
+            return float(row["last_price"])
+        except Exception as e:
+            logger.exception(f"[RiskManager] _fetch_latest_price_for_pair => pair={pair}, err={e}")
+            return 0.0
+        finally:
+            conn.close()
+
+    # ----------------------------------------------------------------------
+    # 1) Stop-Loss / Take-Profit
     # ----------------------------------------------------------------------
     def on_price_update(
             self,
             pair: str,
             current_price: float,
-            kraken_balances: dict,
+            kraken_balances: Dict[str, float],
             stop_loss_pct: float = ConfigLoader.get_value("stop_loss_percent", 0.05),
             take_profit_pct: float = ConfigLoader.get_value("take_profit_percent", 0.02)
     ):
         """
-        For each open lot of `pair`, check if the price triggers:
-          - Stop-Loss => SELL entire lot
-          - Take-Profit => SELL 'initial_quantity'
+        For each open lot of `pair`, check if current_price triggers a stop-loss or T/P.
+        If so, we create a SELL 'pending_trade' row and remove or update the lot.
 
-        If triggered, we create a SELL row in 'pending_trades' and either remove or update
-        that lot to reflect the partial or full sale.
-
-        :param pair: The trading pair (e.g. "ETH/USD")
-        :param current_price: Current market price from a feed
-        :param kraken_balances: Dict with user’s real-time balances from the exchange
-        :param stop_loss_pct: e.g. 0.05 => 5% stop
-        :param take_profit_pct: e.g. 0.02 => 2% take-profit
+        :param pair: e.g. "DOT/USD"
+        :param current_price: the latest known ticker price from your DB
+        :param kraken_balances: a dict of user balances, e.g. {"ZUSD": 200.5, "XDOT": 100.0}
+        :param stop_loss_pct: 0.05 => 5% stop
+        :param take_profit_pct: 0.02 => 2% T/P
         """
         lots = self._load_lots_for_pair(pair)
         if not lots:
@@ -189,35 +253,31 @@ class RiskManagerDB:
             lot_qty = lot["quantity"]
             init_qty = lot["initial_quantity"]
 
-            # Skip empty or closed positions
             if lot_qty <= 0:
                 continue
 
-            # -------------- STOP-LOSS --------------
+            # ---------- STOP-LOSS -----------
             if current_price <= lot_price * (1.0 - stop_loss_pct):
-                reason = f"STOP_LOSS triggered: px={current_price:.2f}"
+                reason = f"STOP_LOSS triggered: px={current_price:.4f}"
                 logger.info(
                     f"[RiskManager] Stop-loss => lot_id={lot_id}, sell all {lot_qty:.4f} of {pair}"
                 )
-                # Create SELL pending trade
                 create_pending_trade(
                     side="SELL",
                     requested_qty=lot_qty,
                     pair=pair,
                     reason=reason
                 )
-                # Remove or zero out the lot
                 self._remove_lot(lot_id)
                 continue
 
-            # -------------- TAKE-PROFIT --------------
+            # ---------- TAKE-PROFIT ---------
             if current_price >= lot_price * (1.0 + take_profit_pct):
-                # Sell up to 'init_qty'
                 sell_size = min(init_qty, lot_qty)
                 if sell_size <= 0:
                     continue
 
-                reason = f"TAKE_PROFIT triggered: px={current_price:.2f}"
+                reason = f"TAKE_PROFIT triggered: px={current_price:.4f}"
                 logger.info(
                     f"[RiskManager] Take-profit => lot_id={lot_id}, sell {sell_size:.4f} of {pair}"
                 )
@@ -228,12 +288,10 @@ class RiskManagerDB:
                     reason=reason
                 )
 
-                leftover_qty = lot_qty - sell_size
-                if leftover_qty > 0:
-                    # Partial leftover => update it, mark has_sold_in_between=1
-                    self._update_lot_after_partial_sale(lot_id, leftover_qty)
+                leftover = lot_qty - sell_size
+                if leftover > 0:
+                    self._update_lot_after_partial_sale(lot_id, leftover)
                 else:
-                    # Entire lot closed
                     self._remove_lot(lot_id)
 
     # ----------------------------------------------------------------------
@@ -241,20 +299,14 @@ class RiskManagerDB:
     # ----------------------------------------------------------------------
     def add_or_combine_lot(self, pair: str, buy_quantity: float, buy_price: float):
         """
-        Called once a new BUY is finalized.
-        If there's an existing lot for `pair` with has_sold_in_between=0, combine cost basis.
-        Otherwise, create a new row.
-
-        :param pair: e.g. "ETH/USD"
-        :param buy_quantity: final filled quantity from the buy
-        :param buy_price: actual fill price (including fees if you prefer)
+        Called once a BUY finalizes. If there's an existing open lot with no partial sells,
+        merges cost basis. Otherwise, create a new row in holding_lots.
         """
         if buy_quantity <= 0 or buy_price <= 0:
             return
 
         existing_lot = self._find_open_lot_without_sells(pair)
         if existing_lot:
-            # Weighted average cost basis update
             lot_id = existing_lot["id"]
             old_qty = existing_lot["quantity"]
             old_price = existing_lot["purchase_price"]
@@ -263,11 +315,10 @@ class RiskManagerDB:
             new_price = ((old_qty * old_price) + (buy_quantity * buy_price)) / total_qty
             logger.info(
                 f"[RiskManager] Combine-lot => lot_id={lot_id}, old_qty={old_qty:.4f}, "
-                f"new_qty={buy_quantity:.4f}, total={total_qty:.4f}, price={new_price:.4f}"
+                f"new_qty={buy_quantity:.4f}, total={total_qty:.4f}, px={new_price:.4f}"
             )
             self._update_combined_lot(lot_id, new_price, total_qty, old_qty, buy_quantity)
         else:
-            # Insert a new lot row
             now_ts = int(time.time())
             self._insert_new_lot(pair, buy_price, buy_quantity, now_ts)
 
@@ -275,43 +326,35 @@ class RiskManagerDB:
     # 3) Daily Drawdown & Basic Pre-Trade Checks
     # ----------------------------------------------------------------------
     def adjust_trade(
-            self,
-            signal: str,
-            suggested_size: float,
-            pair: str,
-            current_price: float,
-            kraken_balances: dict
+        self,
+        signal: str,
+        suggested_size: float,
+        pair: str,
+        current_price: float,
+        kraken_balances: Dict[str, float]
     ) -> Tuple[str, float]:
         """
-        Ensures trades abide by daily drawdown and user capacity:
-          - If daily drawdown is below threshold => no new BUYs
-          - If user doesn't have enough USD/coin => skip
-          - Clamps final size to self.max_position_size
-          - If cost is > initial_spending_account => skip
-
-        Returns (final_signal, final_size).
-        Typically called just before placing an order in AIStrategy.
+        1) If daily drawdown is below max => skip new BUY
+        2) clamp final_size to self.max_position_size
+        3) check user capacity (cost vs free USD, or coin vs free_coins)
+        4) return (final_signal, final_size) => "HOLD" if blocked
         """
-        # 1) daily drawdown check
+        # daily drawdown
         if self.max_daily_drawdown is not None:
             daily_pnl = self.get_daily_realized_pnl()
             if daily_pnl <= self.max_daily_drawdown and signal == "BUY":
                 logger.warning(
-                    f"[RiskManager] daily drawdown => realizedPnL={daily_pnl:.4f} "
-                    f"<= {self.max_daily_drawdown} => no new buys => HOLD."
+                    f"[RiskManager] dailyPnL={daily_pnl:.4f} <= {self.max_daily_drawdown} => no new buys => HOLD"
                 )
                 return ("HOLD", 0.0)
 
-        # 2) If not BUY/SELL => do nothing
         if signal not in ("BUY", "SELL"):
             return ("HOLD", 0.0)
 
-        # 3) clamp the size
         final_size = min(suggested_size, self.max_position_size)
         if final_size <= 0:
             return ("HOLD", 0.0)
 
-        # 4) Check cost or coin availability
         if signal == "BUY":
             cost = final_size * current_price
             if cost > self.initial_spending_account:
@@ -322,18 +365,13 @@ class RiskManagerDB:
             usd_symbol = self._get_quote_symbol(pair)
             free_usd = kraken_balances.get(usd_symbol, 0.0)
             if cost > free_usd:
-                logger.info(
-                    f"[RiskManager] insufficient {usd_symbol} => cost={cost:.2f}, free={free_usd:.2f}"
-                )
+                logger.info(f"[RiskManager] insufficient {usd_symbol}, cost={cost:.2f}, have={free_usd:.2f}")
                 return ("HOLD", 0.0)
-        else:
-            # SELL => check base coin
+        else:  # SELL => check base coin
             base_sym = self._get_base_symbol(pair)
             free_coins = kraken_balances.get(base_sym, 0.0)
             if final_size > free_coins:
-                logger.info(
-                    f"[RiskManager] insufficient {base_sym} => requested={final_size:.4f}, have={free_coins:.4f}"
-                )
+                logger.info(f"[RiskManager] insufficient {base_sym} => requested={final_size:.4f}, have={free_coins:.4f}")
                 return ("HOLD", 0.0)
 
         return (signal, final_size)
@@ -343,21 +381,20 @@ class RiskManagerDB:
     # ----------------------------------------------------------------------
     def get_daily_realized_pnl(self, date_str: Optional[str] = None) -> float:
         """
-        Sums realized_pnl from 'trades' for the specified UTC date.
-        If none, uses today's date in UTC. Returns 0.0 if none found or error.
+        Sums realized_pnl from 'trades' for a given UTC date. If not specified, use today (UTC).
         """
         if not date_str:
             date_str = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+
         conn = sqlite3.connect(self.db_path)
         try:
             c = conn.cursor()
-            q = """
+            c.execute("""
                 SELECT IFNULL(SUM(realized_pnl), 0.0)
                 FROM trades
                 WHERE realized_pnl IS NOT NULL
                   AND date(timestamp, 'unixepoch') = ?
-            """
-            c.execute(q, (date_str,))
+            """, (date_str,))
             row = c.fetchone()
             if row and row[0] is not None:
                 return float(row[0])
@@ -391,34 +428,29 @@ class RiskManagerDB:
             conn.close()
 
     # ----------------------------------------------------------------------
-    # Utility: Combine cost basis
+    # Utility: Weighted cost basis update
     # ----------------------------------------------------------------------
     def _update_combined_lot(
-            self,
-            lot_id: int,
-            new_price: float,
-            new_qty: float,
-            old_qty: float,
-            add_qty: float
+        self,
+        lot_id: int,
+        new_price: float,
+        new_qty: float,
+        old_qty: float,
+        add_qty: float
     ):
         """
-        Weighted cost basis update. Also updates 'initial_quantity' by the newly purchased amount.
+        Weighted cost basis update; also update initial_quantity by the new buy.
         """
         conn = sqlite3.connect(self.db_path)
         try:
             c = conn.cursor()
-            c.execute("""
-                SELECT initial_quantity
-                FROM holding_lots
-                WHERE id=?
-            """, (lot_id,))
+            c.execute("SELECT initial_quantity FROM holding_lots WHERE id=?", (lot_id,))
             row = c.fetchone()
             if not row:
                 logger.warning(f"[RiskManager] No lot found with id={lot_id} to combine.")
                 return
-
             old_init_qty = float(row[0])
-            new_init_qty = old_init_qty + add_qty  # expand "initial_quantity" by the new buy
+            new_init_qty = old_init_qty + add_qty
 
             c.execute("""
                 UPDATE holding_lots
@@ -438,7 +470,7 @@ class RiskManagerDB:
     # ----------------------------------------------------------------------
     def _update_lot_after_partial_sale(self, lot_id: int, new_quantity: float):
         """
-        Mark leftover quantity and set has_sold_in_between=1 so future buys won't merge cost basis.
+        If we partially sold a lot, set has_sold_in_between=1 to block cost-basis merges.
         """
         if new_quantity < 0:
             new_quantity = 0.0
@@ -463,7 +495,7 @@ class RiskManagerDB:
     # ----------------------------------------------------------------------
     def _remove_lot(self, lot_id: int):
         """
-        Deletes the lot row from holding_lots after a full stop-loss or a total take-profit exit.
+        If we fully sold or hit a stop‐loss on that entire lot => remove the row.
         """
         conn = sqlite3.connect(self.db_path)
         try:
@@ -477,13 +509,9 @@ class RiskManagerDB:
             conn.close()
 
     # ----------------------------------------------------------------------
-    # Utility: Find an existing open lot for merging
+    # Utility: find an open lot for merging
     # ----------------------------------------------------------------------
     def _find_open_lot_without_sells(self, pair: str) -> Optional[dict]:
-        """
-        Returns the first open lot for this pair where has_sold_in_between=0
-        and quantity>0, or None if not found. We'll combine cost basis with that lot if found.
-        """
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         try:
@@ -504,21 +532,16 @@ class RiskManagerDB:
             conn.close()
 
     # ----------------------------------------------------------------------
-    # Utility: load lots for a pair
+    # Utility: load all open lots for a pair
     # ----------------------------------------------------------------------
-    def _load_lots_for_pair(self, pair: str) -> list:
-        """
-        Return all open lots for this pair (quantity>0).
-        """
+    def _load_lots_for_pair(self, pair: str) -> List[dict]:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         results = []
         try:
             c = conn.cursor()
             c.execute("""
-                SELECT
-                    id, pair, purchase_price, initial_quantity,
-                    quantity, date_purchased, has_sold_in_between
+                SELECT id, pair, purchase_price, initial_quantity, quantity, date_purchased, has_sold_in_between
                 FROM holding_lots
                 WHERE pair=? AND quantity>0
             """, (pair,))
@@ -536,12 +559,12 @@ class RiskManagerDB:
     # ----------------------------------------------------------------------
     def _get_quote_symbol(self, pair: str) -> str:
         """
-        For "ETH/USD", returns the 'quote' symbol in Kraken format, e.g. "ZUSD".
+        For "DOT/USD", returns the 'quote' symbol in Kraken format, e.g. "ZUSD".
         """
         return db_lookup.get_asset_value_for_pair(pair, value="quote")
 
     def _get_base_symbol(self, pair: str) -> str:
         """
-        For "ETH/USD", returns the 'base' symbol in Kraken format, e.g. "XETH".
+        For "DOT/USD", returns the 'base' symbol in Kraken format, e.g. "XDOT".
         """
         return db_lookup.get_base_asset(pair)
