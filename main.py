@@ -744,6 +744,7 @@ def main():
         place_live_orders=PLACE_LIVE_ORDERS
     )
     risk_manager_db.initialize()
+    risk_manager_db.rebuild_lots_from_ledger_entries()
     loop = asyncio.get_event_loop()
     loop.create_task(
         risk_manager_db.start_db_price_check_cycle(
@@ -756,7 +757,7 @@ def main():
     ai_strategy = AIStrategy(
         pairs=TRADED_PAIRS,
         use_openai=ENABLE_GPT,
-        max_position_size=3,
+        max_position_size=5,
         max_daily_drawdown=-0.02,
         risk_controls=risk_controls,
         risk_manager=risk_manager_db,
