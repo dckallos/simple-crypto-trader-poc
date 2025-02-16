@@ -550,9 +550,9 @@ class KrakenPrivateWSClient:
 
     def _process_own_trades(self, trades_chunk):
         """
-        ownTrades => actual fills
-        Each item => { trade_id: {...fields...} }.
-        We'll store them in 'trades' if not found.
+        ownTrades => actual fills.
+        Each item => { trade_id: {"type":"buy","vol":"0.01","pair":"ETH/USD","price":"1800.00", ...} }.
+        We'll parse and call _store_own_trade_if_new(...) with all parameters.
         """
         if not isinstance(trades_chunk, list):
             return
@@ -560,39 +560,98 @@ class KrakenPrivateWSClient:
         for item in trades_chunk:
             if not isinstance(item, dict):
                 continue
-            for trade_id, trade_obj in item.items():
-                self._store_own_trade_if_new(trade_id, trade_obj)
 
-    def _store_own_trade_if_new(self, trade_id: str, trade_obj: dict):
+            for trade_id, trade_obj in item.items():
+                # Extract fields from trade_obj
+                side_str = trade_obj.get("type", "").upper()  # "BUY" or "SELL"
+                pair_str = trade_obj.get("pair", "UNKNOWN")
+                vol_str = trade_obj.get("vol", "0.0")
+                px_str = trade_obj.get("price", "0.0")
+                fee_str = trade_obj.get("fee", "0.0")
+
+                # Convert numeric strings
+                quantity = float(vol_str)
+                fill_price = float(px_str)
+                fill_fee = float(fee_str)
+
+                # Optionally parse 'time', but we can get a timestamp from time.time() if we want.
+                # time_float = float(trade_obj.get("time", "0"))  # if needed
+
+                self._store_own_trade_if_new(
+                    trade_id=trade_id,
+                    side=side_str,
+                    pair=pair_str,
+                    quantity=quantity,
+                    fill_price=fill_price,
+                    fee=fill_fee,
+                    source=None,  # or fill from somewhere if available
+                    rationale=None  # or fill from somewhere if available
+                )
+
+    def _store_own_trade_if_new(
+            self,
+            trade_id: str,
+            side: str,
+            pair: str,
+            quantity: float,
+            fill_price: float,
+            fee: float,
+            source: str = None,
+            rationale: str = None
+    ):
         """
-        Insert a new row in 'trades' if we haven't stored that trade_id yet.
+        Insert a new row into 'trades' if we haven't inserted this trade_id yet.
+
+        Additionally:
+          1) We'll look up 'source' and 'rationale' in the 'pending_trades' table
+             (matching kraken_order_id = trade_id).
+          2) If found, we override the 'source' or 'rationale' parameters with those
+             from the pending_trades table, unless they're None there as well.
+          3) Then we insert into 'trades' with the final source/rationale.
+
+        :param trade_id: The unique Kraken trade ID or order ID
+        :param side: "BUY" or "SELL"
+        :param pair: e.g. "ETH/USD"
+        :param quantity: how many coins filled
+        :param fill_price: the fill price
+        :param fee: total fee
+        :param source: e.g. "ai_strategy" or "risk_manager" — overridden if found in pending_trades
+        :param rationale: e.g. GPT text or "stop-loss" / "take-profit" — overridden if found
         """
         conn = sqlite3.connect("trades.db")
         try:
             c = conn.cursor()
+
+            # 1) Check if we've already inserted this trade_id => skip
             c.execute("""
-                SELECT id FROM trades
+                SELECT id
+                FROM trades
                 WHERE order_id=?
                 LIMIT 1
             """, (trade_id,))
             row = c.fetchone()
             if row:
-                return  # already recorded
+                return  # Already recorded => exit early
 
-            side = trade_obj.get("type", "").upper()  # "BUY" or "SELL"
-            price_str = trade_obj.get("price", "0.0")
-            vol_str = trade_obj.get("vol", "0.0")
-            fee_str = trade_obj.get("fee", "0.0")
-            pair = trade_obj.get("pair", "UNKNOWN")
+            # 2) Attempt to fetch source, rationale from pending_trades if they exist
+            c.execute("""
+                SELECT source, rationale
+                FROM pending_trades
+                WHERE kraken_order_id=?
+                LIMIT 1
+            """, (trade_id,))
+            pend_row = c.fetchone()
+            if pend_row:
+                pending_source, pending_rationale = pend_row
+                # Only override if they exist
+                if pending_source is not None:
+                    source = pending_source
+                if pending_rationale is not None:
+                    rationale = pending_rationale
 
-            tfloat = float(trade_obj.get("time", "0"))
-            ts = int(tfloat)
+            # 3) Insert new row into 'trades' with final source/rationale
+            ts = int(time.time())  # or parse real fill-time if you like
 
-            quantity = float(vol_str)
-            fill_price = float(price_str)
-            fill_fee = float(fee_str)
-
-            # Insert a final fill row
             c.execute("""
                 INSERT INTO trades (
                     timestamp,
@@ -602,17 +661,29 @@ class KrakenPrivateWSClient:
                     price,
                     order_id,
                     fee,
-                    realized_pnl
+                    realized_pnl,
+                    source,
+                    rationale
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
             """, (
-                ts, pair, side, quantity, fill_price, trade_id, fill_fee
+                ts,
+                pair,
+                side,
+                quantity,
+                fill_price,
+                trade_id,
+                fee,
+                source,
+                rationale
             ))
             conn.commit()
+
             logger.info(
                 f"[PrivateWS] Inserted new fill => trade_id={trade_id}, side={side}, "
-                f"qty={quantity}, px={fill_price}"
+                f"qty={quantity}, px={fill_price}, source={source}, rationale={rationale}"
             )
+
         except Exception as e:
             logger.exception(f"[PrivateWS] Error inserting ownTrades => {e}")
         finally:
@@ -674,43 +745,57 @@ class KrakenPrivateWSClient:
 
     def _finalize_trade_from_kraken(self, kraken_order_id: str, filled_size: float, avg_fill_price: float, fee: float):
         """
-        Called when an order is canceled/expired or partially filled => finalize the pending_trade row.
-        The actual fill details come from ownTrades (which inserts the 'trades' row).
-        We also notify risk_manager if there's a 'lot_id' so it can remove/partial leftover the lot
-        via on_pending_trade_closed(...).
+        Called whenever an order is canceled/expired/closed => finalize pending_trades row.
+        Then we also let risk_manager know if there's a related lot.
+
+        1) Look up the pending_trades row (which includes source, rationale, etc.).
+        2) Mark it 'closed'.
+        3) Insert a final record into 'trades' via _store_own_trade_if_new(...) if it isn't inserted yet.
+           (Because ownTrades feed might also do it, but if it's partial fill we handle it here.)
+        4) If there's a lot_id => call risk_manager.on_pending_trade_closed(...).
         """
         row = _fetch_pending_trade_by_kraken_id(kraken_order_id)
         if not row:
             logger.warning(f"[PrivateWS] No pending_trade row for kraken_order_id={kraken_order_id}")
             return
 
+        # row: (id, pair, side, requested_qty, lot_id, source, rationale)
         pending_id = row[0]
         pair = row[1]
         side = row[2]
         requested_qty = row[3]
-
-        # ----- CHANGE: Grab lot_id if present as the 5th column -----
-        # We add 'lot_id' in the SELECT statement below
-        # ( see the _fetch_pending_trade_by_kraken_id() ) so let's do that now:
-        #   "SELECT id, pair, side, requested_qty, lot_id FROM pending_trades..."
+        lot_id = row[4]
+        source = row[5]  # "risk_manager" or "ai_strategy", etc.
+        rationale = row[6]  # "stop-loss", "take-profit", or GPT text, etc.
 
         reason = f"final fill size={filled_size}, fee={fee}"
         mark_pending_trade_closed(pending_id, reason=reason)
         logger.info(f"[PrivateWS] Marked pending_id={pending_id} closed => fill={filled_size}, fee={fee}")
 
-        # If risk_manager is set and we do have a lot_id => call on_pending_trade_closed
-        # We'll parse out side, fill_size, etc. to pass in
-        # The updated _fetch_pending_trade_by_kraken_id can return the lot_id at row[4].
-        if len(row) > 4 and self.risk_manager:
-            lot_id = row[4]
-            if lot_id is not None:
-                # side might be "BUY" or "SELL"
-                self.risk_manager.on_pending_trade_closed(
-                    lot_id=lot_id,
-                    fill_size=filled_size,
-                    side=side,
-                    fill_price=avg_fill_price
-                )
+        # Insert row into `trades` if needed (with the new source/rationale).
+        # Usually, ownTrades feed also calls _store_own_trade_if_new. But if you want
+        # to force an entry here, you can do so. The typical approach is to rely on
+        # ownTrades to do the actual insertion. If you want them to definitely have source/rationale,
+        # we can do:
+        self._store_own_trade_if_new(
+            trade_id=kraken_order_id,  # we treat the Kraken ID as 'order_id'
+            side=side,
+            pair=pair,
+            quantity=filled_size,
+            fill_price=avg_fill_price,
+            fee=fee,
+            source=source,
+            rationale=rationale
+        )
+
+        # If there's a lot => inform risk_manager
+        if lot_id is not None and self.risk_manager:
+            self.risk_manager.on_pending_trade_closed(
+                lot_id=lot_id,
+                fill_size=filled_size,
+                side=side,
+                fill_price=avg_fill_price
+            )
 
 
 # ------------------------------------------------------------------------------
@@ -718,16 +803,23 @@ class KrakenPrivateWSClient:
 # ------------------------------------------------------------------------------
 def _fetch_pending_trade_by_kraken_id(kraken_order_id: str):
     """
-    Returns (id, pair, side, requested_qty, lot_id) from 'pending_trades'
-    where kraken_order_id=?.
+    Returns (id, pair, side, requested_qty, lot_id, source, rationale)
+    from 'pending_trades' where kraken_order_id=?.
 
-    We add 'lot_id' as the 5th element so we can finalize the corresponding lot in risk_manager.
+    We fetch 'source' and 'rationale' so that final trades can store them.
     """
     conn = sqlite3.connect("trades.db")
     try:
         c = conn.cursor()
         c.execute("""
-            SELECT id, pair, side, requested_qty, lot_id
+            SELECT
+                id,
+                pair,
+                side,
+                requested_qty,
+                lot_id,
+                source,
+                rationale
             FROM pending_trades
             WHERE kraken_order_id=?
         """, (kraken_order_id,))
@@ -737,7 +829,6 @@ def _fetch_pending_trade_by_kraken_id(kraken_order_id: str):
         return None
     finally:
         conn.close()
-
 
 def mark_pending_trade_open_by_kraken_id(kraken_order_id: str):
     """
