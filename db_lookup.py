@@ -641,7 +641,7 @@ def get_recent_sells_for_pair(pair: str, limit: int = 5) -> List[str]:
 
 if __name__ == "__main__":
     # Example usage / self-test
-    example_wsname = "DOGE/USD"
+    example_wsname = "ETH/USD"
 
     print(f"Testing db_lookup.py for wsname={example_wsname} ...")
 
@@ -656,3 +656,7 @@ if __name__ == "__main__":
 
     tick_size = get_asset_value_for_pair(example_wsname, "tick_size")
     print(f"tick_size => {tick_size}")
+
+    buys = get_recent_ledger_entries_for_pair(example_wsname, limit=5, trade_type='BUY')
+    for buy in buys:
+        print(buy)
