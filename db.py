@@ -69,12 +69,14 @@ def init_db():
                     timestamp INTEGER,
                     kraken_trade_id TEXT,
                     pair TEXT,
-                    side TEXT,         -- 'BUY' or 'SELL'
+                    side TEXT,
                     quantity REAL,
                     price REAL,
                     order_id TEXT,
                     fee REAL DEFAULT 0,
-                    realized_pnl REAL
+                    realized_pnl REAL,
+                    source TEXT,
+                    rationale TEXT
                 )
         """)
 
@@ -404,7 +406,9 @@ def create_pending_trades_table(conn=None):
                 status TEXT,               -- 'pending','open','closed','rejected'
                 kraken_order_id TEXT,
                 reason TEXT,
-                lot_id INTEGER
+                lot_id INTEGER,
+                source TEXT,
+                rationale TEXT
             )
         """)
         conn.commit()
@@ -418,22 +422,27 @@ def create_pending_trades_table(conn=None):
 # ------------------------------------------------------------------------------
 # CRUD for PENDING_TRADES
 # ------------------------------------------------------------------------------
-## CHANGED: No partial fill columns or partial fill logic is included.
-def create_pending_trade(side: str, requested_qty: float, pair: str, reason: str = None) -> int:
-    """
-    Insert a new row in 'pending_trades' with status='pending'.
-    Returns newly inserted row ID.
-    """
+def create_pending_trade(side: str, requested_qty: float, pair: str,
+                         reason: str = None, source: str = None, rationale: str = None) -> int:
     conn = sqlite3.connect(DB_FILE)
     row_id = None
     try:
         c = conn.cursor()
         c.execute("""
             INSERT INTO pending_trades (
-                created_at, pair, side, requested_qty, status, kraken_order_id, reason
+                created_at, pair, side, requested_qty, status,
+                kraken_order_id, reason, source, rationale
             )
-            VALUES (?, ?, ?, ?, 'pending', NULL, ?)
-        """, (int(time.time()), pair, side, requested_qty, reason))
+            VALUES (?, ?, ?, ?, 'pending', NULL, ?, ?, ?)
+        """, (
+            int(time.time()),
+            pair,
+            side,
+            requested_qty,
+            reason,
+            source,
+            rationale
+        ))
         conn.commit()
         row_id = c.lastrowid
     except Exception as e:
