@@ -235,12 +235,18 @@ class AIStrategy:
                     buy_quantity=size,
                     buy_price=px
                 )
-            self._store_decision(pair, action, size, rationale)
+            self._store_decision(pair, action, size, rationale, group_rationale="Fallback logic from an AI decision.")
             return (action, size)
 
         else:
             rationale = f"[Fallback] => px={px:.2f} >=20k => HOLD"
-            self._store_decision(pair, "HOLD", 0.0, rationale)
+            self._store_decision(
+                pair,
+                "HOLD",
+                0.0,
+                rationale,
+                group_rationale="Fallback logic from an AI decision."
+            )
             return ("HOLD", 0.0)
 
     # --------------------------------------------------------------------------
@@ -390,7 +396,7 @@ class AIStrategy:
                         buy_price=px
                     )
 
-            self._store_decision(pair, final_action, final_size, rationale)
+            self._store_decision(pair, final_action, final_size, rationale, group_rationale=ai_rationale)
             results_set[pair] = (final_action, final_size)
 
         return results_set
@@ -508,7 +514,8 @@ class AIStrategy:
                 pair TEXT,
                 action TEXT,
                 size REAL,
-                rationale TEXT
+                rationale TEXT,
+                group_rationale TEXT
             )
             """)
             conn.commit()
@@ -517,7 +524,7 @@ class AIStrategy:
         finally:
             conn.close()
 
-    def _store_decision(self, pair: str, action: str, size: float, rationale: str):
+    def _store_decision(self, pair: str, action: str, size: float, rationale: str, group_rationale: str = None):
         """
         Insert a record into 'ai_decisions' reflecting the final GPT or fallback decision.
         """
@@ -526,9 +533,9 @@ class AIStrategy:
         try:
             c = conn.cursor()
             c.execute("""
-            INSERT INTO ai_decisions (timestamp, pair, action, size, rationale)
-            VALUES (?, ?, ?, ?, ?)
-            """, (int(time.time()), pair, action, size, rationale))
+            INSERT INTO ai_decisions (timestamp, pair, action, size, rationale, group_rationale)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """, (int(time.time()), pair, action, size, rationale, group_rationale))
             conn.commit()
         except Exception as e:
             logger.exception(f"[AIStrategy] Error storing AI decision => {e}")
