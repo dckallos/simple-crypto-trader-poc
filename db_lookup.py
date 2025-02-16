@@ -42,6 +42,8 @@ Author: Your Team
 import sqlite3
 import logging
 import os
+from typing import List, Optional
+import datetime
 
 ###############################################################################
 # Adjust DB_FILE if your DB path is different
@@ -514,6 +516,126 @@ def get_recent_timeseries_for_coin(coin_id: str, limit: int = 5) -> dict:
         conn.close()
 
     return results_dict
+
+# --------------------------------------------------------------------------
+# Retrieve recent ledger trades for a given pair (BUY/SELL), with USD cost
+# --------------------------------------------------------------------------
+def get_recent_ledger_entries_for_pair(
+    pair: str,
+    limit: int = 5,
+    trade_type: Optional[str] = None
+) -> List[str]:
+    """
+    Retrieves up to `limit` most recent trades (ledger entries) for the given pair,
+    returning a list of strings formatted as:
+
+        <epoch_time> <YYYY-MM-DD HH:MM> <BUY|SELL> <pair> <quantity>@<price_in_usd> balance=<balance>
+
+    - We detect BUY vs SELL by sign of 'amount' in the base asset row:
+        amount>0 => BUY
+        amount<0 => SELL
+    - We also fetch the matching ZUSD row (same 'refid') to see the cost or proceeds
+      in USD (absolute value).  price = (abs(zusd_amount) / abs(base_amount)).
+    - The ledger 'balance' is taken from the base-asset row's 'balance' column.
+    - `trade_type` can be "BUY" or "SELL" if you only want that type. Otherwise None returns both.
+    - We order by time DESC.
+
+    Example output line:
+       1739675593 2025-02-15 21:50 BUY ETH/USD 0.002@2692.23 balance=0.034
+    """
+    base_asset = get_base_asset(pair)
+    if not base_asset:
+        logger.warning(f"[db_lookup] Cannot retrieve recent ledger entries => no base_asset for {pair}")
+        return []
+
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    results = []
+    try:
+        c = conn.cursor()
+        # Grab the last `limit` ledger rows for base_asset, ignoring type != 'trade'
+        q = """
+        SELECT ledger_id, refid, time, amount, balance
+        FROM ledger_entries
+        WHERE asset=? 
+          AND type='trade'
+        ORDER BY time DESC
+        LIMIT ?
+        """
+        c.execute(q, (base_asset, limit))
+        rows = c.fetchall()
+
+        for row in rows:
+            ledger_id = row["ledger_id"]
+            refid = row["refid"]
+            t_epoch = float(row["time"])
+            amt_base = float(row["amount"])
+            bal_base = float(row["balance"] or 0.0)
+
+            # Determine if it's buy or sell
+            side = "BUY" if amt_base > 0 else "SELL"
+            if amt_base == 0:
+                # skip edge cases (0.0 amounts)
+                continue
+            # If trade_type is specified, skip mismatch
+            if trade_type and trade_type.upper() != side:
+                continue
+
+            abs_qty = abs(amt_base)
+
+            # For price in USD => find the matching ZUSD row for the same refid
+            c2 = conn.cursor()
+            c2.execute("""
+            SELECT amount 
+            FROM ledger_entries
+            WHERE refid=? 
+              AND asset='ZUSD'
+              AND type='trade'
+            LIMIT 1
+            """, (refid,))
+            row_zusd = c2.fetchone()
+            cost_usd = 0.0
+            if row_zusd:
+                cost_usd = abs(float(row_zusd[0]))
+
+            px = 0.0
+            if abs_qty > 0:
+                px = cost_usd / abs_qty
+
+            # Convert epoch to readable date
+            dt = datetime.datetime.utcfromtimestamp(t_epoch)
+            dt_str = dt.strftime("%Y-%m-%d %H:%M")
+
+            # Build final string
+            line = (
+                f"{int(t_epoch)} {dt_str} {side} {pair} "
+                f"{abs_qty:.4g}@{px:.3f} balance={bal_base:.4g}"
+            )
+            results.append(line)
+
+        return results
+
+    except Exception as e:
+        logger.exception(f"[db_lookup] Error in get_recent_ledger_entries_for_pair({pair}): {e}")
+        return []
+    finally:
+        conn.close()
+
+
+def get_recent_buys_for_pair(pair: str, limit: int = 5) -> List[str]:
+    """
+    Returns only the most recent BUY trades for a given pair.
+    Internally calls get_recent_ledger_entries_for_pair(..., trade_type='BUY').
+    """
+    return get_recent_ledger_entries_for_pair(pair, limit=limit, trade_type='BUY')
+
+
+def get_recent_sells_for_pair(pair: str, limit: int = 5) -> List[str]:
+    """
+    Returns only the most recent SELL trades for a given pair.
+    Internally calls get_recent_ledger_entries_for_pair(..., trade_type='SELL').
+    """
+    return get_recent_ledger_entries_for_pair(pair, limit=limit, trade_type='SELL')
 
 
 
