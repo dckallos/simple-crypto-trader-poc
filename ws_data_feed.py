@@ -532,9 +532,18 @@ class KrakenPrivateWSClient:
             if not isinstance(item, dict):
                 continue
             for txid, info in item.items():
+                userref = info.get("userref")
                 status_str = info.get("status", "")
                 vol_exec_str = info.get("vol_exec", "0.0")
                 vol_exec = float(vol_exec_str)
+
+                # --- NEW: record kraken_order_id in pending trades ---
+                if userref:
+                    try:
+                        set_kraken_order_id_for_pending_trade(int(userref), txid)
+                        logger.debug(f"[PrivateWS] Mapped userref={userref} -> kraken_order_id={txid}")
+                    except ValueError:
+                        logger.warning(f"[PrivateWS] userref is not an int? userref={userref}")
 
                 if status_str in ("canceled", "expired"):
                     if vol_exec == 0:
@@ -713,7 +722,7 @@ class KrakenPrivateWSClient:
             if price is not None:
                 msg["price"] = str(price)
             if userref is not None:
-                msg["userref"] = userref
+                msg["userref"] = str(userref)
             logger.info(f"[PrivateWS] Sending addOrder => {msg}")
             await self._ws.send(json.dumps(msg))
 
