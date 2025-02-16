@@ -24,7 +24,6 @@ We keep aggregator_cycle_all_coins, update_lunarcrush_data, and _build_aggregato
 exactly as you had them, ensuring minimal changes to your aggregator logic.
 Stop-loss/take-profit is now handled in risk_manager.py or ws_data_feed.py
 if you wish to do it on each price update.
-
 """
 
 import time
@@ -740,7 +739,9 @@ def main():
         db_path=DB_FILE,
         max_position_size=3,
         max_daily_drawdown=-0.02,
-        initial_spending_account=risk_controls.get("initial_spending_account", 0.0)
+        initial_spending_account=risk_controls.get("initial_spending_account", 0.0),
+        private_ws_client=None,
+        place_live_orders=PLACE_LIVE_ORDERS
     )
     risk_manager_db.initialize()
     loop = asyncio.get_event_loop()
@@ -821,6 +822,7 @@ def main():
         # If placing live orders => attach it
         if PLACE_LIVE_ORDERS:
             ai_strategy.private_ws_client = priv_client
+            risk_manager_db.private_ws_client = priv_client
 
     # aggregator => calls AIStrategy => multi-coin GPT
     class HybridAppAggregator(HybridApp):
