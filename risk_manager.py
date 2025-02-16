@@ -287,8 +287,7 @@ class RiskManagerDB:
                     side="SELL",
                     requested_qty=lot_qty,
                     pair=pair,
-                    reason=reason,
-                    lot_id=lot_id
+                    reason=reason
                 )
                 # 2) mark lot as pending SELL
                 self._mark_lot_as_pending_sell(lot_id)
@@ -311,8 +310,7 @@ class RiskManagerDB:
                     side="SELL",
                     requested_qty=sell_size,
                     pair=pair,
-                    reason=reason,
-                    lot_id=lot_id
+                    reason=reason
                 )
                 # 2) mark lot as pending SELL
                 self._mark_lot_as_pending_sell(lot_id)
@@ -656,3 +654,188 @@ class RiskManagerDB:
         For "DOT/USD", returns the 'base' symbol in Kraken format, e.g. "XDOT".
         """
         return db_lookup.get_base_asset(pair)
+
+    def rebuild_lots_from_ledger_entries(self):
+        """
+        Rebuilds 'holding_lots' by replaying all ledger_entries where type='trade'.
+        Steps:
+          1) DELETE all rows from 'holding_lots'.
+          2) For each unique refid in ledger_entries (where type='trade'):
+             - Gather the ledger rows. Typically there are 2 rows per trade:
+                 a) One for ZUSD (the cost or proceeds)
+                 b) One for the base asset (the coin)
+             - If the base asset row shows a positive 'amount', that is a BUY of that coin
+               (the ZUSD ledger row will show a negative 'amount' of the same magnitude).
+             - If the base asset row shows a negative 'amount', that is a SELL of that coin
+               (the ZUSD ledger row will show a positive 'amount').
+             - Convert these two rows into a single transaction => call add_or_combine_lot(...)
+               or the new _apply_historical_sell_ledger(...)
+        This ensures 'holding_lots' accurately reflects all trades recognized in ledger_entries.
+        """
+        import sqlite3
+        conn = sqlite3.connect(self.db_path)
+        try:
+            c = conn.cursor()
+
+            # 1) Clear out holding_lots
+            logger.info("[RiskManager] Rebuilding lots from ledger => clearing existing holding_lots.")
+            c.execute("DELETE FROM holding_lots")
+            conn.commit()
+
+            # 2) Fetch all ledger rows where type='trade', sorted by time ascending
+            c.execute("""
+                SELECT ledger_id, refid, time, asset, amount, fee, balance
+                FROM ledger_entries
+                WHERE type='trade'
+                ORDER BY time ASC, ledger_id ASC
+            """)
+            rows = c.fetchall()
+
+            # Group them by refid in Python
+            from collections import defaultdict
+            trades_by_refid = defaultdict(list)
+            for (ledger_id, refid, tstamp, asset, amt, fee, bal) in rows:
+                trades_by_refid[refid].append({
+                    "ledger_id": ledger_id,
+                    "time": tstamp,
+                    "asset": asset,
+                    "amount": amt,
+                    "fee": fee,
+                    "balance": bal
+                })
+
+            # 3) Process each refid in ascending time order
+            #    (Kraken's ledger might have >2 rows for advanced trades, but typically 2 for spot.)
+            refids_sorted = sorted(trades_by_refid.keys(),
+                                   key=lambda r: trades_by_refid[r][0]["time"])
+            for refid in refids_sorted:
+                ledger_group = trades_by_refid[refid]
+                if len(ledger_group) < 2:
+                    # Some edge case or partial data?
+                    logger.warning(f"[RiskManager] Ledger refid={refid} has <2 rows => skipping.")
+                    continue
+
+                # We try to find the row that is 'ZUSD' vs. the row that is some alt coin
+                # For multi-asset trades (e.g. A -> B), you'd extend this logic.
+                maybe_zusd = [x for x in ledger_group if x["asset"].upper().startswith("Z")]
+                maybe_coin = [x for x in ledger_group if not x["asset"].upper().startswith("Z")]
+
+                if not maybe_zusd or not maybe_coin:
+                    logger.warning(f"[RiskManager] refid={refid} doesn't have ZUSD + coin => skipping.")
+                    continue
+
+                # We'll just take the first from each list (typical 1:1, ignoring fees row if separate)
+                zusd_row = maybe_zusd[0]
+                coin_row = maybe_coin[0]
+
+                # deduce if it's a BUY or SELL
+                # if the coin_row 'amount' is positive => BUY
+                # if negative => SELL
+                coin_amt = coin_row["amount"]
+                zusd_amt = zusd_row["amount"]
+                timestamp = coin_row["time"]  # or zusd_row["time"], typically same
+
+                if coin_amt > 0:
+                    # BUY => quantity is coin_amt
+                    # cost in USD => absolute value of zusd_amt
+                    # => price can be cost / coin_amt
+                    # (assuming no partial-lot logic for fees, or incorporate fee if you want)
+                    buy_qty = coin_amt
+                    cost_usd = abs(zusd_amt)  # likely negative
+                    if abs(buy_qty) > 0:
+                        avg_price = cost_usd / buy_qty
+                        # call add_or_combine_lot
+                        self.add_or_combine_lot(pair=self._get_pair_name(coin_row["asset"]),
+                                                buy_quantity=buy_qty,
+                                                buy_price=avg_price)
+                    else:
+                        logger.warning(f"[RiskManager] refid={refid}, coin_amt=0 => skip")
+
+                else:
+                    # SELL => coin_amt < 0 => we sold some coin
+                    # proceeds => positive zusd_amt
+                    sell_qty = abs(coin_amt)  # how many coins we sold
+                    proceeds_usd = zusd_amt   # typically positive
+                    if sell_qty > 0:
+                        # We compute an approximate fill price if you want
+                        avg_price = proceeds_usd / sell_qty if sell_qty else 0
+                        self._apply_historical_sell_ledger(
+                            pair=self._get_pair_name(coin_row["asset"]),
+                            sell_qty=sell_qty,
+                            sell_price=avg_price
+                        )
+                    else:
+                        logger.warning(f"[RiskManager] refid={refid}, negative coin_amt => 0 => skip")
+
+            logger.info("[RiskManager] Completed rebuilding lots from ledger entries.")
+
+        except Exception as e:
+            logger.exception(f"[RiskManager] Error in rebuild_lots_from_ledger_entries => {e}")
+        finally:
+            conn.close()
+
+
+    def _apply_historical_sell_ledger(self, pair: str, sell_qty: float, sell_price: float):
+        """
+        Very similar to the approach for replaying SELL from trades.
+        We reduce 'sell_qty' from open lots for 'pair' in FIFO order.
+        If a lot is fully used up, remove it. If partially leftover, set has_sold_in_between=1.
+
+        :param pair: e.g. "XRP/USD" or just "XRP" if you need to guess
+        :param sell_qty: how many base units to remove
+        :param sell_price: fill price derived from ledger (proceeds/quantity).
+        """
+        if sell_qty <= 0:
+            return
+
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            c = conn.cursor()
+            # Query open lots for this pair, oldest first
+            c.execute("""
+                SELECT id, quantity, purchase_price, initial_quantity
+                FROM holding_lots
+                WHERE pair=?
+                  AND quantity>0
+                  AND has_sold_in_between != 2
+                ORDER BY id ASC
+            """, (pair,))
+            rows = c.fetchall()
+
+            qty_to_sell = sell_qty
+            for row in rows:
+                lot_id = row["id"]
+                lot_qty = float(row["quantity"])
+
+                if qty_to_sell <= 0:
+                    break  # fully allocated the SELL
+
+                if lot_qty <= qty_to_sell:
+                    # This lot is fully closed
+                    c.execute("DELETE FROM holding_lots WHERE id=?", (lot_id,))
+                    logger.debug(f"[RiskManager] Ledger SELL => fully removed lot_id={lot_id}")
+                    qty_to_sell -= lot_qty
+                else:
+                    # partial leftover
+                    leftover = lot_qty - qty_to_sell
+                    c.execute("""
+                        UPDATE holding_lots
+                        SET quantity=?, has_sold_in_between=1
+                        WHERE id=?
+                    """, (leftover, lot_id))
+                    logger.debug(f"[RiskManager] Ledger SELL => lot_id={lot_id}, leftover={leftover}")
+                    qty_to_sell = 0
+
+            conn.commit()
+            if qty_to_sell > 0:
+                logger.warning(f"[RiskManager] Ledger SELL leftover={qty_to_sell} not allocated to any lot. Possibly mismatch.")
+        except Exception as e:
+            logger.exception(f"[RiskManager] _apply_historical_sell_ledger => {e}")
+        finally:
+            conn.close()
+
+
+    def _get_pair_name(self, asset_name: str) -> str:
+        return db_lookup.get_websocket_name_from_base_asset(asset_name)
+
