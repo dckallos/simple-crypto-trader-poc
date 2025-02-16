@@ -72,6 +72,7 @@ class AIStrategy:
         max_position_size: float = 3.0,
         max_daily_drawdown: float = -0.02,
         risk_controls: Optional[Dict[str, Any]] = None,
+        risk_manager: RiskManagerDB = None,
         gpt_model: str = "o1-mini",
         gpt_temperature: float = 1.0,
         gpt_max_tokens: int = 5000,
@@ -106,21 +107,14 @@ class AIStrategy:
             if gpt_model:
                 self.gpt_manager.model = gpt_model
 
-        # RiskManager handles daily drawdown & real-time usage checks (no local sub-positions).
-        self.risk_manager_db = RiskManagerDB(
-            db_path=DB_FILE,
-            max_position_size=max_position_size,
-            max_daily_drawdown=max_daily_drawdown,
-            initial_spending_account=self.risk_controls.get("initial_spending_account", 100.0)
-        )
-        self.risk_manager_db.initialize()
-
         # Whether to place real orders via KrakenPrivateWSClient
         self.private_ws_client = private_ws_client
         self.place_live_orders = place_live_orders
 
         # Ensure ai_decisions table exists
         self._create_ai_decisions_table()
+
+        self.risk_manager = risk_manager
 
     # --------------------------------------------------------------------------
     # 1) SINGLE-PAIR PREDICT
@@ -181,7 +175,7 @@ class AIStrategy:
         # 2) local clamp => post_validate
         final_action, final_size = self._post_validate(action_raw, suggested_size, current_px)
         # 3) daily drawdown check => real-time usage check
-        final_action, final_size = self.risk_manager_db.adjust_trade(
+        final_action, final_size = self.risk_manager.adjust_trade(
             final_action, final_size, pair, current_px, rest_manager.fetch_balance()
         )
 
@@ -201,7 +195,7 @@ class AIStrategy:
 
             # If it is a BUY => combine or create a new lot in RiskManager
             if final_action == "BUY":
-                self.risk_manager_db.add_or_combine_lot(
+                self.risk_manager.add_or_combine_lot(
                     pair=pair,
                     buy_quantity=final_size,
                     buy_price=current_px
@@ -219,7 +213,7 @@ class AIStrategy:
         px = market_data.get("price", 0.0)
         if px < 20000:
             action, size = self._post_validate("BUY", 0.0005, px)
-            action, size = self.risk_manager_db.adjust_trade(
+            action, size = self.risk_manager.adjust_trade(
                 action, size, pair, px, rest_manager.fetch_balance()
             )
             rationale = f"[Fallback] => px={px:.2f} <20k => {action} {size}"
@@ -234,7 +228,7 @@ class AIStrategy:
                 self._maybe_place_kraken_order(pair, action, size, pending_id)
 
                 # add or combine lot
-                self.risk_manager_db.add_or_combine_lot(
+                self.risk_manager.add_or_combine_lot(
                     pair=pair,
                     buy_quantity=size,
                     buy_price=px
@@ -368,7 +362,7 @@ class AIStrategy:
 
             # local clamp => daily drawdown
             final_action, final_size = self._post_validate(action_raw, size_suggested, px)
-            final_action, final_size = self.risk_manager_db.adjust_trade(
+            final_action, final_size = self.risk_manager.adjust_trade(
                 final_action, final_size, pair, px, rest_manager.fetch_balance()
             )
             rationale = f"GPT multi => {pair} => final={final_action}, size={final_size}"
@@ -385,7 +379,7 @@ class AIStrategy:
 
                 # For a BUY => add or combine lot
                 if final_action == "BUY":
-                    self.risk_manager_db.add_or_combine_lot(
+                    self.risk_manager.add_or_combine_lot(
                         pair=pair,
                         buy_quantity=final_size,
                         buy_price=px
