@@ -27,7 +27,7 @@ import sqlite3
 import time
 import logging
 import os
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 import asyncio
 from config_loader import ConfigLoader
 
@@ -256,6 +256,62 @@ def store_price_history(pair: str, bid: float, ask: float, last: float, volume: 
         conn.commit()
     except Exception as e:
         logger.exception(f"Error storing price in DB: {e}")
+    finally:
+        conn.close()
+
+def fetch_minute_spaced_prices(
+    pair: str,
+    db_path: str = "trades.db",
+    num_points: int = 15,
+    max_rows_to_search: int = 300
+) -> List[Tuple[int, float]]:
+    """
+    Returns up to `num_points` data points from 'price_history' spaced ~1 minute apart,
+    with the most recent data as the last entry in chronological order.
+
+    Each returned item is (timestamp, last_price).
+
+    Implementation:
+      - Fetch the last `max_rows_to_search` rows for 'price_history' WHERE pair=?, DESC order.
+      - Reverse them to ascending.
+      - Walk forward, picking rows ~60s apart, until we collect `num_points` or run out.
+    """
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT timestamp, last_price
+            FROM price_history
+            WHERE pair = ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """, (pair, max_rows_to_search))
+        rows_desc = c.fetchall()
+        if not rows_desc:
+            return []
+
+        # Reverse to ascending chronological order
+        rows_asc = list(reversed(rows_desc))
+
+        out = []
+        last_picked_ts = 0
+        for row in rows_asc:
+            ts = int(row["timestamp"])
+            price = float(row["last_price"])
+            if not out:
+                out.append((ts, price))
+                last_picked_ts = ts
+            else:
+                if (ts - last_picked_ts) >= 60:
+                    out.append((ts, price))
+                    last_picked_ts = ts
+            if len(out) >= num_points:
+                break
+        return out
+    except Exception as e:
+        logger.exception(f"[fetch_minute_spaced_prices] error => {e}")
+        return []
     finally:
         conn.close()
 
