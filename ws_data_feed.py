@@ -60,6 +60,7 @@ from db import (
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+
 def create_secure_ssl_context() -> ssl.SSLContext:
     """
     Creates an SSL context using certifi's trusted CA certificates.
@@ -73,6 +74,7 @@ def create_secure_ssl_context() -> ssl.SSLContext:
     context.check_hostname = True
     context.load_verify_locations(cafile=certifi.where())
     return context
+
 
 # ------------------------------------------------------------------------------
 # PUBLIC FEED: KrakenPublicWSClient
@@ -306,6 +308,7 @@ class KrakenPublicWSClient:
                 last=price_val,
                 volume=vol_val
             )
+
 
 # ------------------------------------------------------------------------------
 # PRIVATE FEED: KrakenPrivateWSClient
@@ -673,6 +676,8 @@ class KrakenPrivateWSClient:
         """
         Called when an order is canceled/expired or partially filled => finalize the pending_trade row.
         The actual fill details come from ownTrades (which inserts the 'trades' row).
+        We also notify risk_manager if there's a 'lot_id' so it can remove/partial leftover the lot
+        via on_pending_trade_closed(...).
         """
         row = _fetch_pending_trade_by_kraken_id(kraken_order_id)
         if not row:
@@ -680,25 +685,49 @@ class KrakenPrivateWSClient:
             return
 
         pending_id = row[0]
-        # pair = row[1]
-        # side = row[2]
-        # requested_qty = row[3]
+        pair = row[1]
+        side = row[2]
+        requested_qty = row[3]
+
+        # ----- CHANGE: Grab lot_id if present as the 5th column -----
+        # We add 'lot_id' in the SELECT statement below
+        # ( see the _fetch_pending_trade_by_kraken_id() ) so let's do that now:
+        #   "SELECT id, pair, side, requested_qty, lot_id FROM pending_trades..."
+
         reason = f"final fill size={filled_size}, fee={fee}"
         mark_pending_trade_closed(pending_id, reason=reason)
         logger.info(f"[PrivateWS] Marked pending_id={pending_id} closed => fill={filled_size}, fee={fee}")
+
+        # If risk_manager is set and we do have a lot_id => call on_pending_trade_closed
+        # We'll parse out side, fill_size, etc. to pass in
+        # The updated _fetch_pending_trade_by_kraken_id can return the lot_id at row[4].
+        if len(row) > 4 and self.risk_manager:
+            lot_id = row[4]
+            if lot_id is not None:
+                # side might be "BUY" or "SELL"
+                self.risk_manager.on_pending_trade_closed(
+                    lot_id=lot_id,
+                    fill_size=filled_size,
+                    side=side,
+                    fill_price=avg_fill_price
+                )
+
 
 # ------------------------------------------------------------------------------
 # HELPER: fetch pending_trades row by kraken_order_id
 # ------------------------------------------------------------------------------
 def _fetch_pending_trade_by_kraken_id(kraken_order_id: str):
     """
-    Returns (id, pair, side, requested_qty) from 'pending_trades' where kraken_order_id=?.
+    Returns (id, pair, side, requested_qty, lot_id) from 'pending_trades'
+    where kraken_order_id=?.
+
+    We add 'lot_id' as the 5th element so we can finalize the corresponding lot in risk_manager.
     """
     conn = sqlite3.connect("trades.db")
     try:
         c = conn.cursor()
         c.execute("""
-            SELECT id, pair, side, requested_qty
+            SELECT id, pair, side, requested_qty, lot_id
             FROM pending_trades
             WHERE kraken_order_id=?
         """, (kraken_order_id,))
@@ -708,6 +737,7 @@ def _fetch_pending_trade_by_kraken_id(kraken_order_id: str):
         return None
     finally:
         conn.close()
+
 
 def mark_pending_trade_open_by_kraken_id(kraken_order_id: str):
     """
@@ -728,6 +758,7 @@ def mark_pending_trade_open_by_kraken_id(kraken_order_id: str):
         logger.exception(f"Error marking trade open => {e}")
     finally:
         conn.close()
+
 
 def mark_pending_trade_rejected_by_kraken_id(kraken_order_id: str, reason: str = None):
     """
