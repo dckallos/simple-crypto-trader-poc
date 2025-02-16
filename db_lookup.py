@@ -370,6 +370,36 @@ def get_base_asset(wsname: str) -> str:
         conn.close()
 
 
+def get_websocket_name_from_base_asset(base_asset_name: str) -> str:
+    """
+    Returns the 'base' column from kraken_asset_pairs where wsname = ?.
+
+    :param base_asset_name: The raw 'base' value from the table, e.g. "XETH", "XXBT", or "" if not found.
+    :type base_asset_name: str
+    :return: The WebSocket name of the pair, e.g. "ETH/USD" or "XBT/USD".
+    :rtype: str
+    """
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT wsname
+            FROM kraken_asset_name_lookup
+            WHERE base_asset = ?
+            LIMIT 1
+        """, (base_asset_name,))
+        row = c.fetchone()
+        if row:
+            return row[0]  # e.g. "ETH/USD"
+        logger.warning(f"[db_lookup] No matching base asset for wsname={base_asset_name}")
+        return ""
+    except Exception as e:
+        logger.exception(f"[db_lookup] Error in get_base_asset(wsname='{base_asset_name}'): {e}")
+        return ""
+    finally:
+        conn.close()
+
+
 def get_minimum_cost_in_usd(wsname: str) -> float:
     """
     Calculate the minimum cost in USD by:
