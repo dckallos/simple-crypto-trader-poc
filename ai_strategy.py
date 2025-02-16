@@ -223,7 +223,9 @@ class AIStrategy:
                     side=action,
                     requested_qty=size,
                     pair=pair,
-                    reason="FALLBACK_SINGLE"
+                    reason="FALLBACK_SINGLE",
+                    source="fallback",
+                    rationale="Fallback logic from an AI decision."
                 )
                 self._maybe_place_kraken_order(pair, action, size, pending_id)
 
@@ -344,6 +346,7 @@ class AIStrategy:
                 pair = it.get("pair", "UNK")
                 results_set[pair] = ("HOLD", 0.0)
             return results_set
+        ai_rationale = multi_resp.get("rationale", "No GPT rationale provided")
 
         # 2) For each GPT decision => do local post-validation => risk_manager_db => create pending trades
         for dec in decisions_array:
@@ -373,7 +376,9 @@ class AIStrategy:
                     side=final_action,
                     requested_qty=final_size,
                     pair=pair,
-                    reason="GPT_MULTI_DECISION"
+                    reason="GPT_MULTI_DECISION",
+                    source="ai_strategy",
+                    rationale=ai_rationale
                 )
                 self._maybe_place_kraken_order(pair, final_action, final_size, pending_id)
 
