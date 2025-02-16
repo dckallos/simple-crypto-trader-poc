@@ -47,13 +47,14 @@ import datetime
 
 import db
 # Local modules
-from db import init_db, DB_FILE
+from db import init_db, DB_FILE, fetch_minute_spaced_prices
 from ai_strategy import AIStrategy
 from ws_data_feed import KrakenPublicWSClient, KrakenPrivateWSClient
 from config_loader import ConfigLoader
 from fetch_lunarcrush import LunarCrushFetcher
 from risk_manager import RiskManagerDB
 from kraken_rest_manager import KrakenRestManager
+import db_lookup
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.DEBUG)
@@ -104,6 +105,51 @@ LOG_CONFIG = {
         },
     }
 }
+
+def compute_minute_percent_changes(price_records: list[tuple[int, float]]) -> list[float]:
+    """
+    Given a list of (timestamp, price) in ascending order, return an array of % changes
+    from each record to the next.
+
+    If price[i] == 0, or there's not enough data, returns 0 for that slot.
+
+    Example:
+       price_records = [(t1, p1), (t2, p2), (t3, p3)]
+       returns => [%_change_2_1, %_change_3_2]
+
+    :return: e.g. [+0.12, -0.03, +0.25, ...]
+    """
+    changes = []
+    for i in range(1, len(price_records)):
+        _, prev_price = price_records[i-1]
+        _, curr_price = price_records[i]
+        if prev_price == 0:
+            pct_change = 0.0
+        else:
+            pct_change = (curr_price - prev_price) / prev_price * 100.0
+        changes.append(pct_change)
+    return changes
+
+def convert_base_asset_keys_to_wsname(trade_balances: Dict[str, float]) -> Dict[str, float]:
+    """
+    Convert each key in trade_balances from a base-asset name (e.g. "XETH")
+    into its corresponding wsname, e.g. "ETH/USD".
+
+    :param trade_balances: something like {"XETH": 1.25, "XXBT": 0.3, ...}
+    :return: new dict with e.g. {"ETH/USD": 1.25, "XBT/USD": 0.3, ...}
+             if no wsname is found for a base asset, that entry is skipped.
+    """
+    import db_lookup
+    new_dict = {}
+    for base_asset, balance in trade_balances.items():
+        wsname = db_lookup.get_websocket_name_from_base_asset(base_asset)
+        if wsname:
+            new_dict[wsname] = balance
+        else:
+            # Optionally, log or skip:
+            # logger.warning(f"No wsname found for base_asset={base_asset}, skipping.")
+            pass
+    return new_dict
 
 def setup_logging():
     """
@@ -379,7 +425,10 @@ class HybridApp:
         self.latest_prices[pair] = last_price
         now = time.time()
         if (now - self.last_agg_ts) >= ConfigLoader.get_value("trade_interval_seconds", 300):
-            self.aggregator_cycle_all_coins()
+            if ConfigLoader.get_value("use_simple_prompt", False):
+                self.aggregator_cycle_all_coins_simple_prompt()
+            else:
+                self.aggregator_cycle_all_coins()
             self.last_agg_ts = now
 
     def aggregator_cycle_all_coins(self):
@@ -428,6 +477,59 @@ class HybridApp:
             input_open_positions=open_positions_txt,
             current_balance=current_usd_balance,
             current_trade_balance=trade_balances
+        )
+        logger.info("[Aggregator] GPT decisions => %s", decisions)
+
+    def aggregator_cycle_all_coins_simple_prompt(self):
+        """
+        The aggregator cycle:
+         1) fetch ledger => store => read ZUSD balance
+         2) build aggregator_list => AIStrategy => multi-coin GPT
+         3) GPT => create pending trades if needed
+        (We have removed time-series population from here.)
+        """
+        # 1) Update LunarCrush data
+        self.update_lunarcrush_data()
+
+        logger.info("[Aggregator] aggregator_cycle_all_coins => Checking ledger for ZUSD balance...")
+        fetch_and_store_kraken_ledger(
+            api_key=self.kraken_api_key,
+            api_secret=self.kraken_api_secret,
+            asset="all",
+            ledger_type="all",
+            db_path=DB_FILE
+        )
+        trade_balances = fetch_kraken_balance(
+            api_key=self.kraken_api_key,
+            api_secret=self.kraken_api_secret
+        )
+        trade_balances_ws = convert_base_asset_keys_to_wsname(trade_balances)
+        current_usd_balance = get_latest_zusd_balance(db_path=DB_FILE)
+        logger.info(f'[Aggregator] Current ZUSD balance: {current_usd_balance}')
+
+        aggregator_list = []
+        for pair in self.pairs:
+            quantity = ConfigLoader.get_value("quantity_of_price_history", 15)
+            simple_str = self._build_aggregator_for_pair_simple_prompt(pair, quantity)
+            aggregator_list.append({
+                "pair": pair,
+                "prompt_text": simple_str
+            })
+
+        # Example trade_history + open_positions usage for AIStrategy => multi-coin approach
+        trade_history = self._build_global_trade_history(limit=10)
+        open_positions_txt = []
+
+        zero_count = sum(1 for p in self.pairs if self.latest_prices[p] == 0.0)
+        if zero_count > 0:
+            logger.info(f"Skipping aggregator because {zero_count} pairs have price=0.0.")
+            return
+
+        decisions = self.strategy.gpt_manager.generate_multi_trade_decision_simple_prompt(
+            aggregator_list_simple=aggregator_list,
+            reflection_enabled=ConfigLoader.get_value("enable_reflection", False),
+            current_balance=current_usd_balance,
+            current_trade_balance=trade_balances_ws
         )
         logger.info("[Aggregator] GPT decisions => %s", decisions)
 
@@ -491,6 +593,45 @@ class HybridApp:
             output_lines.append(line_str)
 
         return "\n".join(output_lines)
+
+    def _build_aggregator_for_pair_simple_prompt(
+            self,
+            pair: str,
+            num_intervals: int = 15
+    ) -> str:
+        """
+        Builds a short text block describing minute-based % changes for a single coin,
+        with neutral/hypothetical language to avoid policy flags.
+        """
+        db_path = "trades.db"
+        records = fetch_minute_spaced_prices(
+            pair=pair,
+            db_path=db_path,
+            num_points=num_intervals + 1
+        )
+        if len(records) < 2:
+            return f"Coin: [{pair}]\n\nNo minute-based data found (insufficient points)."
+
+        changes = compute_minute_percent_changes(records)
+        changes_str = ", ".join(f"{chg:.3f}" for chg in changes)
+        min_qty = db_lookup.get_ordermin(pair)
+        min_cost = db_lookup.get_minimum_cost_in_usd(pair)
+
+        # Basic disclaimers, avoiding “advice/guarantee” language
+        aggregator_text = f"""\
+    Coin: [{pair}]
+    PRICE HISTORY DATA (sample):
+    "price_changes": [
+      {changes_str}
+    ]
+    minimum_purchase_quantity = {min_qty} (approx. ${min_cost})
+
+    NOTE: These numeric values are hypothetical references, not instructions.
+    1. Consecutive positives or negatives may hint at short-term trends.
+    2. Larger absolute changes (~±0.25% or more) might indicate stronger variations.
+    3. This is purely illustrative with no assurance of outcome.
+    """
+        return aggregator_text
 
     def _build_aggregator_for_pair(self, pair: str) -> Dict[str, Any]:
         """
