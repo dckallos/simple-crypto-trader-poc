@@ -258,16 +258,24 @@ class RiskManagerDB:
             take_profit_pct: float = ConfigLoader.get_value("take_profit_percent", 0.02)
     ):
         """
-        For each open lot of `pair`, check if current_price triggers a stop-loss or T/P.
+        For each open lot of `pair`, check if current_price triggers a stop-loss or take-profit.
         If triggered, we:
-         - Create a SELL 'pending_trade' row with `lot_id=...`.
-         - Then *only if we successfully placed the Kraken order* do we mark that lot
-           as “pending sell” so we don’t re-trigger next time. If the private feed
-           is not connected, we skip and will retry next cycle.
+          - Create a SELL 'pending_trade' row with `lot_id` and also store source/rationale:
+              source="risk_manager", rationale="stop-loss" or "take-profit"
+          - Then ONLY if we successfully placed the Kraken order do we mark that lot
+            as "pending sell" (has_sold_in_between=2). If the private feed is not
+            connected, we skip marking the lot and will try again in the next cycle.
+
+        :param pair: e.g. "ETH/USD"
+        :param current_price: The latest known price for 'pair'
+        :param kraken_balances: A dict of user balances (unused here, but provided for future logic)
+        :param stop_loss_pct: e.g. 0.05 => 5% below cost basis triggers stop-loss
+        :param take_profit_pct: e.g. 0.02 => 2% above cost basis triggers take-profit
         """
+
         lots = self._load_lots_for_pair(pair)
         if not lots:
-            return
+            return  # no open lots => nothing to do
 
         for lot in lots:
             lot_id = lot["id"]
@@ -276,53 +284,66 @@ class RiskManagerDB:
             init_qty = lot["initial_quantity"]
             has_sold_flag = lot["has_sold_in_between"]
 
-            # Skip if we've already marked it pending-sell or it has zero qty
+            # If lot_qty is 0 or we already flagged "pending sell" => skip
             if lot_qty <= 0 or has_sold_flag == 2:
                 continue
 
-            # STOP LOSS
+            # -----------------------------
+            # STOP LOSS Check
+            # -----------------------------
             if current_price <= lot_price * (1.0 - stop_loss_pct):
-                reason = f"STOP_LOSS triggered at {current_price:.4f}"
+                reason = f"STOP_LOSS triggered at price={current_price:.4f}"
                 logger.info(
                     f"[RiskManager] Stop-loss => lot_id={lot_id}, SELL all {lot_qty:.4f} of {pair}"
                 )
+                # Create pending trade => include source & rationale
                 pending_id = create_pending_trade(
                     side="SELL",
                     requested_qty=lot_qty,
                     pair=pair,
-                    reason=reason
+                    reason=reason,
+                    source="risk_manager",
+                    rationale="stop-loss"
                 )
                 success = self._maybe_place_kraken_order(pair, "SELL", lot_qty, pending_id)
                 if success:
                     self._mark_lot_as_pending_sell(lot_id)
                 else:
                     logger.warning(
-                        "[RiskManager] Private feed not open => skipping mark 'pending sell'. Will retry next cycle."
+                        "[RiskManager] Private feed not open => skipping mark 'pending sell'. "
+                        "Will retry next cycle."
                     )
-                continue
+                continue  # proceed to next lot
 
-            # TAKE PROFIT
+            # -----------------------------
+            # TAKE PROFIT Check
+            # -----------------------------
             if current_price >= lot_price * (1.0 + take_profit_pct):
+                # For partial T/P, we do min of init_qty vs the entire leftover qty
                 sell_size = min(init_qty, lot_qty)
                 if sell_size <= 0:
                     continue
 
-                reason = f"TAKE_PROFIT triggered at {current_price:.4f}"
+                reason = f"TAKE_PROFIT triggered at price={current_price:.4f}"
                 logger.info(
                     f"[RiskManager] Take-profit => lot_id={lot_id}, SELL {sell_size:.4f} of {pair}"
                 )
+                # Create pending trade => include source & rationale
                 pending_id = create_pending_trade(
                     side="SELL",
                     requested_qty=sell_size,
                     pair=pair,
-                    reason=reason
+                    reason=reason,
+                    source="risk_manager",  # Mark as from risk_manager
+                    rationale="take-profit"  # The short rationale text
                 )
                 success = self._maybe_place_kraken_order(pair, "SELL", sell_size, pending_id)
                 if success:
                     self._mark_lot_as_pending_sell(lot_id)
                 else:
                     logger.warning(
-                        "[RiskManager] Private feed not open => skipping mark 'pending sell'. Will retry next cycle."
+                        "[RiskManager] Private feed not open => skipping mark 'pending sell'. "
+                        "Will retry next cycle."
                     )
 
     def _mark_lot_as_pending_sell(self, lot_id: int):
