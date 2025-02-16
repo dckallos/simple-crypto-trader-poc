@@ -744,7 +744,7 @@ def main():
     # 4) Create risk_manager + AIStrategy
     risk_manager_db = RiskManagerDB(
         db_path=DB_FILE,
-        max_position_size=3,
+        max_position_size=10,
         max_daily_drawdown=-0.02,
         initial_spending_account=risk_controls.get("initial_spending_account", 0.0),
         private_ws_client=None,
@@ -764,7 +764,7 @@ def main():
     ai_strategy = AIStrategy(
         pairs=TRADED_PAIRS,
         use_openai=ENABLE_GPT,
-        max_position_size=5,
+        max_position_size=10,
         max_daily_drawdown=-0.02,
         risk_controls=risk_controls,
         risk_manager=risk_manager_db,
