@@ -501,6 +501,11 @@ class HybridApp:
         lunarcrush_symbol = db_lookup.get_formatted_name_from_pair_name(pair)
         symbol = db_lookup.get_base_asset(pair)
         last_price = 0.0
+        # Get up to 3 recent BUYs and 3 recent SELLs:
+        recent_buys = db_lookup.get_recent_buys_for_pair(pair, limit=5)
+        recent_sells = db_lookup.get_recent_sells_for_pair(pair, limit=5)
+        buys_block = "\n".join(recent_buys) if recent_buys else "No recent BUYS."
+        sells_block = "\n".join(recent_sells) if recent_sells else "No recent SELLS."
         aggregator_text = "No aggregator data found"
 
         conn = sqlite3.connect(DB_FILE)
@@ -566,7 +571,9 @@ class HybridApp:
 
                     import json
                     aggregator_text = (
-                        f"[{pair}]\n"
+                        f"[{pair}]\n\n"
+                        f"RECENT BUYS FOR {pair}:\n{buys_block}\n\n"
+                        f"RECENT SELLS FOR {pair}:\n{sells_block}\n\n"
                         f"pair_name = {db_lookup.get_asset_value_for_pair(pair, 'pair_name')}\n"
                         f"alternative_name = {db_lookup.get_asset_value_for_pair(pair, 'altname')}\n"
                         f"base_asset = {db_lookup.get_base_asset(pair)}\n"
