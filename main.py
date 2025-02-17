@@ -512,8 +512,10 @@ class HybridApp:
         quantity = ConfigLoader.get_value("quantity_of_price_history", 15)
         for pair in self.pairs:
             simple_str = self._build_aggregator_for_pair_simple_prompt(pair, quantity)
+            last_price_for_pair = self.latest_prices.get(pair, 0.0)
             aggregator_list.append({
                 "pair": pair,
+                "price": last_price_for_pair,
                 "prompt_text": simple_str
             })
 
