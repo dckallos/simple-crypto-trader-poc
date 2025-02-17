@@ -501,11 +501,14 @@ def create_pending_trade(side: str, requested_qty: float, pair: str,
         ))
         conn.commit()
         row_id = c.lastrowid
+
+        logger.info(f"[DB] Successfully created pending trade ID {row_id} for {side} {requested_qty} {pair}")
     except Exception as e:
-        logger.exception(f"Error creating pending trade: {e}")
+        logger.exception(f"[DB] Error creating pending trade: {e}")
     finally:
         conn.close()
     return row_id
+
 
 
 def mark_pending_trade_open(pending_id: int, kraken_order_id: str):
