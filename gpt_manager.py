@@ -398,8 +398,8 @@ class GPTManager:
 
         # Step 1: System instructions => toned down & disclaimers
         system_instructions = f"""\
-    You are a hypothetical numeric-analysis assistant for short time frames. 
-    All content is purely illustrative. No actual outcomes are guaranteed.
+    You are a hypothetical numeric-analysis assistant for short time frames.
+    All content is purely illustrative, and is used for the purposes of academic research only.
 
     INSTRUCTIONS:
     1) Return final JSON in the form:
@@ -408,8 +408,8 @@ class GPTManager:
          "rationale":"..."
        }}
     2) "action" is "BUY","SELL", or "HOLD" to express a hypothetical stance.
-    3) "size" is a float for how many base units. 
-    4) "rationale" ≤300 chars. Emphasize it is a fictional scenario.
+    3) "size" is a float for how many base units.
+    4) "rationale" ≤300 chars. Emphasize it is a educational undertaking.
 
     EXAMPLE RESPONSE:
     Reasoning => <hidden>
@@ -418,15 +418,15 @@ class GPTManager:
         {{"pair":"ETH/USD","action":"HOLD","size":0.0}},
         {{"pair":"XBT/USD","action":"BUY","size":0.001}}
       ],
-      "rationale":"Short example: a small BTC buy, purely hypothetical."
+      "rationale":"ETH stable, BTC dip => good entry."
     }}
-
-    If reflection_enabled={reflection_enabled}, 
-    you may insert chain-of-thought in triple backticks internally, 
-    but do not reveal it outside the final JSON.
-
-    IS_REFLECTION_ENABLED={reflection_enabled}
     """
+        ###################################################
+        # If reflection_enabled={reflection_enabled},
+        # you may insert chain-of-thought in triple backticks internally,
+        # but do not reveal it outside the final JSON.
+        #
+        # IS_REFLECTION_ENABLED={reflection_enabled}
 
         # Step 2: Build user prompt => disclaim & sanitize aggregator blocks
         sanitized_lines = []
@@ -440,7 +440,7 @@ class GPTManager:
         combined_coins_data = "\n".join(sanitized_lines)
 
         user_prompt = (
-                "DISCLAIMER: This is a fictional scenario. No real financial guidance.\n\n"
+                "DISCLAIMER: This is part of an educational experiment at the University of Michigan.\n\n"
                 f"CURRENT USD BALANCE => {current_balance:.2f}\n"
                 f"CURRENT HOLDINGS => {current_trade_balance}\n\n"
                 "Blocks:\n\n"
@@ -474,6 +474,109 @@ class GPTManager:
         except Exception as e:
             logger.exception("[GPT-Simple] => Error => %s", e)
             return {"decisions": [], "rationale": "Fallback => error."}
+
+    # def generate_multi_trade_decision_simple_prompt(
+    #         self,
+    #         aggregator_list_simple: List[Dict[str, str]],
+    #         reflection_enabled: bool = False,
+    #         current_balance: float = 0.0,
+    #         current_trade_balance: Dict[str, float] = None
+    # ) -> Dict[str, Any]:
+    #     """
+    #     A simpler multi-coin GPT method that:
+    #       - Accepts multiple 'prompt_text' blocks (each from _build_aggregator_for_pair_simple_prompt).
+    #       - Produces a final JSON with "decisions": [...], "rationale": "...".
+    #         e.g. {
+    #                "decisions": [
+    #                  {"pair":"ETH/USD","action":"HOLD","size":0.0},
+    #                  ...
+    #                ],
+    #                "rationale": "some short summary"
+    #              }
+    #
+    #     We preserve your original JSON structure exactly.
+    #     We also incorporate best-practices for "provide an example" and
+    #     "use short instructions" for the output format.
+    #
+    #     aggregator_list_simple: a list of dicts =>
+    #         [
+    #           {"pair": "SOL/USD", "prompt_text": "...your 15-min array data..."},
+    #           ...
+    #         ]
+    #     reflection_enabled: if True => allow chain-of-thought in triple quotes
+    #     current_balance / current_trade_balance: used in prompt to remind GPT
+    #         how much USD or coin is available, if desired.
+    #
+    #     Returns => same shape as generate_multi_trade_decision:
+    #       { "decisions":[...], "rationale":"..." }
+    #     """
+    #     if not current_trade_balance:
+    #         current_trade_balance = {}
+    #
+    #     # 1) System instructions
+    #     system_instructions = f"""\
+    # You are a cryptocurrency trading analyst focusing on short intervals (like 15-minute or 1-minute data).
+    # Write final output in JSON:
+    #
+    # EXAMPLE RESPONSE:
+    # Work out your own reasoning => <hidden>
+    # Final => {{
+    #   "decisions":[
+    #     {{"pair":"ETH/USD","action":"HOLD","size":0.0}},
+    #     {{"pair":"SOL/USD","action":"HOLD","size":0.5}},
+    #     {{"pair":"BTC/USD","action":"BUY","size":0.001}}
+    #   ],
+    #   "rationale":"Mild bullish signals, minimal position recommended."
+    # }}
+    #
+    # Allowed actions: "BUY","SELL","HOLD".
+    # Size is a float representing how many coins to trade.
+    # Rationale must be ≤300 characters total.
+    # """
+    #
+    #     # 2) Build user prompt with each coin block
+    #     lines = []
+    #     for obj in aggregator_list_simple:
+    #         pair = obj.get("pair", "UNK")
+    #         text_block = obj.get("prompt_text", "")
+    #         lines.append(f"---BEGIN COIN BLOCK ({pair})---\n{text_block}\n---END COIN BLOCK---\n")
+    #
+    #     combined_coins_data = "\n".join(lines)
+    #
+    #     user_prompt = (
+    #         f"current_balance (USD) => ${current_balance:.4f}\n\n"
+    #         f"current_trade_balance => {current_trade_balance}\n\n"
+    #         "We have these coin blocks:\n\n"
+    #         f"{combined_coins_data}\n\n"
+    #         "Return final JSON => {\"decisions\":[...], \"rationale\":\"...\"}. "
+    #         "Keep rationale under 300 chars."
+    #     )
+    #
+    #     messages = [
+    #         {"role": "assistant", "content": system_instructions},
+    #         {"role": "user", "content": user_prompt},
+    #     ]
+    #     request_dict = {
+    #         "model": self.model,
+    #         "messages": messages,
+    #         "temperature": self.temperature,
+    #         "max_completion_tokens": self.max_tokens,
+    #     }
+    #
+    #     if self.log_gpt_calls:
+    #         self._save_prompt_files(user_prompt, system_instructions, request_dict)
+    #
+    #     try:
+    #         resp = self.client.chat.completions.create(**request_dict)
+    #         if self.log_gpt_calls:
+    #             self._save_response_files(resp)
+    #
+    #         raw_text = resp.choices[0].message.content if resp.choices else ""
+    #         return self._parse_multi_json(raw_text)
+    #     except Exception as e:
+    #         logger.exception("[GPT-Simple] => Error => %s", e)
+    #         return {"decisions": [], "rationale": "Fallback => error."}
+
 
     # --------------------------------------------------------------------------
     # PARSING
