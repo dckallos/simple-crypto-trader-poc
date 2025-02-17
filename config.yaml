@@ -6,7 +6,9 @@ enable_gpt_integration: true
 trade_interval_seconds: 120
 min_data_rows: 100
 openai_model: "o1-mini"
-pre_populate_db_tables: false
+
+pre_populate_db_tables: true
+pre_populate_lunarcrush_data: false
 
 # Use simple prompt with only price history
 use_simple_prompt: true
