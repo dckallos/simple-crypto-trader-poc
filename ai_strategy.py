@@ -401,6 +401,153 @@ class AIStrategy:
 
         return results_set
 
+    def predict_multi_coins_simple(
+            self,
+            aggregator_list_simple: List[Dict[str, Any]],
+            trade_history: List[str],
+            max_trades: int,
+            input_open_positions: List[str],
+            current_balance: float,
+            current_trade_balance: Dict[str, float]
+    ) -> Dict[str, Tuple[str, float]]:
+        """
+        A streamlined, 'simple prompt' version of the multi-coin trading logic. This method
+        calls generate_multi_trade_decision_simple_prompt(...) to retrieve BUY/SELL/HOLD
+        instructions, then follows a nearly identical workflow to predict_multi_coins(...):
+
+          1) If no aggregator data is provided or GPT usage is disabled, returns an empty
+             dict or HOLD decisions.
+          2) Calls GPT with a simplified prompt, capturing a JSON output of recommended trades.
+          3) For each pair in the response:
+             - Retrieve a valid 'price' from aggregator_list_simple or set to 0 if missing.
+             - If the price <= 0, we set action=HOLD and skip further steps.
+             - Otherwise, we run local post-validation to clamp the action and size
+               (via self._post_validate(...)).
+             - We pass the action and size to self.risk_manager.adjust_trade(...) to apply
+               risk checks, daily drawdown logic, and real-time balance checks.
+             - If the final action is BUY or SELL with size > 0, create a new row in
+               pending_trades and optionally place a live Kraken order through
+               self._maybe_place_kraken_order(...).
+             - For BUY actions, call self.risk_manager.add_or_combine_lot(...) to maintain
+               the open-lot tracking.
+             - Store the final action, size, and rationale in ai_decisions via
+               self._store_decision(...).
+
+        :param aggregator_list_simple: A list of dictionaries where each entry includes at
+               least {"pair": "...", "price": float, "prompt_text": "..."} used in GPT's
+               simple prompt. The "price" is used to calculate trade cost or clamp sizes.
+        :param trade_history: A list of strings summarizing recent trades; typically
+               truncated to max_trades items before use in GPT.
+        :param max_trades: The max number of trade-history lines to provide to GPT.
+        :param input_open_positions: A list of strings describing currently open positions,
+               if you want GPT to see them. (Optional usage in the prompt.)
+        :param current_balance: The user’s USD (or main currency) available.
+        :param current_trade_balance: A dictionary like {"ETH/USD": 0.5, "XBT/USD": 0.01}
+               representing coin holdings, used by GPT for context.
+        :return: A dictionary mapping { "PAIR": ("ACTION", final_size) } reflecting the
+                 final decisions after risk checks and pending-trade creation.
+        """
+        results_set: Dict[str, Tuple[str, float]] = {}
+
+        # 1) Early exit if GPT is disabled or aggregator data is empty
+        if not self.use_openai or not self.gpt_manager or not aggregator_list_simple:
+            logger.info("[AIStrategy-simple] GPT disabled or aggregator_list_simple empty => HOLD all.")
+            for item in aggregator_list_simple:
+                pair_name = item.get("pair", "UNK")
+                results_set[pair_name] = ("HOLD", 0.0)
+            return results_set
+
+        # 2) Invoke GPT with a simple prompt approach
+        try:
+            gpt_result = self.gpt_manager.generate_multi_trade_decision_simple_prompt(
+                aggregator_list_simple=aggregator_list_simple,
+                reflection_enabled=False,
+                current_balance=current_balance,
+                current_trade_balance=current_trade_balance
+            )
+        except Exception as e:
+            logger.exception("[AIStrategy-simple] GPT call failed => fallback => HOLD.")
+            for item in aggregator_list_simple:
+                pair_name = item.get("pair", "UNK")
+                results_set[pair_name] = ("HOLD", 0.0)
+            return results_set
+
+        decisions_array = gpt_result.get("decisions", [])
+        if not decisions_array:
+            logger.warning("[AIStrategy-simple] GPT returned no decisions => hold all.")
+            for item in aggregator_list_simple:
+                pair_name = item.get("pair", "UNK")
+                results_set[pair_name] = ("HOLD", 0.0)
+            return results_set
+
+        # Extract a shared rationale if GPT provided one
+        ai_rationale = gpt_result.get("rationale", "No GPT rationale provided")
+
+        # 3) Process each GPT decision => clamp, pass to risk_manager, create pending trades
+        for decision in decisions_array:
+            pair_name = decision.get("pair", "UNK")
+            action_raw = decision.get("action", "HOLD").upper()
+            suggested_size = float(decision.get("size", 0.0))
+
+            # Find the aggregator entry for a valid last price
+            found_item = next((x for x in aggregator_list_simple if x.get("pair") == pair_name), None)
+            current_price = 0.0
+            if found_item is not None:
+                current_price = float(found_item.get("price", 0.0))
+
+            if current_price <= 0:
+                logger.warning(f"[AIStrategy-simple] No valid price for {pair_name} => forcing HOLD.")
+                self._store_decision(pair_name, "HOLD", 0.0, "No valid price => hold", group_rationale=ai_rationale)
+                results_set[pair_name] = ("HOLD", 0.0)
+                continue
+
+            # Post-validate (e.g. ensure size or cost is not nonsensical)
+            final_action, final_size = self._post_validate(action_raw, suggested_size, current_price)
+
+            # daily drawdown / capacity checks via risk_manager
+            final_action, final_size = self.risk_manager.adjust_trade(
+                final_action,
+                final_size,
+                pair_name,
+                current_price,
+                rest_manager.fetch_balance()
+            )
+
+            # If after all checks we still have a trade, create a pending_trades row
+            rationale_str = f"GPT simple => {pair_name} => final={final_action}, size={final_size}"
+            if final_action.upper() in ("BUY", "SELL") and final_size > 0:
+                pending_id = create_pending_trade(
+                    side=final_action,
+                    requested_qty=final_size,
+                    pair=pair_name,
+                    reason="GPT_MULTI_DECISION_SIMPLE",
+                    source="ai_strategy_simple",
+                    rationale=ai_rationale
+                )
+                if pending_id:
+                    logger.info(f"[AIStrategy] Successfully created pending trade with ID {pending_id}")
+                else:
+                    logger.error(f"[AIStrategy] Failed to create pending trade for {pair}")
+                self._maybe_place_kraken_order(
+                    pair=pair_name,
+                    action=final_action,
+                    volume=final_size,
+                    pending_id=pending_id
+                )
+                if final_action.upper() == "BUY":
+                    # Merge or add new lot in holding_lots
+                    self.risk_manager.add_or_combine_lot(
+                        pair=pair_name,
+                        buy_quantity=final_size,
+                        buy_price=current_price
+                    )
+
+            # Record the final result in ai_decisions and in the returned dict
+            self._store_decision(pair_name, final_action, final_size, rationale_str, group_rationale=ai_rationale)
+            results_set[pair_name] = (final_action, final_size)
+
+        return results_set
+
     # --------------------------------------------------------------------------
     # HELPER: aggregator_text builder (example code)
     # --------------------------------------------------------------------------
