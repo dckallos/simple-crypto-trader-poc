@@ -525,9 +525,13 @@ class AIStrategy:
                     rationale=ai_rationale
                 )
                 if pending_id:
+                    logger.warning(f"[AIStrategy] ******************************************************")
                     logger.info(f"[AIStrategy] Successfully created pending trade with ID {pending_id}")
+                    logger.warning(f"[AIStrategy] ******************************************************")
                 else:
-                    logger.error(f"[AIStrategy] Failed to create pending trade for {pair}")
+                    logger.warning(f"[AIStrategy] ******************************************************")
+                    logger.error(f"[AIStrategy] Failed to create pending trade for {pair_name}")
+                    logger.warning(f"[AIStrategy] ******************************************************")
                 self._maybe_place_kraken_order(
                     pair=pair_name,
                     action=final_action,
