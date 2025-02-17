@@ -482,16 +482,15 @@ class HybridApp:
 
     def aggregator_cycle_all_coins_simple_prompt(self):
         """
-        The aggregator cycle:
-         1) fetch ledger => store => read ZUSD balance
-         2) build aggregator_list => AIStrategy => multi-coin GPT
-         3) GPT => create pending trades if needed
-        (We have removed time-series population from here.)
+        The aggregator cycle for the "simple prompt" approach:
+         1) Update ledger => read ZUSD balance
+         2) Build aggregator_list of text blocks => AIStrategy => predict_multi_coins_simple
+         3) That call returns final decisions => create pending trades => possibly place orders
         """
-        # 1) Update LunarCrush data
+        # 1) Update LunarCrush or anything else you want
         self.update_lunarcrush_data()
 
-        logger.info("[Aggregator] aggregator_cycle_all_coins => Checking ledger for ZUSD balance...")
+        logger.info("[Aggregator] aggregator_cycle_all_coins_simple_prompt => Checking ledger/balance.")
         fetch_and_store_kraken_ledger(
             api_key=self.kraken_api_key,
             api_secret=self.kraken_api_secret,
@@ -505,33 +504,41 @@ class HybridApp:
         )
         trade_balances_ws = convert_base_asset_keys_to_wsname(trade_balances)
         current_usd_balance = get_latest_zusd_balance(db_path=DB_FILE)
+        trade_balances_ws["USD"] = current_usd_balance
         logger.info(f'[Aggregator] Current ZUSD balance: {current_usd_balance}')
 
+        # 2) Build aggregator_list of simple text blocks
         aggregator_list = []
+        quantity = ConfigLoader.get_value("quantity_of_price_history", 15)
         for pair in self.pairs:
-            quantity = ConfigLoader.get_value("quantity_of_price_history", 15)
             simple_str = self._build_aggregator_for_pair_simple_prompt(pair, quantity)
             aggregator_list.append({
                 "pair": pair,
                 "prompt_text": simple_str
             })
 
-        # Example trade_history + open_positions usage for AIStrategy => multi-coin approach
+        # For GPT, we can provide optional trade_history & open_positions (similar to normal aggregator)
         trade_history = self._build_global_trade_history(limit=10)
         open_positions_txt = []
 
         zero_count = sum(1 for p in self.pairs if self.latest_prices[p] == 0.0)
         if zero_count > 0:
-            logger.info(f"Skipping aggregator because {zero_count} pairs have price=0.0.")
+            logger.info(f"[Aggregator] Skipping aggregator because {zero_count} pairs have price=0.0.")
             return
 
-        decisions = self.strategy.gpt_manager.generate_multi_trade_decision_simple_prompt(
+        # 3) Instead of calling generate_multi_trade_decision_simple_prompt here,
+        #    we call the new AIStrategy method that finalizes trades
+        decisions = self.strategy.predict_multi_coins_simple(
             aggregator_list_simple=aggregator_list,
-            reflection_enabled=ConfigLoader.get_value("enable_reflection", False),
+            trade_history=trade_history,
+            max_trades=25,
+            input_open_positions=open_positions_txt,
             current_balance=current_usd_balance,
             current_trade_balance=trade_balances_ws
         )
-        logger.info("[Aggregator] GPT decisions => %s", decisions)
+
+        logger.info("[Aggregator] Simple-prompt GPT decisions => %s", decisions)
+
 
     def update_lunarcrush_data(self):
         """
@@ -594,42 +601,94 @@ class HybridApp:
 
         return "\n".join(output_lines)
 
+    # def _build_aggregator_for_pair_simple_prompt(
+    #         self,
+    #         pair: str,
+    #         num_intervals: int = 15
+    # ) -> str:
+    #     """
+    #     Builds a short text block describing minute-based % changes for a single coin,
+    #     with neutral/hypothetical language to avoid policy flags.
+    #     """
+    #     db_path = "trades.db"
+    #     records = fetch_minute_spaced_prices(
+    #         pair=pair,
+    #         db_path=db_path,
+    #         num_points=num_intervals + 1
+    #     )
+    #     if len(records) < 2:
+    #         return f"Coin: [{pair}]\n\nNo minute-based data found (insufficient points)."
+    #
+    #     changes = compute_minute_percent_changes(records)
+    #     changes_str = ", ".join(f"{chg:.3f}" for chg in changes)
+    #     min_qty = db_lookup.get_ordermin(pair)
+    #     min_cost = db_lookup.get_minimum_cost_in_usd(pair)
+    #
+    #     # Basic disclaimers, avoiding “advice/guarantee” language
+    #     aggregator_text = f"""\
+    # Coin: [{pair}]
+    # PRICE HISTORY DATA (sample):
+    # "price_changes": [
+    #   {changes_str}
+    # ]
+    # minimum_purchase_quantity = {min_qty} (approx. ${min_cost})
+    #
+    # NOTE: These numeric values are hypothetical references, not instructions.
+    # 1. Consecutive positives or negatives may hint at short-term trends.
+    # 2. Larger absolute changes (~±0.25% or more) might indicate stronger variations.
+    # 3. This is purely illustrative with no assurance of outcome.
+    # """
+    #     return aggregator_text
+
     def _build_aggregator_for_pair_simple_prompt(
             self,
             pair: str,
             num_intervals: int = 15
     ) -> str:
         """
-        Builds a short text block describing minute-based % changes for a single coin,
-        with neutral/hypothetical language to avoid policy flags.
+        A new aggregator method returning a text block like:
+
+          Coin: [ETH/USD]
+          PRICE HISTORY DATA (chronological):
+          "price_changes": [ 0.05, 0.12, -0.03, ... ]
+
+          HOW TO INTERPRET:
+          1) ...
+          2) ...
+          3) ...
+          4) ...
+
+        The text references ~num_intervals percent changes, computed from minute-spaced data.
         """
-        db_path = "trades.db"
+        db_path = "trades.db"  # Or self.db_path if you store it on the class
+        # 1) get minute-based points
         records = fetch_minute_spaced_prices(
             pair=pair,
             db_path=db_path,
-            num_points=num_intervals + 1
+            num_points=num_intervals + 1  # need +1 so we can compute ~15 changes
         )
         if len(records) < 2:
-            return f"Coin: [{pair}]\n\nNo minute-based data found (insufficient points)."
+            return f"Coin: [{pair}]\n\nNo minute-based data available (or not enough data points)."
 
+        # 2) compute changes in ascending order
         changes = compute_minute_percent_changes(records)
         changes_str = ", ".join(f"{chg:.3f}" for chg in changes)
         min_qty = db_lookup.get_ordermin(pair)
         min_cost = db_lookup.get_minimum_cost_in_usd(pair)
 
-        # Basic disclaimers, avoiding “advice/guarantee” language
         aggregator_text = f"""\
     Coin: [{pair}]
-    PRICE HISTORY DATA (sample):
+    PRICE HISTORY DATA (chronological):
     "price_changes": [
       {changes_str}
     ]
     minimum_purchase_quantity = {min_qty} (approx. ${min_cost})
 
-    NOTE: These numeric values are hypothetical references, not instructions.
-    1. Consecutive positives or negatives may hint at short-term trends.
-    2. Larger absolute changes (~±0.25% or more) might indicate stronger variations.
-    3. This is purely illustrative with no assurance of outcome.
+    HOW TO INTERPRET:
+    1. Each item is the percent change from the previous minute. Positive = up, negative = down.
+    2. Consecutive positives suggest a short bullish wave; consecutive negatives suggest short bearish moves.
+    3. Larger absolute changes (≥ ±0.25%) can indicate stronger momentum swings.
+    4. Near-zero changes suggest a more sideways or “range-bound” interval.
     """
         return aggregator_text
 
@@ -811,6 +870,7 @@ def main():
     TRADED_PAIRS = ConfigLoader.get_traded_pairs()
     AGG_INTERVAL = ConfigLoader.get_value("trade_interval_seconds", 300)
     PRE_POPULATE_DB = ConfigLoader.get_value("pre_populate_db_tables", True)
+    PRE_POPULATE_LUNARCRUSH_DATA = ConfigLoader.get_value("pre_populate_lunarcrush_data", True)
     risk_controls = ConfigLoader.get_value("risk_controls", {
         "initial_spending_account": 50.0,
         "purchase_upper_limit_percent": 75.0,
@@ -861,7 +921,7 @@ def main():
 
         # Backfill timeseries for each symbol => e.g. 1 month
         coin_ids = [db_lookup.get_formatted_name_from_pair_name(pair) for pair in TRADED_PAIRS]
-        if PRE_POPULATE_DB | IS_TIMESERIES_UNDERPOPULATED:
+        if PRE_POPULATE_LUNARCRUSH_DATA | IS_TIMESERIES_UNDERPOPULATED:
             fetcher.backfill_coins(
                 coin_ids=coin_ids,
                 months=1,
