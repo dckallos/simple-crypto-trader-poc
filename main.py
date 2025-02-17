@@ -603,44 +603,6 @@ class HybridApp:
 
         return "\n".join(output_lines)
 
-    # def _build_aggregator_for_pair_simple_prompt(
-    #         self,
-    #         pair: str,
-    #         num_intervals: int = 15
-    # ) -> str:
-    #     """
-    #     Builds a short text block describing minute-based % changes for a single coin,
-    #     with neutral/hypothetical language to avoid policy flags.
-    #     """
-    #     db_path = "trades.db"
-    #     records = fetch_minute_spaced_prices(
-    #         pair=pair,
-    #         db_path=db_path,
-    #         num_points=num_intervals + 1
-    #     )
-    #     if len(records) < 2:
-    #         return f"Coin: [{pair}]\n\nNo minute-based data found (insufficient points)."
-    #
-    #     changes = compute_minute_percent_changes(records)
-    #     changes_str = ", ".join(f"{chg:.3f}" for chg in changes)
-    #     min_qty = db_lookup.get_ordermin(pair)
-    #     min_cost = db_lookup.get_minimum_cost_in_usd(pair)
-    #
-    #     # Basic disclaimers, avoiding “advice/guarantee” language
-    #     aggregator_text = f"""\
-    # Coin: [{pair}]
-    # PRICE HISTORY DATA (sample):
-    # "price_changes": [
-    #   {changes_str}
-    # ]
-    # minimum_purchase_quantity = {min_qty} (approx. ${min_cost})
-    #
-    # NOTE: These numeric values are hypothetical references, not instructions.
-    # 1. Consecutive positives or negatives may hint at short-term trends.
-    # 2. Larger absolute changes (~±0.25% or more) might indicate stronger variations.
-    # 3. This is purely illustrative with no assurance of outcome.
-    # """
-    #     return aggregator_text
 
     def _build_aggregator_for_pair_simple_prompt(
             self,
@@ -967,7 +929,7 @@ def main():
     ai_strategy = AIStrategy(
         pairs=TRADED_PAIRS,
         use_openai=ENABLE_GPT,
-        max_position_size=10,
+        max_position_size=20,
         max_daily_drawdown=-0.02,
         risk_controls=risk_controls,
         risk_manager=risk_manager_db,
