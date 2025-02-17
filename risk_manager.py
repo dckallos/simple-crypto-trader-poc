@@ -215,10 +215,14 @@ class RiskManagerDB:
                             current_price=latest_price,
                             kraken_balances=dummy_balances
                         )
+            except asyncio.CancelledError:
+                logger.info("[RiskManager] price_check_cycle task is cancelled => exiting cleanly.")
+                break
             except Exception as e:
                 logger.exception(f"[RiskManager] DB price check cycle => error => {e}")
 
             await asyncio.sleep(interval)
+        logger.info("[RiskManager] price_check_cycle has exited.")
 
     def _fetch_latest_price_for_pair(self, pair: str) -> float:
         """
