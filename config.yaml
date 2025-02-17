@@ -3,26 +3,26 @@ enable_live_ai_inference: true
 place_live_orders: true
 enable_gpt_integration: true
 
-trade_interval_seconds: 120
+trade_interval_seconds: 1800
 min_data_rows: 100
 openai_model: "o1-mini"
 
 pre_populate_db_tables: true
-pre_populate_lunarcrush_data: true
+pre_populate_lunarcrush_data: false
 
 # Use simple prompt with only price history
 use_simple_prompt: true
 
 # The number of price_history records to include
-quantity_of_price_history: 25
+quantity_of_price_history: 50
 
 # Have the AI model create private summaries, forcing it to think
 enable_reflection: true
 
-stop_loss_percent: 0.05
-take_profit_percent: 0.01
+stop_loss_percent: 0.03
+take_profit_percent: 0.015
 
-risk_manager_interval_seconds: 30
+risk_manager_interval_seconds: 45
 
 risk_controls:
   initial_spending_account: 100.0
