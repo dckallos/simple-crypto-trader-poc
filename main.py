@@ -918,7 +918,7 @@ def main():
     risk_manager_db.initialize()
     risk_manager_db.rebuild_lots_from_ledger_entries()
     loop = asyncio.get_event_loop()
-    loop.create_task(
+    risk_manager_task = loop.create_task(
         risk_manager_db.start_db_price_check_cycle(
             pairs=TRADED_PAIRS,
             interval=ConfigLoader.get_value("risk_manager_interval_seconds", 60),
@@ -1032,6 +1032,10 @@ def main():
         loop.run_forever()
     except KeyboardInterrupt:
         logger.info("[Main] user exit => stopping.")
+        # 2) Gracefully shut down the risk_manager task
+        risk_manager_task.cancel()
+        # Give the task a chance to clean up
+        loop.run_until_complete(risk_manager_task)
     finally:
         pub_client.stop()
         if priv_client:
