@@ -296,6 +296,13 @@ class RiskManagerDB:
                 logger.info(
                     f"[RiskManager] Stop-loss => lot_id={lot_id}, SELL all {lot_qty:.4f} of {pair}"
                 )
+
+                min_order_size = db_lookup.get_ordermin(pair)
+                if lot_qty < min_order_size:
+                    logger.warning(
+                        f"[RiskManager] lot_id={lot_id} => SELL qty={lot_qty:.4f} is below exchange min={min_order_size:.4f}. Skipping..."
+                    )
+                    continue
                 # Create pending trade => include source & rationale
                 pending_id = create_pending_trade(
                     side="SELL",
@@ -328,6 +335,13 @@ class RiskManagerDB:
                 logger.info(
                     f"[RiskManager] Take-profit => lot_id={lot_id}, SELL {sell_size:.4f} of {pair}"
                 )
+
+                min_order_size = db_lookup.get_ordermin(pair)
+                if sell_size < min_order_size:
+                    logger.warning(
+                        f"[RiskManager] lot_id={lot_id} => SELL qty={sell_size:.4f} below exchange min={min_order_size:.4f}. Skipping..."
+                    )
+                    continue
                 # Create pending trade => include source & rationale
                 pending_id = create_pending_trade(
                     side="SELL",
