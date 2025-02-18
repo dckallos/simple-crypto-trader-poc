@@ -67,7 +67,7 @@ class NoHeartbeatFilter(logging.Filter):
         message = record.getMessage().lower()
         if "heartbeat" in message:
             return False
-        if "< TEXT" in message and record.name == "websockets.client":
+        if "< TEXT '[" in message:
             return False
         return True
 
@@ -504,7 +504,7 @@ class HybridApp:
             changes = []
             if len(minute_data) >= 2:
                 changes_raw = compute_minute_percent_changes(minute_data)
-                changes = [round(chg, 5) for chg in changes_raw]
+                changes = [round(chg, 3) for chg in changes_raw]
 
             # Retrieve minimum purchase constraints
             min_qty = format_no_sci(db_lookup.get_ordermin(pair))
