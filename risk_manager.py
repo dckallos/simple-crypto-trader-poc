@@ -138,8 +138,7 @@ class RiskManagerDB:
     # ----------------------------------------------------------------------
     async def start_db_price_check_cycle(
         self,
-        pairs: List[str],
-        interval: float = 30.0
+        pairs: List[str]
     ):
         """
         An asynchronous loop that does the following forever:
@@ -152,12 +151,17 @@ class RiskManagerDB:
         """
         import asyncio
 
+        dynamic_interval = ConfigLoader.get_value("risk_manager_interval_seconds", 30.0)
+        logger.debug(f"[RiskManager] Sleeping for {dynamic_interval} seconds.")
+
         # Delay after init to ensure private feed is connected, etc.
         logger.info("[RiskManager] Delaying 30 seconds after init before first price check.")
-        await asyncio.sleep(30)
+
+        initial_risk_manager_sleep = ConfigLoader.get_value("initial_risk_manager_sleep_seconds", 30.0)
+        await asyncio.sleep(initial_risk_manager_sleep)
         logger.info("[RiskManager] Proceeding with price check cycle now.")
 
-        logger.info(f"[RiskManager] Starting DB-based price check cycle for {pairs}, interval={interval}s")
+        logger.info(f"[RiskManager] Starting DB-based price check cycle for {pairs}, interval={dynamic_interval}s")
         while True:
             try:
                 for pair in pairs:
@@ -175,8 +179,12 @@ class RiskManagerDB:
             except Exception as e:
                 logger.exception(f"[RiskManager] DB price check cycle => error => {e}")
 
-            await asyncio.sleep(interval)
-        logger.info("[RiskManager] price_check_cycle has exited.")
+            # 2) Sleep using *live* config
+            dynamic_interval = ConfigLoader.get_value("risk_manager_interval_seconds", 30.0)
+            logger.debug(f"[RiskManager] Sleeping for {dynamic_interval} seconds.")
+            await asyncio.sleep(dynamic_interval)
+
+    logger.info("[RiskManager] price_check_cycle has exited.")
 
     def _fetch_latest_price_for_pair(self, pair: str) -> float:
         """
