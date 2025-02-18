@@ -43,13 +43,12 @@ Dependencies:
 
 import os
 import json
-import time
+import re
 import yaml
 import logging
 import datetime
 from typing import Dict, Any
 
-import openai
 from openai import OpenAI
 from openai import APIConnectionError, APIStatusError, RateLimitError
 
@@ -88,7 +87,7 @@ class GPTManager:
         self.temperature = temperature
         self.max_tokens = max_tokens
 
-        self.model = "gpt-3.5-turbo"  # default
+        self.model = "o1-mini"
         if os.path.exists(config_file):
             try:
                 with open(config_file, "r", encoding="utf-8") as f:
@@ -164,56 +163,49 @@ class GPTManager:
     # --------------------------------------------------------------------------
     def _parse_decision_json(self, raw_text: str) -> Dict[str, Any]:
         """
-        The Mustache-based prompt is expected to return JSON in the form:
+        Attempts to locate valid JSON inside a triple-backtick code fence labeled as json.
+        For example:
+
+            ```json
             {
-              "decisions": [
-                {"pair":"...","action":"BUY|SELL|HOLD","size":0.0},
-                ...
-              ],
+              "decisions":[...],
               "rationale":"..."
             }
+            ```
+            Additional disclaimers might appear after the closing ```.
 
-        We'll strip triple backticks if present and decode to Python objects.
-        If parsing fails or the JSON is malformed, we return a fallback.
+        1) We first look for any pattern like: ```json ... ```
+        2) If found, we parse that substring as JSON.
+        3) If not, we fallback to removing ```json and ``` from the entire raw_text (old approach).
+        4) If still invalid, return an empty "decisions" with "rationale" fallback.
+
+        :param raw_text: The raw GPT assistant message, which may contain disclaimers,
+                         triple backticks, etc.
+        :return: dict => { "decisions":[...], "rationale":"..." }
         """
         fallback = {"decisions": [], "rationale": "Fallback => parse error."}
         if not raw_text.strip():
             return fallback
 
-        # Remove any markdown fences
+        # 1) Attempt to find the fenced JSON block
+        match = re.search(r'```json(.*?)```', raw_text, re.DOTALL | re.IGNORECASE)
+        if match:
+            # Extract just what’s inside the triple backtick
+            candidate = match.group(1).strip()
+            logger.debug(f"[GPTManager] Found fenced JSON => {candidate[:100]}...")
+
+            # Try parsing that snippet
+            try:
+                return self._attempt_json_parse(candidate, fallback)
+            except json.JSONDecodeError:
+                logger.warning("[GPTManager] code fence JSON decode error => fallback to entire text parse.")
+
+        # 2) If no code fence (or parse error), fallback to old approach of stripping fences
+        #    This might still fail if disclaimers appear after the JSON
         cleaned = raw_text.replace("```json", "").replace("```", "").strip()
 
-        try:
-            parsed = json.loads(cleaned)
-            if not isinstance(parsed, dict):
-                return fallback
-            decisions = parsed.get("decisions", [])
-            rationale = parsed.get("rationale", "No rationale")
-
-            # Basic validations
-            if not isinstance(decisions, list):
-                decisions = []
-            if len(rationale) > 300:
-                rationale = rationale[:300]
-
-            # Clean each decision
-            final_decisions = []
-            for d in decisions:
-                if not isinstance(d, dict):
-                    continue
-                pair = str(d.get("pair", "UNK"))
-                action = str(d.get("action", "HOLD")).upper()
-                size = float(d.get("size", 0.0))
-                if action not in ("BUY", "SELL", "HOLD"):
-                    action = "HOLD"
-                if size < 0:
-                    size = 0.0
-                final_decisions.append({"pair": pair, "action": action, "size": size})
-
-            return {"decisions": final_decisions, "rationale": rationale}
-        except json.JSONDecodeError:
-            logger.warning("[GPTManager] JSON decode error => fallback.")
-            return fallback
+        # One more parse attempt
+        return self._attempt_json_parse(cleaned, fallback)
 
     # --------------------------------------------------------------------------
     # Logging / debug
@@ -228,9 +220,10 @@ class GPTManager:
         with open(prompt_path, "w", encoding="utf-8") as f_prompt:
             f_prompt.write(prompt_text)
 
-        req_path = os.path.join(log_dir, "request_body.txt")
+        req_path = os.path.join(log_dir, "request_body.json")
         with open(req_path, "w", encoding="utf-8") as f_req:
-            f_req.write(str(request_dict))
+            json_str = json.dumps(request_dict, indent=4)
+            f_req.write(json_str)
 
     def _save_response_files(self, response_obj: Any) -> None:
         """Saves the raw GPT response object and usage to logs/{timestamp}/ for debugging."""
@@ -254,3 +247,37 @@ class GPTManager:
 
         with open(usage_path, "w", encoding="utf-8") as f_usage:
             f_usage.write(str(usage_data))
+
+    def _attempt_json_parse(self, candidate: str, fallback: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Attempts json.loads on candidate. If success, we do minimal validation
+        on 'decisions' & 'rationale'. Otherwise returns fallback.
+        """
+        parsed = json.loads(candidate)
+        if not isinstance(parsed, dict):
+            return fallback
+
+        decisions = parsed.get("decisions", [])
+        rationale = parsed.get("rationale", "No rationale")
+        if not isinstance(decisions, list):
+            decisions = []
+        if len(rationale) > 300:
+            rationale = rationale[:300]
+
+        final_decisions = []
+        for d in decisions:
+            if not isinstance(d, dict):
+                continue
+            pair = str(d.get("pair", "UNK"))
+            action = str(d.get("action", "HOLD")).upper()
+            size = float(d.get("size", 0.0))
+            if action not in ("BUY", "SELL", "HOLD"):
+                action = "HOLD"
+            if size < 0:
+                size = 0.0
+            final_decisions.append({"pair": pair, "action": action, "size": size})
+
+        return {
+            "decisions": final_decisions,
+            "rationale": rationale
+        }
