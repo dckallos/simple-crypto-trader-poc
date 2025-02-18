@@ -12,7 +12,7 @@ place_live_orders: true
 openai_model: "o1-mini"
 
 # How many seconds to wait for the next ST/TP exit check
-risk_manager_interval_seconds: 30
+risk_manager_interval_seconds: 45
 
 # The number of price_history records to include in AI prompt
 quantity_of_price_history: 100
