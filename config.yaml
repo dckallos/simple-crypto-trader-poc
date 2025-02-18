@@ -3,9 +3,12 @@ enable_live_ai_inference: true
 place_live_orders: true
 enable_gpt_integration: true
 
-trade_interval_seconds: 240
+trade_interval_seconds: 1200
 min_data_rows: 100
 openai_model: "o1-mini"
+
+# The name of the prompt template
+prompt_template_name: "aggregator_simple_prompt.mustache"
 
 pre_populate_db_tables: true
 pre_populate_lunarcrush_data: false
@@ -20,9 +23,9 @@ quantity_of_price_history: 100
 enable_reflection: true
 
 stop_loss_percent: 0.03
-take_profit_percent: 0.02
+take_profit_percent: 0.01
 
-risk_manager_interval_seconds: 25
+risk_manager_interval_seconds: 30
 
 risk_controls:
   initial_spending_account: 100.0
