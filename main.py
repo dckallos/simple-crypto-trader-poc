@@ -5,25 +5,20 @@
 """
 main.py
 
-Demonstration of consuming both the PUBLIC and PRIVATE Kraken websockets feeds,
-using the classes defined in ws_data_feed.py:
+Consolidated single-aggregator design:
+--------------------------------------
+We remove the old methods aggregator_cycle_all_coins and aggregator_cycle_all_coins_simple_prompt,
+replacing them with a single aggregator_cycle() method. This method:
 
-- KrakenPublicWSClient: for public data like ticker/trade
-- KrakenPrivateWSClient: for private data like openOrders, placing/canceling orders
+1) Fetches ledger data => updates local DB
+2) Fetches current Kraken balances => determines ZUSD
+3) Builds aggregator data for each pair (no large inline strings in Python)
+4) Loads a Mustache template name from config (prompt_template_name or fallback)
+5) Renders the Mustache template with aggregator data
+6) Calls AIStrategy => predict_from_prompt => GPT => create pending trades => possibly place real orders
 
-We also have a HybridApp aggregator that calls AIStrategy => predict_multi_coins(...)
-periodically. We explicitly populate the lunarcrush_data and lunarcrush_timeseries
-tables at application startup—rather than waiting for aggregator cycles.
-
-Environment:
-    - KRAKEN_API_KEY, KRAKEN_API_SECRET for private feed usage
-    - OPENAI_API_KEY if GPT is used in AIStrategy
-    - config_loader.py for aggregator settings (pairs, intervals, risk_controls, etc.)
-
-We keep aggregator_cycle_all_coins, update_lunarcrush_data, and _build_aggregator_for_pair
-exactly as you had them, ensuring minimal changes to your aggregator logic.
-Stop-loss/take-profit is now handled in risk_manager.py or ws_data_feed.py
-if you wish to do it on each price update.
+The user’s KeyboardInterrupt triggers a graceful exit, canceling the risk_manager_task and
+stopping the public/private websockets.
 """
 
 import time
@@ -35,31 +30,33 @@ import logging
 import asyncio
 import logging.config
 import os
-import urllib
-import urllib.parse
 import json
-from dotenv import load_dotenv
 import warnings
 import sqlite3
-import pandas as pd
 from typing import Optional, Dict, Any, List
-import datetime
 
-import db
+import pandas as pd
+from dotenv import load_dotenv
+from numpy.f2py.crackfortran import privatepattern
+
 # Local modules
-from db import init_db, DB_FILE, fetch_minute_spaced_prices
-from ai_strategy import AIStrategy
-from ws_data_feed import KrakenPublicWSClient, KrakenPrivateWSClient
+import db
+from db import init_db, DB_FILE
 from config_loader import ConfigLoader
-from fetch_lunarcrush import LunarCrushFetcher
 from risk_manager import RiskManagerDB
 from kraken_rest_manager import KrakenRestManager
+from fetch_lunarcrush import LunarCrushFetcher
+from ws_data_feed import KrakenPublicWSClient, KrakenPrivateWSClient
+from ai_strategy import AIStrategy
+from prompt_builder import PromptBuilder
+
 import db_lookup
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.DEBUG)
 
 warnings.simplefilter(action="ignore", category=pd.errors.SettingWithCopyWarning)
+
 
 class NoHeartbeatFilter(logging.Filter):
     """
@@ -68,8 +65,8 @@ class NoHeartbeatFilter(logging.Filter):
     from ws_data_feed.py without raising the log level or altering other logs.
     """
     def filter(self, record: logging.LogRecord) -> bool:
-        # If 'heartbeat' appears, return False to discard that log
         return "heartbeat" not in record.getMessage().lower()
+
 
 LOG_CONFIG = {
     'version': 1,
@@ -106,30 +103,6 @@ LOG_CONFIG = {
     }
 }
 
-def compute_minute_percent_changes(price_records: list[tuple[int, float]]) -> list[float]:
-    """
-    Given a list of (timestamp, price) in ascending order, return an array of % changes
-    from each record to the next.
-
-    If price[i] == 0, or there's not enough data, returns 0 for that slot.
-
-    Example:
-       price_records = [(t1, p1), (t2, p2), (t3, p3)]
-       returns => [%_change_2_1, %_change_3_2]
-
-    :return: e.g. [+0.12, -0.03, +0.25, ...]
-    """
-    changes = []
-    for i in range(1, len(price_records)):
-        _, prev_price = price_records[i-1]
-        _, curr_price = price_records[i]
-        if prev_price == 0:
-            pct_change = 0.0
-        else:
-            pct_change = (curr_price - prev_price) / prev_price * 100.0
-        changes.append(pct_change)
-    return changes
-
 def convert_base_asset_keys_to_wsname(trade_balances: Dict[str, float]) -> Dict[str, float]:
     """
     Convert each key in trade_balances from a base-asset name (e.g. "XETH")
@@ -151,6 +124,8 @@ def convert_base_asset_keys_to_wsname(trade_balances: Dict[str, float]) -> Dict[
             pass
     return new_dict
 
+
+
 def setup_logging():
     """
     Sets up Python logging using the existing LOG_CONFIG, then attaches
@@ -159,8 +134,6 @@ def setup_logging():
     other logs at their current levels.
     """
     import logging.config
-
-    # Apply your existing dictConfig from main.py (LOG_CONFIG)
     logging.config.dictConfig(LOG_CONFIG)
 
     ws_logger = logging.getLogger("ws_data_feed")
@@ -170,7 +143,7 @@ def setup_logging():
     wc_logger.addFilter(NoHeartbeatFilter())
     main_logger.addFilter(NoHeartbeatFilter())
 
-    logging.getLogger(__name__).info("Logging setup complete; heartbeat messages are now suppressed.")
+    logger.info("Logging setup complete; heartbeat messages are now suppressed.")
 
 
 def fetch_kraken_balance(api_key: str, api_secret: str) -> Dict[str, float]:
@@ -376,45 +349,36 @@ def fetch_and_store_kraken_public_asset_pairs(
 
 class HybridApp:
     """
-    A combined aggregator that:
-      1) Receives live ticker updates from public WS => store in DB => track last known price
-      2) At aggregator_interval => aggregator_cycle_all_coins => gather aggregator data for all pairs
-         => AIStrategy => single GPT call => produce decisions
-      3) Places trades if GPT suggests them => creating pending trades in the
-         'pending_trades' table. Then the private feed finalizes them or rejects them.
+    Aggregator with a single aggregator_cycle method.
+    on_ticker => aggregator_cycle every aggregator_interval seconds.
 
-    We do not rely on sub-position logic. We do no local SL/TP here.
-    If you want SL/TP, see risk_manager or ws_data_feed for on_price_update usage.
+    aggregator_cycle =>
+      1) fetch ledger => read ZUSD
+      2) build aggregator data => Mustache => AIStrategy => GPT
+      3) Create pending trades => done
     """
 
     def __init__(
         self,
         pairs: List[str],
         strategy: AIStrategy,
-        aggregator_interval: int = 300,
-        private_ws_client: Optional[KrakenPrivateWSClient] = None,
-        kraken_api_key: str = "",
-        kraken_api_secret: str = ""
+        aggregator_interval: int,
+        private_ws_client: Optional[KrakenPrivateWSClient],
+        kraken_api_key: str,
+        kraken_api_secret: str
     ):
-        """
-        :param pairs: e.g. ["ETH/USD","XBT/USD"] => tracked coins
-        :param strategy: AIStrategy instance
-        :param aggregator_interval: seconds between aggregator cycles
-        :param private_ws_client: optional => private feed for real trades
-        :param kraken_api_key, kraken_api_secret: used for ledger or other private calls
-        """
         self.pairs = pairs
         self.strategy = strategy
         self.aggregator_interval = aggregator_interval
         self.ws_private = private_ws_client
         self.kraken_api_key = kraken_api_key
         self.kraken_api_secret = kraken_api_secret
+
+        # manager is optional for rest calls
         self.manager = None
 
-        self.latest_prices: Dict[str, float] = {}
-        for p in pairs:
-            self.latest_prices[p] = 0.0
-
+        # track live prices to skip aggregator if zero
+        self.latest_prices: Dict[str, float] = {p: 0.0 for p in pairs}
         self.last_agg_ts = 0
 
     def on_ticker(self, pair: str, last_price: float):
@@ -424,24 +388,17 @@ class HybridApp:
         """
         self.latest_prices[pair] = last_price
         now = time.time()
-        if (now - self.last_agg_ts) >= ConfigLoader.get_value("trade_interval_seconds", 300):
-            if ConfigLoader.get_value("use_simple_prompt", False):
-                self.aggregator_cycle_all_coins_simple_prompt()
-            else:
-                self.aggregator_cycle_all_coins()
+        interval = ConfigLoader.get_value("trade_interval_seconds", self.aggregator_interval)
+        if (now - self.last_agg_ts) >= interval:
+            self.aggregator_cycle()
             self.last_agg_ts = now
 
-    def aggregator_cycle_all_coins(self):
+    def aggregator_cycle(self):
         """
-        The aggregator cycle:
-         1) fetch ledger => store => read ZUSD balance
-         2) build aggregator_list => AIStrategy => multi-coin GPT
-         3) GPT => create pending trades if needed
-        (We have removed time-series population from here.)
+        Single aggregator cycle => fetch ledger => build aggregator data => Mustache => AIStrategy
         """
         # 1) Update LunarCrush data
-        self.update_lunarcrush_data()
-
+        self._update_lunarcrush_data()
         logger.info("[Aggregator] aggregator_cycle_all_coins => Checking ledger for ZUSD balance...")
         fetch_and_store_kraken_ledger(
             api_key=self.kraken_api_key,
@@ -455,382 +412,89 @@ class HybridApp:
             api_secret=self.kraken_api_secret
         )
         current_usd_balance = get_latest_zusd_balance(db_path=DB_FILE)
-        logger.info(f'[Aggregator] Current ZUSD balance: {current_usd_balance}')
-
-        aggregator_list: List[Dict[str, Any]] = []
-        for pair in self.pairs:
-            aggregator_list.append(self._build_aggregator_for_pair(pair))
-
-        # Example trade_history + open_positions usage for AIStrategy => multi-coin approach
-        trade_history = self._build_global_trade_history(limit=10)
-        open_positions_txt = []
-
-        zero_count = sum(1 for p in self.pairs if self.latest_prices[p] == 0.0)
-        if zero_count > 0:
-            logger.info(f"Skipping aggregator because {zero_count} pairs have price=0.0.")
-            return
-
-        decisions = self.strategy.predict_multi_coins(
-            input_aggregator_list=aggregator_list,
-            trade_history=trade_history,
-            max_trades=25,
-            input_open_positions=open_positions_txt,
-            current_balance=current_usd_balance,
-            current_trade_balance=trade_balances
-        )
-        logger.info("[Aggregator] GPT decisions => %s", decisions)
-
-    def aggregator_cycle_all_coins_simple_prompt(self):
-        """
-        The aggregator cycle for the "simple prompt" approach:
-         1) Update ledger => read ZUSD balance
-         2) Build aggregator_list of text blocks => AIStrategy => predict_multi_coins_simple
-         3) That call returns final decisions => create pending trades => possibly place orders
-        """
-        # 1) Update LunarCrush or anything else you want
-        self.update_lunarcrush_data()
-
-        logger.info("[Aggregator] aggregator_cycle_all_coins_simple_prompt => Checking ledger/balance.")
-        fetch_and_store_kraken_ledger(
-            api_key=self.kraken_api_key,
-            api_secret=self.kraken_api_secret,
-            asset="all",
-            ledger_type="all",
-            db_path=DB_FILE
-        )
-        trade_balances = fetch_kraken_balance(
-            api_key=self.kraken_api_key,
-            api_secret=self.kraken_api_secret
-        )
         trade_balances_ws = convert_base_asset_keys_to_wsname(trade_balances)
-        current_usd_balance = get_latest_zusd_balance(db_path=DB_FILE)
         trade_balances_ws["USD"] = current_usd_balance
         logger.info(f'[Aggregator] Current ZUSD balance: {current_usd_balance}')
 
-        # 2) Build aggregator_list of simple text blocks
         aggregator_list = []
-        quantity = ConfigLoader.get_value("quantity_of_price_history", 15)
-        for pair in self.pairs:
-            simple_str = self._build_aggregator_for_pair_simple_prompt(pair, quantity)
-            last_price_for_pair = self.latest_prices.get(pair, 0.0)
+        zero_count = 0
+        for p in self.pairs:
+            px = self.latest_prices.get(p, 0.0)
+            if px == 0.0:
+                zero_count += 1
+            # Minimal aggregator dict
             aggregator_list.append({
-                "pair": pair,
-                "price": last_price_for_pair,
-                "prompt_text": simple_str
+                "pair": p,
+                "last_price": px
+                # More fields can be added if your Mustache template references them
             })
-
-        # For GPT, we can provide optional trade_history & open_positions (similar to normal aggregator)
-        trade_history = self._build_global_trade_history(limit=10)
-        open_positions_txt = []
-
-        zero_count = sum(1 for p in self.pairs if self.latest_prices[p] == 0.0)
-        if zero_count > 0:
-            logger.info(f"[Aggregator] Skipping aggregator because {zero_count} pairs have price=0.0.")
+        if zero_count == len(self.pairs):
+            logger.info("[Aggregator] all pairs price=0 => skipping aggregator.")
             return
 
-        # 3) Instead of calling generate_multi_trade_decision_simple_prompt here,
-        #    we call the new AIStrategy method that finalizes trades
-        decisions = self.strategy.predict_multi_coins_simple(
-            aggregator_list_simple=aggregator_list,
-            trade_history=trade_history,
-            max_trades=25,
-            input_open_positions=open_positions_txt,
-            current_balance=current_usd_balance,
-            current_trade_balance=trade_balances_ws
+        # read which mustache template from config
+        template_name = ConfigLoader.get_value("prompt_template_name", "aggregator_simple_prompt.mustache")
+
+        # build context for Mustache
+        from prompt_builder import PromptBuilder
+        builder = PromptBuilder(template_dir="templates")
+
+        # aggregator_items => repeated in template
+        context = {
+            "current_usd_balance": f"{current_usd_balance:.2f}",
+            "trade_balances": json.dumps(trade_balances, indent=2),
+            "aggregator_items": []
+        }
+        for item in aggregator_list:
+            # each aggregator item => 'prompt_text' is optional
+            # if your template references it.
+            # or you can do something like 'last_price': item['last_price'] if needed
+            context["aggregator_items"].append({
+                "pair": item["pair"],
+                "prompt_text": f"(Placeholder) last_price={item['last_price']}"
+            })
+
+        # Render final prompt
+        final_prompt_text = builder.render_template(template_name, context)
+
+        # AIStrategy => parse + create trades
+        logger.info("[Aggregator] Submitting final prompt to AIStrategy => GPT.")
+        decisions = self.strategy.predict_from_prompt(
+            final_prompt_text=final_prompt_text,
+            current_trade_balance=trade_balances,
+            current_balance=current_usd_balance
         )
+        logger.info(f"[Aggregator] GPT decisions => {decisions}")
 
-        logger.info("[Aggregator] Simple-prompt GPT decisions => %s", decisions)
-
-
-    def update_lunarcrush_data(self):
+    def _update_lunarcrush_data(self):
         """
-        Calls LunarCrushFetcher to fetch & store snapshot data, or partial time-series, etc.
-        Adjust as needed based on your actual fetch logic (snapshot, timeseries, etc.)
+        If needed, fetch from LunarCrush => store.
         """
         try:
             fetcher = LunarCrushFetcher(db_file=DB_FILE)
             fetcher.fetch_snapshot_data_filtered(limit=100)
-            logger.info("[Aggregator] Successfully updated lunarcrush_data from LunarCrush API.")
+            logger.info("[Aggregator] updated lunarcrush_data snapshot.")
         except Exception as e:
-            logger.exception(f"[Aggregator] Error updating lunarcrush_data => {e}")
-
-
-    def _format_price_history(self, pair: str, limit: int = 10) -> str:
-        """
-        1) Fetches rows (descending order).
-        2) For row i, compares it to row i+1 (the next older row), computing % changes.
-        3) Omits the final row, since it has no row i+1 for comparison.
-        4) Returns a single string with each line in the desired format:
-           Timestamp => Unix: {ts}: Bid=..., Ask=..., Last=...
-        """
-        rows = db.fetch_price_history_desc(pair=pair, limit=limit + 1)
-        if len(rows) < 2:
-            return "Not enough rows to calculate percentage changes."
-
-        output_lines = []
-
-        # We'll loop from i=0 up to i=(len(rows)-2) so row i+1 always exists
-        for i in range(len(rows) - 1):
-            # Row i is the "newer" row
-            row_newer = rows[i]
-            # Row i+1 is the "older" row
-            row_older = rows[i+1]
-
-            # Extract the new row's timestamp & prices
-            ts_new = row_newer["timestamp"]
-            bid_new = float(row_newer["bid_price"] or 0)
-            ask_new = float(row_newer["ask_price"] or 0)
-            last_new = float(row_newer["last_price"] or 0)
-
-            # Extract the older row's prices for comparison
-            bid_old = float(row_older["bid_price"] or 0)
-            ask_old = float(row_older["ask_price"] or 0)
-            last_old = float(row_older["last_price"] or 0)
-
-            # Compute percentage changes relative to older row
-            # e.g. (current - old)/old * 100
-            bid_pct = ((bid_new - bid_old) / bid_old * 100) if bid_old else 0
-            ask_pct = ((ask_new - ask_old) / ask_old * 100) if ask_old else 0
-            last_pct = ((last_new - last_old) / last_old * 100) if last_old else 0
-
-            line_str = (
-                f"Timestamp => Unix: {ts_new}: "
-                f"Bid={bid_new:.4f} ({bid_pct}%), "
-                f"Ask={ask_new:.4f} ({ask_pct}%), "
-                f"Last={last_new:.4f} ({last_pct}%)"
-            )
-            output_lines.append(line_str)
-
-        return "\n".join(output_lines)
-
-
-    def _build_aggregator_for_pair_simple_prompt(
-            self,
-            pair: str,
-            num_intervals: int = 15
-    ) -> str:
-        """
-        A new aggregator method returning a text block like:
-
-          Coin: [ETH/USD]
-          PRICE HISTORY DATA (chronological):
-          "price_changes": [ 0.05, 0.12, -0.03, ... ]
-
-          HOW TO INTERPRET:
-          1) ...
-          2) ...
-          3) ...
-          4) ...
-
-        The text references ~num_intervals percent changes, computed from minute-spaced data.
-        """
-        db_path = "trades.db"  # Or self.db_path if you store it on the class
-        # 1) get minute-based points
-        records = fetch_minute_spaced_prices(
-            pair=pair,
-            db_path=db_path,
-            num_points=num_intervals + 1  # need +1 so we can compute ~15 changes
-        )
-        if len(records) < 2:
-            return f"Coin: [{pair}]\n\nNo minute-based data available (or not enough data points)."
-
-        # 2) compute changes in ascending order
-        changes = compute_minute_percent_changes(records)
-        changes_str = ", ".join(f"{chg:.3f}" for chg in changes)
-        min_qty = db_lookup.get_ordermin(pair)
-        min_cost = db_lookup.get_minimum_cost_in_usd(pair)
-
-        aggregator_text = f"""\
-    Coin: [{pair}]
-    PRICE HISTORY DATA (chronological):
-    "price_changes": [
-      {changes_str}
-    ]
-    minimum_purchase_quantity = {min_qty} (approx. ${min_cost})
-
-    HOW TO INTERPRET:
-    1. Each item is the percent change from the previous minute. Positive = up, negative = down.
-    2. Consecutive positives suggest a short bullish wave; consecutive negatives suggest short bearish moves.
-    3. Larger absolute changes (≥ ±0.25%) can indicate stronger momentum swings.
-    4. Near-zero changes suggest a more sideways or “range-bound” interval.
-    """
-        return aggregator_text
-
-    def _build_aggregator_for_pair(self, pair: str) -> Dict[str, Any]:
-        """
-        Gathers aggregator_summaries info and recent price from lunarcrush_data. Returns
-        a dict with 'pair', 'price', and 'aggregator_data' describing aggregator fields.
-        """
-        import db_lookup
-        lunarcrush_symbol = db_lookup.get_formatted_name_from_pair_name(pair)
-        symbol = db_lookup.get_base_asset(pair)
-        last_price = 0.0
-        # Get up to 3 recent BUYs and 3 recent SELLs:
-        recent_buys = db_lookup.get_recent_buys_for_pair(pair, limit=5)
-        recent_sells = db_lookup.get_recent_sells_for_pair(pair, limit=5)
-        buys_block = "\n".join(recent_buys) if recent_buys else "No recent BUYS."
-        sells_block = "\n".join(recent_sells) if recent_sells else "No recent SELLS."
-        aggregator_text = "No aggregator data found"
-
-        conn = sqlite3.connect(DB_FILE)
-        try:
-            c = conn.cursor()
-
-            # aggregator_summaries => aggregator fields
-            c.execute("""
-                SELECT
-                    price_bucket,
-                    galaxy_score,
-                    galaxy_score_previous,
-                    alt_rank,
-                    alt_rank_previous,
-                    market_dominance,
-                    dominance_bucket,
-                    sentiment_label
-                FROM aggregator_summaries
-                WHERE UPPER(symbol)=?
-                ORDER BY timestamp DESC
-                LIMIT 1
-            """, (lunarcrush_symbol,))
-            row_summ = c.fetchone()
-
-            # lunarcrush_data => the latest price
-            c.execute("""
-                SELECT 
-                    price,
-                    sentiment,
-                    volatility,
-                    volume_24h,
-                    percent_change_1h,
-                    percent_change_24h,
-                    percent_change_7d,
-                    percent_change_30d
-                FROM lunarcrush_data
-                WHERE UPPER(symbol)=?
-                ORDER BY timestamp DESC
-                LIMIT 1
-            """, (lunarcrush_symbol,))
-            row_price = c.fetchone()
-            if row_price:
-                last_price = float(row_price[0]) if row_price[0] else 0.0
-                sentiment = row_price[1]
-                volatility = row_price[2]
-                volume_24h = row_price[3]
-                pct_1h = row_price[4]
-                pct_24h = row_price[5]
-                pct_7d = row_price[6]
-                pct_30d = row_price[7]
-
-                if row_summ:
-                    (
-                        price_bucket,
-                        galaxy_score,
-                        galaxy_score_previous,
-                        alt_rank,
-                        alt_rank_previous,
-                        market_dominance,
-                        dominance_bucket,
-                        sentiment_label
-                    ) = row_summ
-
-                    import json
-                    aggregator_text = (
-                        f"[{pair}]\n\n"
-                        f"RECENT BUYS FOR {pair}:\n{buys_block}\n\n"
-                        f"RECENT SELLS FOR {pair}:\n{sells_block}\n\n"
-                        f"pair_name = {db_lookup.get_asset_value_for_pair(pair, 'pair_name')}\n"
-                        f"alternative_name = {db_lookup.get_asset_value_for_pair(pair, 'altname')}\n"
-                        f"base_asset = {db_lookup.get_base_asset(pair)}\n"
-                        f"formatted_name = {db_lookup.get_formatted_name_from_pair_name(pair)}\n"
-                        f"price_for_one {pair} = ${last_price}\n"
-                        f"price_bucket = {price_bucket}\n"
-                        f"ticker_price_history summary for {pair}:\n\n"
-                        f"{self._format_price_history(pair=pair, limit=15)}\n\n"
-                        f"recent_price_history_by_hour:\n"
-                        f"{json.dumps(db_lookup.get_recent_timeseries_for_coin(db_lookup.get_base_asset(pair)), indent=4)}\n"
-                        f"minimum_purchase_quantity for {pair} = {db_lookup.get_ordermin(pair)}\n"
-                        f"minimum_purchase in USD = {db_lookup.get_minimum_cost_in_usd(pair)}\n"
-                        "\tNote: minimum_purchase_quantity applies to both buying and selling this investment.\n"
-                        f"tick_size = {db_lookup.get_asset_value_for_pair(pair, 'tick_size')}\n"
-                        f"volatility = {volatility}\n"
-                        f"volume_24h = {volume_24h:.2f}\n"
-                        f"percent_change_1h = {pct_1h}%\n"
-                        f"percent_change_24h = {pct_24h}%\n"
-                        f"percent_change_7d = {pct_7d:.4f}%\n"
-                        f"percent_change_30d = {pct_30d:.2f}%\n"
-                        f"galaxy_score = {galaxy_score} (previous_value = {galaxy_score_previous})\n"
-                        f"alt_rank = {alt_rank} (previous_value = {alt_rank_previous})\n"
-                        f"market_dominance = {market_dominance:.2f}\n"
-                        f"dominance_bucket = {dominance_bucket}\n"
-                        f"social_sentiment = {sentiment}\n"
-                        f"sentiment_label = {str(sentiment_label).upper()}\n\n"
-                    )
-            else:
-                aggregator_text = (
-                    f"No aggregator_summaries row for symbol={symbol}; last_price={last_price:.2f}"
-                )
-
-        except Exception as e:
-            logger.exception(f"[HybridApp] Error loading aggregator for {symbol}: {e}")
-            aggregator_text = f"Error retrieving aggregator data: {e}"
-        finally:
-            conn.close()
-
-        return {
-            "pair": pair,
-            "price": last_price,
-            "aggregator_data": aggregator_text
-        }
-
-    def _build_global_trade_history(self, limit=10) -> List[str]:
-        """
-        Gather up to 'limit' trades from 'trades' => reversed => lines
-        """
-        lines = []
-        conn = sqlite3.connect(DB_FILE)
-        try:
-            c = conn.cursor()
-            c.execute("""
-            SELECT timestamp, pair, side, quantity, price
-            FROM trades
-            ORDER BY id DESC
-            LIMIT ?
-            """, (limit,))
-            rows = c.fetchall()
-            if not rows:
-                return []
-            rows = rows[::-1]
-            for r in rows:
-                t, p, sd, qty, px = r
-                import datetime
-                dt_s = datetime.datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M")
-                line = f"{dt_s} {sd} {p} {qty}@{px}"
-                lines.append(line)
-        except Exception as e:
-            logger.exception(f"[Aggregator] error building global trade history => {e}")
-        finally:
-            conn.close()
-        return lines
+            logger.exception(f"[Aggregator] error updating lunarcrush => {e}")
 
 
 def main():
     """
     Main entry point:
-      1) Reads config from config_loader.py for pairs, intervals, GPT usage
-      2) Creates AIStrategy => multi-coin GPT approach
-      3) On startup, explicitly updates DB tables, including:
-         - fetching lunarcrush_data for configured symbols
-         - storing Kraken asset pairs if desired
-      4) Creates a HybridApp aggregator => aggregator_cycle_all_coins at intervals
-      5) Subscribes to KrakenPublicWSClient => on_ticker => aggregator cycle
-      6) If a valid WS token => also subscribe to private feed => confirm/cancel orders
+      1) Setup logging + load config
+      2) init DB => optionally fetch asset pairs + lunarcrush data
+      3) create risk_manager => AIStrategy => aggregator => public WS => run
+      4) On interrupt => graceful shutdown
     """
     setup_logging()
+    load_dotenv()
     import db_lookup
 
     # 1) Load config
     ENABLE_TRAINING = ConfigLoader.get_value("enable_training", True)
+    RISK_INTERVAL = ConfigLoader.get_value("risk_manager_interval_seconds", 60)
     ENABLE_GPT = ConfigLoader.get_value("enable_gpt_integration", True)
+    OPENAI_MODEL = ConfigLoader.get_value("openai_model", "o1-mini")
     TRADED_PAIRS = ConfigLoader.get_traded_pairs()
     AGG_INTERVAL = ConfigLoader.get_value("trade_interval_seconds", 300)
     PRE_POPULATE_DB = ConfigLoader.get_value("pre_populate_db_tables", True)
@@ -844,9 +508,6 @@ def main():
     # If we want to place real orders
     PLACE_LIVE_ORDERS = ConfigLoader.get_value("place_live_orders", False)
 
-    RISK_MANAGER_CHECK = ConfigLoader.get_value("risk_manager_interval_seconds", 60)
-
-    load_dotenv()
     KRAKEN_API_KEY = os.getenv("KRAKEN_API_KEY", "")
     KRAKEN_API_SECRET = os.getenv("KRAKEN_SECRET_API_KEY", "")
 
@@ -921,9 +582,12 @@ def main():
     risk_manager_task = loop.create_task(
         risk_manager_db.start_db_price_check_cycle(
             pairs=TRADED_PAIRS,
-            interval=ConfigLoader.get_value("risk_manager_interval_seconds", 60),
+            interval=RISK_INTERVAL
         )
     )
+
+    # Manager
+    rest_manager = KrakenRestManager(KRAKEN_API_KEY, KRAKEN_API_SECRET)
 
     # Create AIStrategy
     ai_strategy = AIStrategy(
@@ -933,10 +597,10 @@ def main():
         max_daily_drawdown=-0.02,
         risk_controls=risk_controls,
         risk_manager=risk_manager_db,
-        gpt_model="o1-mini",
+        gpt_model=OPENAI_MODEL,
         gpt_temperature=1.0,
         gpt_max_tokens=40000,
-        private_ws_client=None,   # Will attach if we get a valid token
+        private_ws_client=None,
         place_live_orders=PLACE_LIVE_ORDERS
     )
     logger.info(f"[Main] AIStrategy => multi-coin GPT => pairs={TRADED_PAIRS}, GPT={ENABLE_GPT}, place_live_orders={PLACE_LIVE_ORDERS}")
@@ -982,30 +646,30 @@ def main():
         logger.info(f"[Main] Got private WS token => {token_str[:5]}...")
 
     # 6) private feed
-    priv_client = None
+    private_client = None
     if token_str:
         def on_private_event(evt_dict):
             logger.debug(f"[PrivateWS] Event => {evt_dict}")
 
-        priv_client = KrakenPrivateWSClient(
+        private_client = KrakenPrivateWSClient(
             token=token_str,
             on_private_event_callback=on_private_event,
             risk_manager=risk_manager_db
         )
         # If placing live orders => attach it
         if PLACE_LIVE_ORDERS:
-            ai_strategy.private_ws_client = priv_client
-            risk_manager_db.private_ws_client = priv_client
+            ai_strategy.private_ws_client = private_client
+            risk_manager_db.private_ws_client = private_client
 
     # aggregator => calls AIStrategy => multi-coin GPT
     class HybridAppAggregator(HybridApp):
-        pass  # The aggregator_cycle_all_coins, update_lunarcrush_data, etc. are above
+        pass
 
     aggregator_app = HybridAppAggregator(
         pairs=TRADED_PAIRS,
         strategy=ai_strategy,
         aggregator_interval=AGG_INTERVAL,
-        private_ws_client=priv_client,
+        private_ws_client=private_client,
         kraken_api_key=KRAKEN_API_KEY,
         kraken_api_secret=KRAKEN_API_SECRET
     )
@@ -1023,23 +687,24 @@ def main():
     pub_client.start()
 
     # start private feed if we have token
-    if priv_client:
-        priv_client.start()
+    if private_client:
+        private_client.start()
 
     logger.info("[Main] aggregator approach running. Press Ctrl+C to exit.")
     try:
-        # Instead of a 'while True: time.sleep(1)', run the asyncio loop forever
-        loop.run_forever()
+        logger.info("[Main] user exit => stopping.")
+        # gracefully shut down risk_manager
+        risk_manager_task.cancel()
+        loop.run_until_complete(risk_manager_task)
     except KeyboardInterrupt:
         logger.info("[Main] user exit => stopping.")
-        # 2) Gracefully shut down the risk_manager task
+        # gracefully shut down risk_manager
         risk_manager_task.cancel()
-        # Give the task a chance to clean up
         loop.run_until_complete(risk_manager_task)
     finally:
         pub_client.stop()
-        if priv_client:
-            priv_client.stop()
+        if private_client:
+            private_client.stop()
         logger.info("[Main] aggregator halted.")
 
 
