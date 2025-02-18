@@ -637,15 +637,13 @@ def main():
     except Exception as e:
         logger.exception(f"[Main] Error updating lunarcrush => {e}")
 
-    from train_model import run_full_training_pipeline
-    run_full_training_pipeline(
-        db_path="trades.db",
-        symbols_for_timeseries=db_lookup.get_symbols_for_time_series(TRADED_PAIRS)
-    )
-
     # If we do local training
     if ENABLE_TRAINING:
-        logger.info("[Main] Potential training step here. (Omitted)")
+        from train_model import run_full_training_pipeline
+        run_full_training_pipeline(
+            db_path="trades.db",
+            symbols_for_timeseries=db_lookup.get_symbols_for_time_series(TRADED_PAIRS)
+        )
 
     # 4) Create risk_manager + AIStrategy
     risk_manager_db = RiskManagerDB(
