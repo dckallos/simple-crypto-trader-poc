@@ -64,7 +64,12 @@ class NoHeartbeatFilter(logging.Filter):
     from ws_data_feed.py without raising the log level or altering other logs.
     """
     def filter(self, record: logging.LogRecord) -> bool:
-        return "heartbeat" not in record.getMessage().lower()
+        message = record.getMessage().lower()
+        if "heartbeat" in message:
+            return False
+        if "< TEXT" in message and record.name == "websockets.client":
+            return False
+        return True
 
 
 LOG_CONFIG = {
@@ -160,9 +165,11 @@ def setup_logging():
     ws_logger = logging.getLogger("ws_data_feed")
     wc_logger = logging.getLogger("websockets.client")
     main_logger = logging.getLogger("__main__")
-    ws_logger.addFilter(NoHeartbeatFilter())
-    wc_logger.addFilter(NoHeartbeatFilter())
-    main_logger.addFilter(NoHeartbeatFilter())
+
+    no_heartbeat_filter = NoHeartbeatFilter()
+    ws_logger.addFilter(no_heartbeat_filter)
+    wc_logger.addFilter(no_heartbeat_filter)
+    main_logger.addFilter(no_heartbeat_filter)
 
     logger.info("Logging setup complete; heartbeat messages are now suppressed.")
 
