@@ -1,34 +1,60 @@
-enable_training: true
-enable_live_ai_inference: true
-place_live_orders: true
-enable_gpt_integration: true
+##################################################################
+## Reactive Configurations
+##################################################################
 
-trade_interval_seconds: 1200
-min_data_rows: 100
+# How often the AI is called to make a trading decision (seconds)
+trade_interval_seconds: 1800
+
+# Either place live orders, or turn off ordering with app running.
+place_live_orders: true
+
+# The model called during any AI trading advice requests.
 openai_model: "o1-mini"
+
+# How many seconds to wait for the next ST/TP exit check
+risk_manager_interval_seconds: 30
+
+# The number of price_history records to include in AI prompt
+quantity_of_price_history: 100
 
 # The name of the prompt template
 prompt_template_name: "aggregator_simple_prompt.mustache"
 
+# The percent loss allowed before you exit position
+stop_loss_percent: 0.03
+
+# The percent gains allowed before you exit position
+take_profit_percent: 0.015
+
+# Minimum rows for pre-populate tables to have to be skipped
+min_data_rows: 100
+
+# Pre-populate table options
 pre_populate_db_tables: true
 pre_populate_lunarcrush_data: false
 
 # Use simple prompt with only price history
+# [[development]]
 use_simple_prompt: true
 
-# The number of price_history records to include
-quantity_of_price_history: 100
+##################################################################
+## Set-up Configurations
+##################################################################
+
+# enable training to run on load
+enable_training: false
+enable_live_ai_inference: true
+enable_gpt_integration: true
+
+# The amount of time we're giving kraken private client to start
+initial_risk_manager_sleep_seconds: 20
 
 # Have the AI model create private summaries, forcing it to think
+# [[deprecated]]
 enable_reflection: true
 
-stop_loss_percent: 0.03
-take_profit_percent: 0.01
-
-risk_manager_interval_seconds: 30
-
 risk_controls:
-  initial_spending_account: 100.0
+  initial_spending_account: 90.0
   purchase_upper_limit_percent: 25.0
   max_position_value: 25.0
 
