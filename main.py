@@ -547,7 +547,7 @@ def main():
     AGG_INTERVAL = ConfigLoader.get_value("trade_interval_seconds", 300)
     PRE_POPULATE_DB = ConfigLoader.get_value("pre_populate_db_tables", True)
     PRE_POPULATE_LUNARCRUSH_DATA = ConfigLoader.get_value("pre_populate_lunarcrush_data", True)
-    risk_controls = ConfigLoader.get_value("risk_controls", {
+    RISK_CONTROLS = ConfigLoader.get_value("risk_controls", {
         "initial_spending_account": 50.0,
         "purchase_upper_limit_percent": 75.0,
         "max_position_value": 25.0
@@ -620,7 +620,7 @@ def main():
         db_path=DB_FILE,
         max_position_size=10,
         max_daily_drawdown=-0.02,
-        initial_spending_account=risk_controls.get("initial_spending_account", 0.0),
+        initial_spending_account=RISK_CONTROLS.get("initial_spending_account", 0.0),
         private_ws_client=None,
         place_live_orders=PLACE_LIVE_ORDERS
     )
@@ -643,7 +643,7 @@ def main():
         use_openai=ENABLE_GPT,
         max_position_size=20,
         max_daily_drawdown=-0.02,
-        risk_controls=risk_controls,
+        risk_controls=RISK_CONTROLS,
         risk_manager=risk_manager_db,
         gpt_model=OPENAI_MODEL,
         gpt_temperature=1.0,
