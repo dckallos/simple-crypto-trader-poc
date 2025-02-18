@@ -103,6 +103,30 @@ LOG_CONFIG = {
     }
 }
 
+def compute_minute_percent_changes(price_records: list[tuple[int, float]]) -> list[float]:
+    """
+    Given a list of (timestamp, price) in ascending order, return an array of % changes
+    from each record to the next.
+
+    If price[i] == 0, or there's not enough data, returns 0 for that slot.
+
+    Example:
+       price_records = [(t1, p1), (t2, p2), (t3, p3)]
+       returns => [%_change_2_1, %_change_3_2]
+
+    :return: e.g. [+0.12, -0.03, +0.25, ...]
+    """
+    changes = []
+    for i in range(1, len(price_records)):
+        _, prev_price = price_records[i-1]
+        _, curr_price = price_records[i]
+        if prev_price == 0:
+            pct_change = 0.0
+        else:
+            pct_change = (curr_price - prev_price) / prev_price * 100.0
+        changes.append(pct_change)
+    return changes
+
 def convert_base_asset_keys_to_wsname(trade_balances: Dict[str, float]) -> Dict[str, float]:
     """
     Convert each key in trade_balances from a base-asset name (e.g. "XETH")
@@ -120,11 +144,9 @@ def convert_base_asset_keys_to_wsname(trade_balances: Dict[str, float]) -> Dict[
             new_dict[wsname] = balance
         else:
             # Optionally, log or skip:
-            # logger.warning(f"No wsname found for base_asset={base_asset}, skipping.")
+            logger.warning(f"No wsname found for base_asset={base_asset}, skipping.")
             pass
     return new_dict
-
-
 
 def setup_logging():
     """
@@ -395,73 +417,99 @@ class HybridApp:
 
     def aggregator_cycle(self):
         """
-        Single aggregator cycle => fetch ledger => build aggregator data => Mustache => AIStrategy
+        Single aggregator cycle => fetch ledger => build aggregator data => Mustache => AIStrategy => GPT => trades.
+
+        Detailed Steps:
+          1) Update the local ledger DB by calling fetch_and_store_kraken_ledger(...).
+          2) Fetch the latest trade balances from Kraken => convert base asset keys => determine USD.
+          3) Build a raw aggregator list with only numeric data (pair, last_price, changes, etc.).
+          4) Render the Mustache template (e.g. aggregator_simple_prompt.mustache) with the aggregator list.
+          5) Pass the rendered prompt text to AIStrategy => GPT => parse => produce decisions.
+          6) If valid trades come back, create pending trades + possibly place real orders.
+
+        This method does NOT embed prompt text in Python. All text is in Mustache.
         """
-        # 1) Update LunarCrush data
+        # 1) Possibly update LunarCrush data (optional)
         self._update_lunarcrush_data()
-        logger.info("[Aggregator] aggregator_cycle_all_coins => Checking ledger for ZUSD balance...")
+
+        logger.info("[Aggregator] Starting aggregator_cycle => checking ledger for ZUSD balance...")
+
+        # 2) Refresh ledger => read ZUSD balance from DB
         fetch_and_store_kraken_ledger(
             api_key=self.kraken_api_key,
             api_secret=self.kraken_api_secret,
             asset="all",
             ledger_type="all",
-            db_path=DB_FILE
+            db_path=db.DB_FILE
         )
-        trade_balances = fetch_kraken_balance(
-            api_key=self.kraken_api_key,
-            api_secret=self.kraken_api_secret
-        )
-        current_usd_balance = get_latest_zusd_balance(db_path=DB_FILE)
-        trade_balances_ws = convert_base_asset_keys_to_wsname(trade_balances)
-        trade_balances_ws["USD"] = current_usd_balance
-        logger.info(f'[Aggregator] Current ZUSD balance: {current_usd_balance}')
+        trade_balances = self.manager.fetch_balance()  # or your own fetch_kraken_balance
+        current_usd_balance = get_latest_zusd_balance(db_path=db.DB_FILE)
 
+        # Convert any Kraken base-asset keys to standard wsname (e.g. "ETH/USD").
+        trade_balances_ws = convert_base_asset_keys_to_wsname(trade_balances)
+        # For clarity, store "USD": <float> as well
+        trade_balances_ws["USD"] = current_usd_balance
+
+        # 3) Build aggregator items. No inline text, just raw numeric data.
         aggregator_list = []
         zero_count = 0
-        for p in self.pairs:
-            px = self.latest_prices.get(p, 0.0)
-            if px == 0.0:
+
+        # You can configure how many minute-spaced points you want:
+        quantity = ConfigLoader.get_value("quantity_of_price_history", 15)
+
+        for pair in self.pairs:
+            last_price = self.latest_prices.get(pair, 0.0)
+            if last_price == 0.0:
                 zero_count += 1
-            # Minimal aggregator dict
+
+            # Fetch ~N+1 data points from DB for that pair
+            minute_data = db.fetch_minute_spaced_prices(
+                pair=pair,
+                db_path=db.DB_FILE,
+                num_points=quantity + 1
+            )
+
+            # Compute minute-based % changes
+            changes = []
+            if len(minute_data) >= 2:
+                changes = compute_minute_percent_changes(minute_data)
+
+            # Retrieve minimum purchase constraints
+            min_qty = db_lookup.get_ordermin(pair)
+            min_cost = db_lookup.get_minimum_cost_in_usd(pair)
+
+            # Add a dictionary of raw data (no inline text) to aggregator_list
             aggregator_list.append({
-                "pair": p,
-                "last_price": px
-                # More fields can be added if your Mustache template references them
+                "pair": pair,
+                "last_price": last_price,
+                "changes": changes,  # array of float % changes
+                "min_qty": min_qty,
+                "min_cost": min_cost
             })
+
+        # If all pairs have a zero price, skip aggregator calls to avoid nonsense
         if zero_count == len(self.pairs):
-            logger.info("[Aggregator] all pairs price=0 => skipping aggregator.")
+            logger.info("[Aggregator] All pairs last_price=0 => skipping aggregator_cycle.")
             return
 
-        # read which mustache template from config
+        # 4) Prepare the Mustache context (raw data only)
         template_name = ConfigLoader.get_value("prompt_template_name", "aggregator_simple_prompt.mustache")
-
-        # build context for Mustache
-        from prompt_builder import PromptBuilder
         builder = PromptBuilder(template_dir="templates")
 
-        # aggregator_items => repeated in template
         context = {
             "current_usd_balance": f"{current_usd_balance:.2f}",
-            "trade_balances": json.dumps(trade_balances, indent=2),
-            "aggregator_items": []
+            "trade_balances": json.dumps(trade_balances_ws, indent=2),
+            "aggregator_items": aggregator_list
         }
-        for item in aggregator_list:
-            # each aggregator item => 'prompt_text' is optional
-            # if your template references it.
-            # or you can do something like 'last_price': item['last_price'] if needed
-            context["aggregator_items"].append({
-                "pair": item["pair"],
-                "prompt_text": f"(Placeholder) last_price={item['last_price']}"
-            })
 
-        # Render final prompt
+        # Render the Mustache template into a final prompt text
         final_prompt_text = builder.render_template(template_name, context)
+        logger.info("[Aggregator] Successfully rendered Mustache prompt => sending to AIStrategy/GPT.")
 
-        # AIStrategy => parse + create trades
-        logger.info("[Aggregator] Submitting final prompt to AIStrategy => GPT.")
+        # 5) AIStrategy => parse => create trades
         decisions = self.strategy.predict_from_prompt(
             final_prompt_text=final_prompt_text,
-            current_trade_balance=trade_balances,
+            current_trade_balance=trade_balances_ws,
             current_balance=current_usd_balance
         )
         logger.info(f"[Aggregator] GPT decisions => {decisions}")
