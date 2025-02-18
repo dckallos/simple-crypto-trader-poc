@@ -2,38 +2,9 @@
 # FILE: risk_manager.py
 # =============================================================================
 """
-Production version of risk_manager.py
-
-Key Points:
------------
-1) Lots-based stop-loss and take-profit logic. Each BUY either creates a new
-   lot in `holding_lots` or merges with an existing one if `has_sold_in_between=0`.
-
-2) The `on_price_update(...)` method scans all open lots for a given pair, checking
-   if the current price triggers a stop-loss or take-profit event. If triggered,
-   we create a SELL entry in `pending_trades` **with `lot_id`**, mark that lot as
-   “pending sell,” and optionally place the real SELL order on Kraken if
-   `place_live_orders` is True and `private_ws_client` is provided.
-
-3) After Kraken **actually** fills or closes the SELL, the private feed finalizes
-   the trade in `pending_trades`. It then calls `risk_manager_db.on_pending_trade_closed(...)`
-   with the lot_id, fill_size, etc. Only then do we remove or partially update that lot.
-
-4) `adjust_trade(...)` enforces daily drawdown and ensures the user has sufficient
-   balances for each new trade.
-
-5) We have an async background loop (`start_db_price_check_cycle(...)`) that
-   periodically queries `price_history` for each pair's newest price, then calls
-   `on_price_update(...)`.
-
-New Changes to Meet Requirements:
---------------------------------
-- We now **wait 30 seconds** after initialization, before the loop starts checking pairs.
-- The `_maybe_place_kraken_order(...)` method returns a boolean success/failure.
-  If it fails (e.g. the private feed isn’t open), we **do not** mark the lot as pending
-  sell. Next cycle, we’ll see the lot still unsold and try again.
-
-All other code is unchanged except where noted to implement these two items.
+Production version of risk_manager.py with adjustments to avoid leaving dust
+positions below the exchange minimum, and ensure all BUY trades exceed the
+minimum purchase cost (in USD).
 """
 
 import logging
@@ -54,12 +25,13 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-DB_FILE = "trades.db"  # Path to your SQLite DB file (must contain 'price_history', etc.)
+DB_FILE = "trades.db"  # Path to your SQLite DB file
 
 
 # ------------------------------------------------------------------------------
 # Utility to initialize 'holding_lots' table
 # ------------------------------------------------------------------------------
+
 def init_holding_lots_table(db_path: str = DB_FILE) -> None:
     """
     Ensures the holding_lots table exists in the SQLite database.
@@ -77,15 +49,15 @@ def init_holding_lots_table(db_path: str = DB_FILE) -> None:
     try:
         c = conn.cursor()
         c.execute("""
-            CREATE TABLE IF NOT EXISTS holding_lots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                pair TEXT,
-                purchase_price REAL,
-                initial_quantity REAL,
-                quantity REAL,
-                date_purchased INTEGER,
-                has_sold_in_between INTEGER DEFAULT 0
-            )
+        CREATE TABLE IF NOT EXISTS holding_lots (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          pair TEXT,
+          purchase_price REAL,
+          initial_quantity REAL,
+          quantity REAL,
+          date_purchased INTEGER,
+          has_sold_in_between INTEGER DEFAULT 0
+        )
         """)
         conn.commit()
         logger.info("[RiskManager] holding_lots table ensured.")
@@ -100,39 +72,26 @@ def init_holding_lots_table(db_path: str = DB_FILE) -> None:
 # ------------------------------------------------------------------------------
 class RiskManagerDB:
     """
-    The core class for your stop-loss and take-profit logic. Key features:
-
-      - 'on_price_update(...)': if current_price hits SL or TP => create SELL in
-        'pending_trades' (with lot_id) => mark that lot as “pending sell” => optionally
-        send the real SELL order to Kraken if place_live_orders is True.
-
-      - 'on_pending_trade_closed(...)': once the private feed says the SELL is actually
-        closed on Kraken => remove or partially update the lot.
-
-      - 'adjust_trade(...)': daily drawdown + user capacity checks.
-
-      - 'start_db_price_check_cycle(...)': background loop that queries 'price_history'
-        to get the newest price for each pair, then calls 'on_price_update(...)'.
-
-      - 'add_or_combine_lot(...)': merges or creates new holding_lots for each BUY fill.
+    The core class for stop-loss / take-profit logic, plus the new rules:
+      1. Force all BUY orders to exceed the exchange's minimum cost in USD
+      2. If a partial SELL would leave leftover < 110% of the min. order size, SELL the entire stake.
     """
 
     def __init__(
-            self,
-            db_path: str = DB_FILE,
-            max_position_size: float = 3.0,
-            max_daily_drawdown: float = None,
-            initial_spending_account: float = 100.0,
-            # NEW: same idea as in AIStrategy
-            private_ws_client=None,
-            place_live_orders: bool = False
+        self,
+        db_path: str = DB_FILE,
+        max_position_size: float = 3.0,
+        max_daily_drawdown: float = None,
+        initial_spending_account: float = 100.0,
+        private_ws_client=None,
+        place_live_orders: bool = False
     ):
         """
-        :param db_path: SQLite DB path containing price_history, trades, pending_trades, holding_lots
-        :param max_position_size: Hard limit on per-trade size (e.g. 3 coins).
-        :param max_daily_drawdown: If daily realized PnL <= this threshold => skip new BUYs.
-        :param initial_spending_account: A budget cap for each trade in USD, if relevant to you.
-        :param private_ws_client: an instance of KrakenPrivateWSClient (optional)
+        :param db_path: Path to SQLite DB
+        :param max_position_size: Hard clamp on number of coins per trade
+        :param max_daily_drawdown: e.g. -0.02 => if realized daily PnL < -2%, do not allow new BUYs
+        :param initial_spending_account: A simple budget cap if desired
+        :param private_ws_client: e.g. KrakenPrivateWSClient
         :param place_live_orders: if True => we call private_ws_client.send_order(...) after new SL/TP SELL
         """
         self.db_path = db_path
@@ -146,25 +105,24 @@ class RiskManagerDB:
 
     def initialize(self) -> None:
         """
-        Ensures 'trades' table and 'holding_lots' are present.
-        'pending_trades' is presumably created in db.py.
+        Ensures the 'trades' and 'holding_lots' tables exist.
         """
         conn = sqlite3.connect(self.db_path)
         try:
             c = conn.cursor()
             c.execute("""
-                CREATE TABLE IF NOT EXISTS trades (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp INTEGER,
-                    kraken_trade_id TEXT,
-                    pair TEXT,
-                    side TEXT,
-                    quantity REAL,
-                    price REAL,
-                    order_id TEXT,
-                    fee REAL DEFAULT 0,
-                    realized_pnl REAL
-                )
+            CREATE TABLE IF NOT EXISTS trades (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              timestamp INTEGER,
+              kraken_trade_id TEXT,
+              pair TEXT,
+              side TEXT,
+              quantity REAL,
+              price REAL,
+              order_id TEXT,
+              fee REAL DEFAULT 0,
+              realized_pnl REAL
+            )
             """)
             conn.commit()
             logger.info("[RiskManager] 'trades' table ensured.")
@@ -179,9 +137,9 @@ class RiskManagerDB:
     # 1) Start an async loop that calls on_price_update(...) from DB prices
     # ----------------------------------------------------------------------
     async def start_db_price_check_cycle(
-            self,
-            pairs: List[str],
-            interval: float = 30.0
+        self,
+        pairs: List[str],
+        interval: float = 30.0
     ):
         """
         An asynchronous loop that does the following forever:
@@ -194,21 +152,17 @@ class RiskManagerDB:
         """
         import asyncio
 
-        # NEW: Wait 30 seconds after initialization
+        # Delay after init to ensure private feed is connected, etc.
         logger.info("[RiskManager] Delaying 30 seconds after init before first price check.")
         await asyncio.sleep(30)
         logger.info("[RiskManager] Proceeding with price check cycle now.")
 
-        logger.info(
-            f"[RiskManager] Starting DB-based price check cycle for {pairs}, interval={interval}s"
-        )
+        logger.info(f"[RiskManager] Starting DB-based price check cycle for {pairs}, interval={interval}s")
         while True:
             try:
                 for pair in pairs:
                     latest_price = self._fetch_latest_price_for_pair(pair)
                     if latest_price > 0:
-                        # Typically you'd pass real user balances from somewhere.
-                        # For demonstration, an empty dict here.
                         dummy_balances = {}
                         self.on_price_update(
                             pair=pair,
@@ -226,19 +180,18 @@ class RiskManagerDB:
 
     def _fetch_latest_price_for_pair(self, pair: str) -> float:
         """
-        Reads the newest 'price_history' row for the given pair from the DB,
-        returning last_price. Returns 0.0 if not found or error.
+        Utility: returns newest last_price from 'price_history' for the given pair, or 0 if not found.
         """
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         try:
             c = conn.cursor()
             c.execute("""
-                SELECT last_price
-                FROM price_history
-                WHERE pair=?
-                ORDER BY timestamp DESC
-                LIMIT 1
+            SELECT last_price
+            FROM price_history
+            WHERE pair=?
+            ORDER BY timestamp DESC
+            LIMIT 1
             """, (pair,))
             row = c.fetchone()
             if row is None:
@@ -250,16 +203,13 @@ class RiskManagerDB:
         finally:
             conn.close()
 
-    # ----------------------------------------------------------------------
-    # 2) Stop-Loss / Take-Profit => create SELL in pending_trades + optional real order
-    # ----------------------------------------------------------------------
     def on_price_update(
-            self,
-            pair: str,
-            current_price: float,
-            kraken_balances: Dict[str, float],
-            stop_loss_pct: float = ConfigLoader.get_value("stop_loss_percent", 0.05),
-            take_profit_pct: float = ConfigLoader.get_value("take_profit_percent", 0.02)
+        self,
+        pair: str,
+        current_price: float,
+        kraken_balances: Dict[str, float],
+        stop_loss_pct: float = ConfigLoader.get_value("stop_loss_percent", 0.05),
+        take_profit_pct: float = ConfigLoader.get_value("take_profit_percent", 0.02)
     ):
         """
         For each open lot of `pair`, check if current_price triggers a stop-loss or take-profit.
@@ -276,10 +226,9 @@ class RiskManagerDB:
         :param stop_loss_pct: e.g. 0.05 => 5% below cost basis triggers stop-loss
         :param take_profit_pct: e.g. 0.02 => 2% above cost basis triggers take-profit
         """
-
         lots = self._load_lots_for_pair(pair)
         if not lots:
-            return  # no open lots => nothing to do
+            return
 
         for lot in lots:
             lot_id = lot["id"]
@@ -288,26 +237,25 @@ class RiskManagerDB:
             init_qty = lot["initial_quantity"]
             has_sold_flag = lot["has_sold_in_between"]
 
-            # If lot_qty is 0 or we already flagged "pending sell" => skip
+            # Skip empty or pending-sell lots
             if lot_qty <= 0 or has_sold_flag == 2:
                 continue
 
             # -----------------------------
-            # STOP LOSS Check
+            # STOP LOSS
             # -----------------------------
             if current_price <= lot_price * (1.0 - stop_loss_pct):
                 reason = f"STOP_LOSS triggered at price={current_price:.4f}"
-                logger.info(
-                    f"[RiskManager] Stop-loss => lot_id={lot_id}, SELL all {lot_qty:.4f} of {pair}"
-                )
+                logger.info(f"[RiskManager] Stop-loss => lot_id={lot_id}, SELL all {lot_qty:.4f} of {pair}")
 
                 min_order_size = db_lookup.get_ordermin(pair)
                 if lot_qty < min_order_size:
                     logger.warning(
-                        f"[RiskManager] lot_id={lot_id} => SELL qty={lot_qty:.4f} is below exchange min={min_order_size:.4f}. Skipping..."
+                        f"[RiskManager] lot_id={lot_id} => SELL qty={lot_qty:.4f} below exchange min={min_order_size:.4f}. Skipping..."
                     )
+                    # Optionally mark this lot as dust if you'd rather not keep it
                     continue
-                # Create pending trade => include source & rationale
+
                 pending_id = create_pending_trade(
                     side="SELL",
                     requested_qty=lot_qty,
@@ -320,65 +268,63 @@ class RiskManagerDB:
                 if success:
                     self._mark_lot_as_pending_sell(lot_id)
                 else:
-                    logger.warning(
-                        "[RiskManager] Private feed not open => skipping mark 'pending sell'. "
-                        "Will retry next cycle."
-                    )
-                continue  # proceed to next lot
+                    logger.warning("[RiskManager] Private feed not open => skipping mark 'pending sell'. Will retry next cycle.")
+                continue
 
             # -----------------------------
-            # TAKE PROFIT Check
+            # TAKE PROFIT
             # -----------------------------
             if current_price >= lot_price * (1.0 + take_profit_pct):
-                # For partial T/P, we do min of init_qty vs the entire leftover qty
+                # Proposed partial sale
                 sell_size = min(init_qty, lot_qty)
-                if sell_size <= 0:
-                    continue
-
-                reason = f"TAKE_PROFIT triggered at price={current_price:.4f}"
-                logger.info(
-                    f"[RiskManager] Take-profit => lot_id={lot_id}, SELL {sell_size:.4f} of {pair}"
-                )
-
                 min_order_size = db_lookup.get_ordermin(pair)
+
+                # ## CHANGED: If leftover < 1.1 * min_order_size => sell full lot
+                leftover = lot_qty - sell_size
+                if leftover > 0 and leftover < (1.1 * min_order_size):
+                    logger.info(
+                        f"[RiskManager] leftover={leftover:.4f} < 1.1 x min_order_size={min_order_size:.4f} => selling entire lot."
+                    )
+                    sell_size = lot_qty
+
                 if sell_size < min_order_size:
                     logger.warning(
                         f"[RiskManager] lot_id={lot_id} => SELL qty={sell_size:.4f} below exchange min={min_order_size:.4f}. Skipping..."
                     )
+                    # Optionally mark this lot as dust if you'd rather not keep it
                     continue
-                # Create pending trade => include source & rationale
+
+                reason = f"TAKE_PROFIT triggered at price={current_price:.4f}"
+                logger.info(f"[RiskManager] Take-profit => lot_id={lot_id}, SELL {sell_size:.4f} of {pair}")
+
                 pending_id = create_pending_trade(
                     side="SELL",
                     requested_qty=sell_size,
                     pair=pair,
                     reason=reason,
-                    source="risk_manager",  # Mark as from risk_manager
-                    rationale="take-profit"  # The short rationale text
+                    source="risk_manager",
+                    rationale="take-profit"
                 )
                 success = self._maybe_place_kraken_order(pair, "SELL", sell_size, pending_id)
                 if success:
                     self._mark_lot_as_pending_sell(lot_id)
                 else:
-                    logger.warning(
-                        "[RiskManager] Private feed not open => skipping mark 'pending sell'. "
-                        "Will retry next cycle."
-                    )
+                    logger.warning("[RiskManager] Private feed not open => skipping mark 'pending sell'. Will retry next cycle.")
 
     def _mark_lot_as_pending_sell(self, lot_id: int):
         """
-        Mark this lot so we know a SELL is pending, to avoid repeated triggers.
-        We'll set has_sold_in_between=2 to indicate "pending SELL".
+        Mark the lot as has_sold_in_between=2 so we don't re-trigger sells each cycle.
         """
         conn = sqlite3.connect(self.db_path)
         try:
             c = conn.cursor()
             c.execute("""
-                UPDATE holding_lots
-                SET has_sold_in_between=2
-                WHERE id=?
+            UPDATE holding_lots
+            SET has_sold_in_between=2
+            WHERE id=?
             """, (lot_id,))
             conn.commit()
-            logger.info(f"[RiskManager] Marked lot_id={lot_id} as pending SELL (has_sold_in_between=2).")
+            logger.info(f"[RiskManager] Marked lot_id={lot_id} as pending SELL (2).")
         except Exception as e:
             logger.exception(f"[RiskManager] _mark_lot_as_pending_sell => {e}")
         finally:
@@ -388,11 +334,11 @@ class RiskManagerDB:
     # 3) Called by the private feed once the SELL is actually closed on Kraken
     # ----------------------------------------------------------------------
     def on_pending_trade_closed(
-            self,
-            lot_id: int,
-            fill_size: float,
-            side: str,
-            fill_price: float
+        self,
+        lot_id: int,
+        fill_size: float,
+        side: str,
+        fill_price: float
     ):
         """
         Once the private feed says the SELL or BUY is fully closed on Kraken,
@@ -414,27 +360,27 @@ class RiskManagerDB:
                 return
 
             current_qty = float(lot["quantity"])
+
             if side.upper() == "SELL":
                 leftover = current_qty - fill_size
                 if leftover <= 0:
-                    # The entire lot is sold
+                    # fully sold
                     c.execute("DELETE FROM holding_lots WHERE id=?", (lot_id,))
                     logger.info(f"[RiskManager] Removed lot_id={lot_id} fully sold.")
                 else:
-                    # Partial leftover => update and set has_sold_in_between=1
+                    # partial leftover
                     c.execute("""
-                        UPDATE holding_lots
-                        SET quantity=?,
-                            has_sold_in_between=1
-                        WHERE id=?
+                    UPDATE holding_lots
+                    SET quantity=?, has_sold_in_between=1
+                    WHERE id=?
                     """, (leftover, lot_id))
                     logger.info(
                         f"[RiskManager] Partial leftover => lot_id={lot_id}, leftover={leftover:.4f}"
                     )
                 conn.commit()
             else:
-                # side==BUY => typically, you'd do no special logic, unless partial fill synergy is needed
-                logger.debug(f"[RiskManager] on_pending_trade_closed => side=BUY => no action needed.")
+                # side=BUY => typically no special logic here
+                logger.debug("[RiskManager] side=BUY => no action needed for on_pending_trade_closed.")
         except Exception as e:
             logger.exception(f"[RiskManager] on_pending_trade_closed => {e}")
         finally:
@@ -445,12 +391,11 @@ class RiskManagerDB:
     # ----------------------------------------------------------------------
     def add_or_combine_lot(self, pair: str, buy_quantity: float, buy_price: float):
         """
-        Called once a BUY finalizes. If there's an existing open lot with no partial sells,
-        merges cost basis. Otherwise, create a new row in holding_lots.
+        Called once a BUY finalizes. If an existing open lot with has_sold_in_between=0 is found,
+        merge cost basis; else create a new lot.
         """
         if buy_quantity <= 0 or buy_price <= 0:
             return
-
         existing_lot = self._find_open_lot_without_sells(pair)
         if existing_lot:
             lot_id = existing_lot["id"]
@@ -459,6 +404,7 @@ class RiskManagerDB:
 
             total_qty = old_qty + buy_quantity
             new_price = ((old_qty * old_price) + (buy_quantity * buy_price)) / total_qty
+
             logger.info(
                 f"[RiskManager] Combine-lot => lot_id={lot_id}, old_qty={old_qty:.4f}, "
                 f"new_qty={buy_quantity:.4f}, total={total_qty:.4f}, px={new_price:.4f}"
@@ -468,24 +414,22 @@ class RiskManagerDB:
             now_ts = int(time.time())
             self._insert_new_lot(pair, buy_price, buy_quantity, now_ts)
 
-    # ----------------------------------------------------------------------
-    # 5) Daily Drawdown & Basic Pre-Trade Checks
-    # ----------------------------------------------------------------------
+    ## Enforce min buy cost in adjust_trade
     def adjust_trade(
-            self,
-            signal: str,
-            suggested_size: float,
-            pair: str,
-            current_price: float,
-            kraken_balances: Dict[str, float]
+        self,
+        signal: str,
+        suggested_size: float,
+        pair: str,
+        current_price: float,
+        kraken_balances: Dict[str, float]
     ) -> Tuple[str, float]:
         """
-        1) If daily drawdown is below max => skip new BUY
+        1) If daily drawdown below threshold => skip new BUY
         2) clamp final_size to self.max_position_size
-        3) check user capacity (cost vs free USD, or coin vs free_coins)
-        4) return (final_signal, final_size) => "HOLD" if blocked
+        3) check user capacity
+        4) NEW: require cost >= min purchase cost
         """
-        # daily drawdown
+        # daily drawdown block
         if self.max_daily_drawdown is not None:
             daily_pnl = self.get_daily_realized_pnl()
             if daily_pnl <= self.max_daily_drawdown and signal == "BUY":
@@ -503,32 +447,41 @@ class RiskManagerDB:
 
         if signal == "BUY":
             cost = final_size * current_price
+
+            ## CHANGED: enforce min purchase cost in USD
+            min_cost = db_lookup.get_minimum_cost_in_usd(pair)
+            if cost < min_cost:
+                logger.info(
+                    f"[RiskManager] Proposed BUY cost={cost:.2f} < min cost={min_cost:.2f}. Skipping..."
+                )
+                return ("HOLD", 0.0)
+
             if cost > self.initial_spending_account:
                 logger.info(
                     f"[RiskManager] cost={cost:.2f} > initial_spending_account={self.initial_spending_account:.2f}"
                 )
                 return ("HOLD", 0.0)
+
             usd_symbol = self._get_quote_symbol(pair)
             free_usd = kraken_balances.get(usd_symbol, 0.0)
             if cost > free_usd:
                 logger.info(f"[RiskManager] insufficient {usd_symbol}, cost={cost:.2f}, have={free_usd:.2f}")
                 return ("HOLD", 0.0)
+
         else:  # SELL => check base coin
             base_sym = self._get_base_symbol(pair)
             free_coins = kraken_balances.get(base_sym, 0.0)
             if final_size > free_coins:
                 logger.info(
-                    f"[RiskManager] insufficient {base_sym} => requested={final_size:.4f}, have={free_coins:.4f}")
+                    f"[RiskManager] insufficient {base_sym} => requested={final_size:.4f}, have={free_coins:.4f}"
+                )
                 return ("HOLD", 0.0)
 
         return (signal, final_size)
 
-    # ----------------------------------------------------------------------
-    # 6) Daily PnL Calculation
-    # ----------------------------------------------------------------------
     def get_daily_realized_pnl(self, date_str: Optional[str] = None) -> float:
         """
-        Sums realized_pnl from 'trades' for a given UTC date. If not specified, use today (UTC).
+        Returns sum of realized_pnl from 'trades' for the given UTC date.
         """
         if not date_str:
             date_str = datetime.datetime.utcnow().strftime("%Y-%m-%d")
@@ -537,10 +490,10 @@ class RiskManagerDB:
         try:
             c = conn.cursor()
             c.execute("""
-                SELECT IFNULL(SUM(realized_pnl), 0.0)
-                FROM trades
-                WHERE realized_pnl IS NOT NULL
-                  AND date(timestamp, 'unixepoch') = ?
+            SELECT IFNULL(SUM(realized_pnl), 0.0)
+            FROM trades
+            WHERE realized_pnl IS NOT NULL
+              AND date(timestamp, 'unixepoch') = ?
             """, (date_str,))
             row = c.fetchone()
             if row and row[0] is not None:
@@ -552,32 +505,28 @@ class RiskManagerDB:
         finally:
             conn.close()
 
-    # ----------------------------------------------------------------------
-    # 7) Possibly place a live Kraken SELL/BUY order
-    # ----------------------------------------------------------------------
-    def _maybe_place_kraken_order(self, pair: str, action: str, volume: float, pending_id: int = None) -> bool:
+    def _maybe_place_kraken_order(
+        self,
+        pair: str,
+        action: str,
+        volume: float,
+        pending_id: int = None
+    ) -> bool:
         """
-        If place_live_orders=True and private_ws_client is available, we attempt a simple
-        market order. 'pending_id' is used as userref to match the pending_trades row.
-
-        Returns:
-          True if the order was successfully handed off to the private feed.
-          False if the private feed is not ready (or place_live_orders=False).
-          The caller uses this return to decide whether to mark the lot as
-          has_sold_in_between=2 or skip and retry next cycle.
+        Place a live market order if place_live_orders=True and private_ws_client is available.
+        Returns True if order was handed off to the private feed, else False.
         """
         if not self.place_live_orders:
             return True
         if not self.private_ws_client or not self.private_ws_client.running:
             logger.warning(
-                "[RiskManager] Private feed not open => cannot place real order => returning False for retry."
+                "[RiskManager] Private feed not open => cannot place real order => returning False."
             )
             return False
 
         side_for_kraken = "buy" if action.upper() == "BUY" else "sell"
         logger.info(
-            f"[RiskManager] Sending real order => pair={pair}, side={side_for_kraken}, "
-            f"volume={volume}, pending_id={pending_id}"
+            f"[RiskManager] Sending real order => pair={pair}, side={side_for_kraken}, volume={volume}, pending_id={pending_id}"
         )
         self.private_ws_client.send_order(
             pair=pair,
@@ -596,10 +545,10 @@ class RiskManagerDB:
         try:
             c = conn.cursor()
             c.execute("""
-                INSERT INTO holding_lots (
-                    pair, purchase_price, initial_quantity, quantity, date_purchased, has_sold_in_between
-                )
-                VALUES (?, ?, ?, ?, ?, 0)
+            INSERT INTO holding_lots (
+              pair, purchase_price, initial_quantity, quantity, date_purchased, has_sold_in_between
+            )
+            VALUES (?, ?, ?, ?, ?, 0)
             """, (pair, purchase_price, quantity, quantity, date_purchased))
             conn.commit()
             logger.info(
@@ -614,12 +563,12 @@ class RiskManagerDB:
     # Utility: Weighted cost basis update
     # ----------------------------------------------------------------------
     def _update_combined_lot(
-            self,
-            lot_id: int,
-            new_price: float,
-            new_qty: float,
-            old_qty: float,
-            add_qty: float
+        self,
+        lot_id: int,
+        new_price: float,
+        new_qty: float,
+        old_qty: float,
+        add_qty: float
     ):
         """
         Weighted cost basis update; also update initial_quantity by the new buy.
@@ -636,11 +585,11 @@ class RiskManagerDB:
             new_init_qty = old_init_qty + add_qty
 
             c.execute("""
-                UPDATE holding_lots
-                SET purchase_price=?,
-                    initial_quantity=?,
-                    quantity=?
-                WHERE id=?
+            UPDATE holding_lots
+            SET purchase_price=?,
+                initial_quantity=?,
+                quantity=?
+            WHERE id=?
             """, (new_price, new_init_qty, new_qty, lot_id))
             conn.commit()
         except Exception as e:
@@ -657,11 +606,11 @@ class RiskManagerDB:
         try:
             c = conn.cursor()
             c.execute("""
-                SELECT id, pair, purchase_price, initial_quantity, quantity, date_purchased, has_sold_in_between
-                FROM holding_lots
-                WHERE pair=? AND quantity>0 AND has_sold_in_between=0
-                ORDER BY id ASC
-                LIMIT 1
+            SELECT id, pair, purchase_price, initial_quantity, quantity, date_purchased, has_sold_in_between
+            FROM holding_lots
+            WHERE pair=? AND quantity>0 AND has_sold_in_between=0
+            ORDER BY id ASC
+            LIMIT 1
             """, (pair,))
             row = c.fetchone()
             return dict(row) if row else None
@@ -681,9 +630,9 @@ class RiskManagerDB:
         try:
             c = conn.cursor()
             c.execute("""
-                SELECT id, pair, purchase_price, initial_quantity, quantity, date_purchased, has_sold_in_between
-                FROM holding_lots
-                WHERE pair=? AND quantity>0
+            SELECT id, pair, purchase_price, initial_quantity, quantity, date_purchased, has_sold_in_between
+            FROM holding_lots
+            WHERE pair=? AND quantity>0
             """, (pair,))
             rows = c.fetchall()
             results = [dict(r) for r in rows]
@@ -698,13 +647,13 @@ class RiskManagerDB:
     # ----------------------------------------------------------------------
     def _get_quote_symbol(self, pair: str) -> str:
         """
-        For "DOT/USD", returns the 'quote' symbol in Kraken format, e.g. "ZUSD".
+        For "DOT/USD", returns the quote symbol in Kraken's format, e.g. "ZUSD"
         """
         return db_lookup.get_asset_value_for_pair(pair, value="quote")
 
     def _get_base_symbol(self, pair: str) -> str:
         """
-        For "DOT/USD", returns the 'base' symbol in Kraken format, e.g. "XDOT".
+        For "DOT/USD", returns the base symbol in Kraken's format, e.g. "XDOT"
         """
         return db_lookup.get_base_asset(pair)
 
@@ -713,22 +662,20 @@ class RiskManagerDB:
     # ----------------------------------------------------------------------
     def rebuild_lots_from_ledger_entries(self):
         """
-        (Existing code you had for ledger-based rebuild. Unchanged.)
+        Example ledger-based rebuild (unchanged from your snippet).
         """
-        import sqlite3
         conn = sqlite3.connect(self.db_path)
         try:
             c = conn.cursor()
-
             logger.info("[RiskManager] Rebuilding lots from ledger => clearing existing holding_lots.")
             c.execute("DELETE FROM holding_lots")
             conn.commit()
 
             c.execute("""
-                SELECT ledger_id, refid, time, asset, amount, fee, balance
-                FROM ledger_entries
-                WHERE type='trade'
-                ORDER BY time ASC, ledger_id ASC
+            SELECT ledger_id, refid, time, asset, amount, fee, balance
+            FROM ledger_entries
+            WHERE type='trade'
+            ORDER BY time ASC, ledger_id ASC
             """)
             rows = c.fetchall()
 
@@ -754,16 +701,15 @@ class RiskManagerDB:
 
                 maybe_zusd = [x for x in ledger_group if x["asset"].upper().startswith("Z")]
                 maybe_coin = [x for x in ledger_group if not x["asset"].upper().startswith("Z")]
-
                 if not maybe_zusd or not maybe_coin:
-                    logger.warning(f"[RiskManager] refid={refid} doesn't have ZUSD + coin => skipping.")
+                    logger.warning(f"[RiskManager] refid={refid} doesn't have Z + coin => skipping.")
                     continue
 
                 zusd_row = maybe_zusd[0]
                 coin_row = maybe_coin[0]
-
                 coin_amt = coin_row["amount"]
                 zusd_amt = zusd_row["amount"]
+
                 if coin_amt > 0:
                     buy_qty = coin_amt
                     cost_usd = abs(zusd_amt)
@@ -786,13 +732,15 @@ class RiskManagerDB:
                         )
 
             logger.info("[RiskManager] Completed rebuilding lots from ledger entries.")
-
         except Exception as e:
             logger.exception(f"[RiskManager] Error in rebuild_lots_from_ledger_entries => {e}")
         finally:
             conn.close()
 
     def _apply_historical_sell_ledger(self, pair: str, sell_qty: float, sell_price: float):
+        """
+        Helper for applying historical SELL lines from ledger => removing or partial leftover in holding_lots.
+        """
         if sell_qty <= 0:
             return
 
@@ -801,12 +749,12 @@ class RiskManagerDB:
         try:
             c = conn.cursor()
             c.execute("""
-                SELECT id, quantity, purchase_price, initial_quantity
-                FROM holding_lots
+            SELECT id, quantity, purchase_price, initial_quantity
+            FROM holding_lots
                 WHERE pair=?
                   AND quantity>0
                   AND has_sold_in_between != 2
-                ORDER BY id ASC
+            ORDER BY id ASC
             """, (pair,))
             rows = c.fetchall()
 
@@ -825,16 +773,16 @@ class RiskManagerDB:
                 else:
                     leftover = lot_qty - qty_to_sell
                     c.execute("""
-                        UPDATE holding_lots
-                        SET quantity=?, has_sold_in_between=1
-                        WHERE id=?
+                    UPDATE holding_lots
+                    SET quantity=?, has_sold_in_between=1
+                    WHERE id=?
                     """, (leftover, lot_id))
                     logger.debug(f"[RiskManager] Ledger SELL => lot_id={lot_id}, leftover={leftover}")
                     qty_to_sell = 0
 
             conn.commit()
             if qty_to_sell > 0:
-                logger.warning(f"[RiskManager] Ledger SELL leftover={qty_to_sell} not allocated. Possibly mismatch.")
+                logger.warning(f"[RiskManager] Ledger SELL leftover={qty_to_sell} not allocated.")
         except Exception as e:
             logger.exception(f"[RiskManager] _apply_historical_sell_ledger => {e}")
         finally:
