@@ -37,7 +37,6 @@ from typing import Optional, Dict, Any, List
 
 import pandas as pd
 from dotenv import load_dotenv
-from numpy.f2py.crackfortran import privatepattern
 
 # Local modules
 import db
@@ -369,6 +368,32 @@ def fetch_and_store_kraken_public_asset_pairs(
         logger.exception(f"[AssetPairs] Unexpected => {e}")
 
 
+# ------------------------------------------------------------------------------
+# CHANGED: Add a small helper to remove scientific notation from a float.
+# ------------------------------------------------------------------------------
+def format_no_sci(value: float, decimal_places: int = 8) -> str:
+    """
+    Returns a string representation of 'value' without scientific notation,
+    truncated or rounded to 'decimal_places' digits after the decimal.
+
+    Examples:
+      format_no_sci(5e-05) => "0.00005000" (default 8 decimals)
+      format_no_sci(12345.6789, decimal_places=2) => "12345.68"
+
+    :param value: the float to format
+    :param decimal_places: how many digits after the decimal
+    :return: string e.g. "0.00005"
+    """
+    # Using standard formatting, then strip trailing zeroes if you like.
+    format_str = f"{{:.{decimal_places}f}}"
+    out = format_str.format(value)
+    # Optionally, remove trailing zeros if you want e.g. "0.00005" instead of "0.00005000"
+    out = out.rstrip("0").rstrip(".") if "." in out else out
+    if out == "":
+        out = "0"
+    return out
+
+
 class HybridApp:
     """
     Aggregator with a single aggregator_cycle method.
@@ -472,11 +497,12 @@ class HybridApp:
             # Compute minute-based % changes
             changes = []
             if len(minute_data) >= 2:
-                changes = compute_minute_percent_changes(minute_data)
+                changes_raw = compute_minute_percent_changes(minute_data)
+                changes = [round(chg, 5) for chg in changes_raw]
 
             # Retrieve minimum purchase constraints
-            min_qty = db_lookup.get_ordermin(pair)
-            min_cost = db_lookup.get_minimum_cost_in_usd(pair)
+            min_qty = format_no_sci(db_lookup.get_ordermin(pair))
+            min_cost = format_no_sci(db_lookup.get_minimum_cost_in_usd(pair))
 
             # Add a dictionary of raw data (no inline text) to aggregator_list
             aggregator_list.append({
@@ -497,8 +523,8 @@ class HybridApp:
         builder = PromptBuilder(template_dir="templates")
 
         context = {
-            "current_usd_balance": f"{current_usd_balance:.2f}",
-            "trade_balances": json.dumps(trade_balances_ws, indent=2),
+            "current_usd_balance": f"{current_usd_balance:.4f}",
+            "trade_balances": json.dumps(trade_balances_ws, indent=2, ensure_ascii=False),
             "aggregator_items": aggregator_list
         }
 
@@ -740,10 +766,7 @@ def main():
 
     logger.info("[Main] aggregator approach running. Press Ctrl+C to exit.")
     try:
-        logger.info("[Main] user exit => stopping.")
-        # gracefully shut down risk_manager
-        risk_manager_task.cancel()
-        loop.run_until_complete(risk_manager_task)
+        loop.run_forever()
     except KeyboardInterrupt:
         logger.info("[Main] user exit => stopping.")
         # gracefully shut down risk_manager
