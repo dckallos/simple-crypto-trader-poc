@@ -52,6 +52,7 @@ from db import (
 from risk_manager import RiskManagerDB
 from gpt_manager import GPTManager
 from kraken_rest_manager import KrakenRestManager
+from config_loader import ConfigLoader
 
 load_dotenv()
 
@@ -96,8 +97,7 @@ class AIStrategy:
         gpt_model: str = "o1-mini",
         gpt_temperature: float = 1.0,
         gpt_max_tokens: int = 5000,
-        private_ws_client=None,
-        place_live_orders: bool = False
+        private_ws_client=None
     ):
         """
         :param pairs: e.g. ["ETH/USD", "XBT/USD"]
@@ -110,14 +110,12 @@ class AIStrategy:
         :param gpt_temperature: GPT model temperature
         :param gpt_max_tokens: GPT model max tokens
         :param private_ws_client: KrakenPrivateWSClient for live orders (optional)
-        :param place_live_orders: if True => we place real market orders
         """
         self.pairs = pairs if pairs else []
         self.use_openai = use_openai
         self.risk_manager = risk_manager
         self.risk_controls = risk_controls or {}
         self.private_ws_client = private_ws_client
-        self.place_live_orders = place_live_orders
 
         # GPT Initialization
         self.gpt_manager = None
@@ -128,8 +126,6 @@ class AIStrategy:
                 max_tokens=gpt_max_tokens,
                 log_gpt_calls=True
             )
-            if gpt_model:
-                self.gpt_manager.model = gpt_model
 
         # Ensure ai_decisions table exists
         self._create_ai_decisions_table()
@@ -156,11 +152,13 @@ class AIStrategy:
         :param current_balance: USD or quote currency currently available
         :return: A dict mapping each "pair" => (action, size) after risk checks
         """
-        results_set: Dict[str, Tuple[str, float]] = {}
-
+        # 1) read the *current* openai_model from config.
         if not self.use_openai or not self.gpt_manager:
-            logger.info("[AIStrategy] GPT is disabled => hold all.")
             return {p: ("HOLD", 0.0) for p in self.pairs}
+
+        self.gpt_manager.model = ConfigLoader.get_value("openai_model", "o1-mini")
+
+        results_set = {}
 
         # 1) Call GPT => parse
         logger.info("[AIStrategy] Submitting final prompt to GPT => calling generate_decisions_from_prompt.")
@@ -203,8 +201,8 @@ class AIStrategy:
                 )
                 if pending_id:
                     logger.info(f"[AIStrategy] Created pending trade ID {pending_id} => {final_action} {final_size} {pair}")
-                    if self.place_live_orders:
-                        self._maybe_place_kraken_order(pair, final_action, final_size, pending_id)
+
+                    self._maybe_place_kraken_order(pair, final_action, final_size, pending_id)
 
                     # If BUY => update or create a lot
                     if final_action == "BUY":
@@ -327,10 +325,9 @@ class AIStrategy:
         If place_live_orders=True and private_ws_client is not None, we send
         a simple market order. 'pending_id' => userref in Kraken's system.
         """
-        if not self.place_live_orders:
-            return
-        if not self.private_ws_client:
-            logger.warning("[AIStrategy] place_live_orders=True but private_ws_client=None => cannot place order.")
+        place_live = ConfigLoader.get_value("place_live_orders", False)
+        if not place_live:
+            logger.info("[AIStrategy] place_live_orders=False => skipping real order.")
             return
 
         side_for_kraken = "buy" if action.upper() == "BUY" else "sell"
