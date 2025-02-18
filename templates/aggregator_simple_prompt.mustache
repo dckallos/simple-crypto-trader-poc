@@ -43,7 +43,25 @@ Blocks:
 
 {{#aggregator_items}}
 ---COIN BLOCK ({{pair}})---
-{{{prompt_text}}}
+    Coin: [{{pair}}]
+    Last Price: {{last_price}}
+
+    PRICE HISTORY DATA (chronological):
+    "price_changes": [
+      {{#changes}}
+      {{.}}%,
+      {{/changes}}
+    ]
+
+    Minimum Purchase Quantity: {{min_qty}}
+    Minimum Cost in USD: {{min_cost}}
+
+    HOW TO INTERPRET:
+    1. Each item is the percent change from the previous minute. Positive = up, negative = down.
+    2. Consecutive positives suggest a short bullish wave; consecutive negatives suggest short bearish moves.
+    3. Larger absolute changes (≥ ±0.25%) can indicate stronger momentum swings.
+    4. Near-zero changes suggest a more sideways or “range-bound” interval.
+
 ---END BLOCK---
 
 {{/aggregator_items}}
