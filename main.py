@@ -481,7 +481,6 @@ class HybridApp:
 
         # You can configure how many minute-spaced points you want:
         quantity = ConfigLoader.get_value("quantity_of_price_history", 15)
-
         for pair in self.pairs:
             last_price = self.latest_prices.get(pair, 0.0)
             if last_price == 0.0:
@@ -655,8 +654,7 @@ def main():
     loop = asyncio.get_event_loop()
     risk_manager_task = loop.create_task(
         risk_manager_db.start_db_price_check_cycle(
-            pairs=TRADED_PAIRS,
-            interval=RISK_INTERVAL
+            pairs=TRADED_PAIRS
         )
     )
 
@@ -674,8 +672,7 @@ def main():
         gpt_model=OPENAI_MODEL,
         gpt_temperature=1.0,
         gpt_max_tokens=40000,
-        private_ws_client=None,
-        place_live_orders=PLACE_LIVE_ORDERS
+        private_ws_client=None
     )
     logger.info(f"[Main] AIStrategy => multi-coin GPT => pairs={TRADED_PAIRS}, GPT={ENABLE_GPT}, place_live_orders={PLACE_LIVE_ORDERS}")
 
