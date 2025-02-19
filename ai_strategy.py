@@ -26,14 +26,6 @@ High-Level Workflow:
 
 Stop-loss & take-profit remain outside this logic (risk_manager or ws_data_feed).
 
-Key Points:
------------
-- The previous "predict", "predict_multi_coins", "predict_multi_coins_simple"
-  methods have been consolidated into a single `predict_from_prompt(...)` method.
-- If you still need single-pair fallback logic (e.g. if GPT is disabled), you can
-  incorporate that in your aggregator or remove it entirely.
-- The rest of the code is largely unchanged but we simplified away multiple aggregator flows.
-
 """
 
 import logging
@@ -102,7 +94,7 @@ class AIStrategy:
         """
         :param pairs: e.g. ["ETH/USD", "XBT/USD"]
         :param use_openai: True => GPT logic is used; else fallback logic
-        :param max_position_size: For partial or local clamp usage
+        :param max_position_size: For local clamp usage
         :param max_daily_drawdown: e.g. -0.02 => skip new trades if daily PnL < -2%
         :param risk_controls: optional dict with custom fields
         :param risk_manager: a RiskManagerDB instance
@@ -149,19 +141,20 @@ class AIStrategy:
 
         :param final_prompt_text: The entire Mustache-rendered prompt that includes instructions + aggregator data
         :param current_trade_balance: e.g. {"ETH/USD": 0.5, "XBT/USD": 0.01} user holdings
-        :param current_balance: USD or quote currency currently available
+        :param current_balance: USD (or similar) currently available
         :return: A dict mapping each "pair" => (action, size) after risk checks
         """
-        # 1) read the *current* openai_model from config.
+        # If GPT is disabled, skip
         if not self.use_openai or not self.gpt_manager:
             return {p: ("HOLD", 0.0) for p in self.pairs}
 
+        # Retrieve the actual GPT model name from config
         self.gpt_manager.model = ConfigLoader.get_value("openai_model", "o1-mini")
+        ai_model_name = self.gpt_manager.model
 
         results_set = {}
 
-        # 1) Call GPT => parse
-        logger.info("[AIStrategy] Submitting final prompt to GPT => calling generate_decisions_from_prompt.")
+        logger.info("[AIStrategy] Submitting final prompt to GPT => generate_decisions_from_prompt.")
         gpt_out = self.gpt_manager.generate_decisions_from_prompt(final_prompt_text)
         decisions_list = gpt_out.get("decisions", [])
         ai_rationale = gpt_out.get("rationale", "No rationale provided")
@@ -170,78 +163,86 @@ class AIStrategy:
             logger.warning("[AIStrategy] GPT returned no decisions => hold all.")
             return {p: ("HOLD", 0.0) for p in self.pairs}
 
-        # 2) For each decision => local checks => create pending trades => possibly place order
+        # For each decision => local checks => create pending trades => possibly place order
         for dec in decisions_list:
             pair = dec.get("pair", "UNK")
             action_raw = dec.get("action", "HOLD").upper()
             size_requested = float(dec.get("size", 0.0))
 
-            # If the aggregator prompt included pairs not in self.pairs, we skip
+            # If GPT lists a pair we aren't tracking, skip
             if pair not in self.pairs:
                 logger.warning(f"[AIStrategy] GPT returned {pair}, but not in self.pairs => skipping.")
                 results_set[pair] = ("HOLD", 0.0)
                 continue
 
-            # local clamp => post_validate => daily drawdown => usage
+            # Quick local clamp => check daily drawdown => skip if needed
             final_action, final_size = self._post_validate(action_raw, size_requested, pair, current_balance)
+
+            # Then pass to risk_manager => ensures min cost, enough balance, etc.
             final_action, final_size = self.risk_manager.adjust_trade(
-                final_action, final_size, pair, self._get_price_estimate(pair), rest_manager.fetch_balance()
+                final_action,
+                final_size,
+                pair,
+                self._get_price_estimate(pair),
+                rest_manager.fetch_balance()
             )
 
-            rationale = f"[AIStrategy] final={final_action}, size={final_size}, rationale=({ai_rationale})"
+            # If final is still BUY or SELL => create a pending trade => maybe place real order
             if final_action in ("BUY", "SELL") and final_size > 0:
-                # create pending trade => optionally place real order
+                # We'll embed the GPT rationale + model name in the final trade record
+                combined_rationale = f"{ai_rationale}\n[ai_model={ai_model_name}]"
+
                 pending_id = create_pending_trade(
                     side=final_action,
                     requested_qty=final_size,
                     pair=pair,
                     reason="GPT_AGGREGATION",
                     source="ai_strategy",
-                    rationale=ai_rationale
+                    rationale=combined_rationale
                 )
                 if pending_id:
                     logger.info(f"[AIStrategy] Created pending trade ID {pending_id} => {final_action} {final_size} {pair}")
 
                     self._maybe_place_kraken_order(pair, final_action, final_size, pending_id)
 
-                    # If BUY => update or create a lot
+                    # If BUY => incorporate into or create a new lot
                     if final_action == "BUY":
                         self.risk_manager.add_or_combine_lot(
                             pair=pair,
                             buy_quantity=final_size,
-                            buy_price=self._get_price_estimate(pair)
+                            buy_price=self._get_price_estimate(pair),
+                            origin_source="ai_strategy",
+                            # Optionally store the same rationale in the lot
+                            risk_params_json=json.dumps(self.risk_controls)
                         )
                 else:
-                    logger.error(f"[AIStrategy] Failed to create pending trade for {pair} => skipping order.")
-
-            # store the final decision
-            self._store_decision(pair, final_action, final_size, rationale, group_rationale=ai_rationale)
-            results_set[pair] = (final_action, final_size)
+                    logger.error(f"[AIStrategy] Failed creating pending trade for {pair}; skipping order.")
+                results_set[pair] = (final_action, final_size)
+            else:
+                # GPT said HOLD or risk checks forced us to skip
+                results_set[pair] = ("HOLD", 0.0)
 
         return results_set
 
     # --------------------------------------------------------------------------
-    # Helper: local clamp => daily drawdown
+    # Local clamp => daily drawdown
     # --------------------------------------------------------------------------
     def _post_validate(self, action: str, suggested_size: float, pair: str, current_balance: float) -> Tuple[str, float]:
         """
         Minimal local clamp:
-          1) If daily drawdown below max => hold
+          1) If daily drawdown < max => skip buy
           2) If suggested_size > max_position_size => clamp
-          3) Possibly check min buy cost
-
-        We rely on risk_manager for more in-depth checks, but this is a quick sanity pass.
         """
         if action not in ("BUY", "SELL"):
             return ("HOLD", 0.0)
 
-        # daily drawdown
+        # If daily drawdown is below threshold => skip buys
         daily_pnl = self.risk_manager.get_daily_realized_pnl()
         if daily_pnl <= self.max_daily_drawdown and action == "BUY":
-            logger.warning(f"[AIStrategy] dailyPnL={daily_pnl} < {self.max_daily_drawdown} => skip buy => HOLD")
+            logger.warning(f"[AIStrategy] dailyPnL={daily_pnl:.4f} < {self.max_daily_drawdown} => skip buy => HOLD")
             return ("HOLD", 0.0)
 
-        # clamp position size
+        # clamp
         final_size = min(suggested_size, self.max_position_size)
         if final_size <= 0:
             return ("HOLD", 0.0)
@@ -250,11 +251,8 @@ class AIStrategy:
 
     def _get_price_estimate(self, pair: str) -> float:
         """
-        If needed, query the last known DB price or keep a local mapping. Here,
-        we do something minimal to avoid rewriting aggregator logic.
+        Returns the last known 'last_price' from price_history or 0 if none.
         """
-        # For a robust approach, read from aggregator or HybridApp. This is just a stub.
-        # Return a nonzero price or 0 if we can't find it.
         from db import fetch_price_history_desc
         rows = fetch_price_history_desc(pair, limit=1)
         if rows:
@@ -269,15 +267,15 @@ class AIStrategy:
         try:
             c = conn.cursor()
             c.execute("""
-            CREATE TABLE IF NOT EXISTS ai_decisions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp INTEGER,
-                pair TEXT,
-                action TEXT,
-                size REAL,
-                rationale TEXT,
-                group_rationale TEXT
-            )
+                CREATE TABLE IF NOT EXISTS ai_decisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp INTEGER,
+                    pair TEXT,
+                    action TEXT,
+                    size REAL,
+                    rationale TEXT,
+                    group_rationale TEXT
+                )
             """)
             conn.commit()
         except Exception as e:
@@ -295,14 +293,15 @@ class AIStrategy:
     ):
         """
         Insert a record into 'ai_decisions' capturing the final action, size, and rationale.
+        This is purely for logging or analysis. The real trades are in 'pending_trades' + 'trades'.
         """
         logger.debug(f"[AIStrategy] Storing decision => pair={pair}, action={action}, size={size}, reason={rationale}")
         conn = sqlite3.connect(DB_FILE)
         try:
             c = conn.cursor()
             c.execute("""
-            INSERT INTO ai_decisions (timestamp, pair, action, size, rationale, group_rationale)
-            VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO ai_decisions (timestamp, pair, action, size, rationale, group_rationale)
+                VALUES (?, ?, ?, ?, ?, ?)
             """, (
                 int(time.time()),
                 pair,
@@ -322,17 +321,21 @@ class AIStrategy:
     # --------------------------------------------------------------------------
     def _maybe_place_kraken_order(self, pair: str, action: str, volume: float, pending_id: int = None):
         """
-        If place_live_orders=True and private_ws_client is not None, we send
-        a simple market order. 'pending_id' => userref in Kraken's system.
+        If place_live_orders=True, tries to submit a market order via private_ws_client.
+        'pending_id' is used as userref in Kraken's system for tracking.
         """
         place_live = ConfigLoader.get_value("place_live_orders", False)
         if not place_live:
             logger.info("[AIStrategy] place_live_orders=False => skipping real order.")
             return
 
+        if not self.private_ws_client:
+            logger.warning("[AIStrategy] No private_ws_client => cannot place live order.")
+            return
+
         side_for_kraken = "buy" if action.upper() == "BUY" else "sell"
         logger.info(
-            f"[AIStrategy] Placing real order => {pair} => side={side_for_kraken}, vol={volume}, userref={pending_id}"
+            f"[AIStrategy] Placing real order => {pair}, side={side_for_kraken}, volume={volume}, userref={pending_id}"
         )
         self.private_ws_client.send_order(
             pair=pair,
