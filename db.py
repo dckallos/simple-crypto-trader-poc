@@ -5,22 +5,20 @@
 db.py
 
 SQLite database utilities for:
+
 1) Recording final (completed) trades in the 'trades' table. (No pending states here!)
-2) Storing ephemeral/pending trades in the new 'pending_trades' table.
+2) Storing ephemeral/pending trades in the 'pending_trades' table.
 3) Storing kraken asset-pair info in 'kraken_asset_pairs' for minOrder and other fields.
 4) Logging ledger entries, price history, cryptopanic data, lunarcrush data, AI context, etc.
 
-NOTE: This file has been updated to reflect the new design where 'trades' only
-holds finalized/closed trades, while 'pending_trades' holds ephemeral states
-('pending','open','rejected','closed'), but we are *not* tracking partial fills
-there. We also added 'kraken_asset_pairs' table with expanded columns to store
-Kraken /AssetPairs data for each pair.
+Additional updates:
+-------------------
+ - We have added a migration step after creating 'trades' that adds analytics-related columns
+   (lot_id, ai_model, source_config, ai_rationale, exchange_fill_time, trade_metrics_json).
+ - This ensures we can track a trade's associated lot (if any), the AI model used, risk parameters,
+   rationale, fill time from the exchange, and any additional metrics.
 
-All other existing functionality not relevant to the newly introduced logic is
-left intact, but references to "pending" or partial-fill logic in 'trades' have
-been removed. Sub-position logic is handled in risk_manager.py or by your app.
-
-CHANGES summary (search for "## NEW or ## CHANGED" comments below for modifications).
+All other logic remains unchanged from prior versions.
 """
 
 import sqlite3
@@ -39,19 +37,23 @@ DB_FILE = "trades.db"
 # ------------------------------------------------------------------------------
 # Basic init / create tables
 # ------------------------------------------------------------------------------
+
 def init_db():
     """
     Creates all needed tables in the SQLite DB specified by DB_FILE, if not exist:
-      - trades          (for final, completed trades only)
-      - pending_trades  (new table for ephemeral pending trades)
+
+      - trades (for final, completed trades only)
+      - pending_trades (ephemeral pending trades)
       - price_history
       - cryptopanic_posts
       - lunarcrush_data
       - ai_context
       - ai_decisions
       - lunarcrush_timeseries
-      - kraken_asset_pairs (new comprehensive table for /AssetPairs)
-      - ledger_entries  (for ledger data)
+      - kraken_asset_pairs
+      - ledger_entries
+
+    Then runs migrations on 'trades' to ensure extended analytics columns exist.
     """
     init_ledger_table(DB_FILE)
     conn = sqlite3.connect(DB_FILE)
@@ -61,27 +63,28 @@ def init_db():
         # ----------------------------------------------------------------------
         # 1) TRADES (FINAL ONLY)
         # ----------------------------------------------------------------------
-        ## CHANGED: Removing 'pending','open','part_filled','rejected' statuses, or partial fill columns.
-        ## We'll create a simpler trades table for final records only.
         c.execute("""
             CREATE TABLE IF NOT EXISTS trades (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp INTEGER,
-                    kraken_trade_id TEXT,
-                    pair TEXT,
-                    side TEXT,
-                    quantity REAL,
-                    price REAL,
-                    order_id TEXT,
-                    fee REAL DEFAULT 0,
-                    realized_pnl REAL,
-                    source TEXT,
-                    rationale TEXT
-                )
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER,
+                kraken_trade_id TEXT,
+                pair TEXT,
+                side TEXT,
+                quantity REAL,
+                price REAL,
+                order_id TEXT,
+                fee REAL DEFAULT 0,
+                realized_pnl REAL,
+                source TEXT,
+                rationale TEXT
+            )
         """)
 
+        # Run a short migration after creating trades:
+        _migrate_trades_table_for_analytics(conn)
+
         # ----------------------------------------------------------------------
-        # 2) PENDING_TRADES (NEW)
+        # 2) PENDING_TRADES
         # ----------------------------------------------------------------------
         create_pending_trades_table(conn)  # calls a helper function below
 
@@ -188,7 +191,7 @@ def init_db():
         """)
 
         # ----------------------------------------------------------------------
-        # 8) KRAKEN_ASSET_PAIRS (NEW or EXPANDED)
+        # 8) KRAKEN_ASSET_PAIRS
         # ----------------------------------------------------------------------
         create_kraken_asset_pairs_table(conn)
 
@@ -204,6 +207,50 @@ def init_db():
         logger.exception(f"Error creating DB: {e}")
     finally:
         conn.close()
+
+
+def _migrate_trades_table_for_analytics(conn: sqlite3.Connection):
+    """
+    Checks if certain analytic columns exist in 'trades' and adds them if missing:
+
+      - lot_id (INTEGER) => link to holding_lots.id
+      - ai_model (TEXT)
+      - source_config (TEXT) => store JSON risk config
+      - ai_rationale (TEXT) => store full GPT rationale
+      - exchange_fill_time (INTEGER) => actual exchange fill time
+      - trade_metrics_json (TEXT) => store peak adverse/favorable excursion, etc.
+    """
+    try:
+        c = conn.cursor()
+        c.execute("PRAGMA table_info(trades)")
+        rows = c.fetchall()
+        existing_cols = [row[1] for row in rows]
+
+        add_columns = []
+
+        if "lot_id" not in existing_cols:
+            add_columns.append(("lot_id", "INTEGER"))
+        if "ai_model" not in existing_cols:
+            add_columns.append(("ai_model", "TEXT"))
+        if "source_config" not in existing_cols:
+            add_columns.append(("source_config", "TEXT"))
+        if "ai_rationale" not in existing_cols:
+            add_columns.append(("ai_rationale", "TEXT"))
+        if "exchange_fill_time" not in existing_cols:
+            add_columns.append(("exchange_fill_time", "INTEGER"))
+        if "trade_metrics_json" not in existing_cols:
+            add_columns.append(("trade_metrics_json", "TEXT"))
+
+        for col_name, col_type in add_columns:
+            logger.info(f"[DB MIGRATION] Adding column '{col_name}' to trades (type={col_type}).")
+            c.execute(f"ALTER TABLE trades ADD COLUMN {col_name} {col_type}")
+
+        if add_columns:
+            conn.commit()
+            logger.info(f"[DB MIGRATION] trades => added {len(add_columns)} new columns => {add_columns}")
+    except Exception as e:
+        logger.exception(f"[DB MIGRATION] Error migrating trades => {e}")
+
 
 # ------------------------------------------------------------------------------
 # LEDGER ENTRIES
@@ -230,6 +277,7 @@ def init_ledger_table(db_path: str = DB_FILE):
         logger.exception(f"Error creating ledger_entries table: {e}")
     finally:
         conn.close()
+
 
 # ------------------------------------------------------------------------------
 # PRICE HISTORY & CRYPTOPANIC
@@ -259,6 +307,7 @@ def store_price_history(pair: str, bid: float, ask: float, last: float, volume: 
     finally:
         conn.close()
 
+
 def fetch_minute_spaced_prices(
     pair: str,
     db_path: str = "trades.db",
@@ -270,11 +319,6 @@ def fetch_minute_spaced_prices(
     with the most recent data as the last entry in chronological order.
 
     Each returned item is (timestamp, last_price).
-
-    Implementation:
-      - Fetch the last `max_rows_to_search` rows for 'price_history' WHERE pair=?, DESC order.
-      - Reverse them to ascending.
-      - Walk forward, picking rows ~60s apart, until we collect `num_points` or run out.
     """
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -303,6 +347,7 @@ def fetch_minute_spaced_prices(
                 out.append((ts, price))
                 last_picked_ts = ts
             else:
+                # only pick a row if >=60 seconds from the prior
                 if (ts - last_picked_ts) >= 60:
                     out.append((ts, price))
                     last_picked_ts = ts
@@ -339,8 +384,9 @@ def store_cryptopanic_data(title: str, url: str, sentiment_score: float):
     finally:
         conn.close()
 
+
 # ------------------------------------------------------------------------------
-# TRADES (FINAL) - We keep record_trade_in_db for legacy, but emphasize it's final
+# TRADES (FINAL) - We keep record_trade_in_db for legacy usage
 # ------------------------------------------------------------------------------
 def record_trade_in_db(
     side: str,
@@ -360,19 +406,16 @@ def record_trade_in_db(
 
     :param side: 'BUY' or 'SELL'
     :param quantity: final filled quantity
-    :param price: final average fill price (or fill price)
+    :param price: final average fill price
     :param order_id: The Kraken order ID or some local reference
     :param pair: e.g. 'ETH/USD'
     :param fee: total fee paid for this fill
     :param kraken_trade_id: The unique trade fill ID from ownTrades
     """
-    import time
-    import sqlite3
-
     conn = sqlite3.connect(DB_FILE)
     try:
         c = conn.cursor()
-        c.execute(f"""
+        c.execute("""
             INSERT INTO trades (
                 timestamp,
                 pair,
@@ -385,7 +428,7 @@ def record_trade_in_db(
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            int(time.time()),  # or pass in an explicit fill timestamp if needed
+            int(time.time()),
             pair,
             side,
             quantity,
@@ -399,6 +442,7 @@ def record_trade_in_db(
         logger.exception(f"Error recording trade in DB: {e}")
     finally:
         conn.close()
+
 
 # ------------------------------------------------------------------------------
 # GPT context loading/saving
@@ -440,11 +484,14 @@ def save_gpt_context_to_db(context_str: str):
     finally:
         conn.close()
 
+
 # =============================================================================
 # CREATE PENDING_TRADES TABLE
 # =============================================================================
-## NEW: We'll store ephemeral/pending trades here, with minimal columns. No partial fill logic.
 def create_pending_trades_table(conn=None):
+    """
+    We'll store ephemeral/pending trades here, with minimal columns. No partial fill logic.
+    """
     close_conn = False
     if conn is None:
         conn = sqlite3.connect(DB_FILE)
@@ -459,7 +506,7 @@ def create_pending_trades_table(conn=None):
                 pair TEXT,
                 side TEXT,
                 requested_qty REAL,
-                status TEXT,               -- 'pending','open','closed','rejected'
+                status TEXT,  -- 'pending','open','closed','rejected'
                 kraken_order_id TEXT,
                 reason TEXT,
                 lot_id INTEGER,
@@ -475,11 +522,21 @@ def create_pending_trades_table(conn=None):
         if close_conn:
             conn.close()
 
+
 # ------------------------------------------------------------------------------
 # CRUD for PENDING_TRADES
 # ------------------------------------------------------------------------------
-def create_pending_trade(side: str, requested_qty: float, pair: str,
-                         reason: str = None, source: str = None, rationale: str = None) -> int:
+def create_pending_trade(
+    side: str,
+    requested_qty: float,
+    pair: str,
+    reason: str = None,
+    source: str = None,
+    rationale: str = None
+) -> int:
+    """
+    Inserts a new row into pending_trades with status='pending'.
+    """
     conn = sqlite3.connect(DB_FILE)
     row_id = None
     try:
@@ -501,14 +558,12 @@ def create_pending_trade(side: str, requested_qty: float, pair: str,
         ))
         conn.commit()
         row_id = c.lastrowid
-
         logger.info(f"[DB] Successfully created pending trade ID {row_id} for {side} {requested_qty} {pair}")
     except Exception as e:
         logger.exception(f"[DB] Error creating pending trade: {e}")
     finally:
         conn.close()
     return row_id
-
 
 
 def mark_pending_trade_open(pending_id: int, kraken_order_id: str):
@@ -535,7 +590,6 @@ def mark_pending_trade_open(pending_id: int, kraken_order_id: str):
 def mark_pending_trade_rejected(pending_id: int, reason: str = None):
     """
     If Kraken rejects the order for any reason, set status='rejected'.
-    Optionally store a reason string.
     """
     conn = sqlite3.connect(DB_FILE)
     try:
@@ -554,43 +608,18 @@ def mark_pending_trade_rejected(pending_id: int, reason: str = None):
         conn.close()
 
 
-# def set_pending_trade_kraken_id(pending_id: int, kraken_order_id: str):
-#     """
-#     Sets kraken_order_id on an existing pending trade row by its local 'id'.
-#     This is used right after we receive 'status':'ok' with a new Kraken txid,
-#     so future updates can match by kraken_order_id.
-#     """
-#     conn = sqlite3.connect(DB_FILE)
-#     try:
-#         c = conn.cursor()
-#         c.execute("""
-#             UPDATE pending_trades
-#             SET kraken_order_id = ?
-#             WHERE id = ?
-#         """, (kraken_order_id, pending_id))
-#         conn.commit()
-#         if c.rowcount < 1:
-#             logger.warning(f"No pending_trades row found with id={pending_id} to set kraken_order_id.")
-#         else:
-#             logger.info(f"Set kraken_order_id={kraken_order_id} for pending_id={pending_id}.")
-#     except Exception as e:
-#         logger.exception(f"Error setting pending trade kraken_order_id: {e}")
-#     finally:
-#         conn.close()
-
-
 def set_kraken_order_id_for_pending_trade(pending_id: int, kraken_order_id: str):
     """
     Assigns the kraken_order_id (txid from Kraken) to our local pending_trades row
-    once we know which pending_id it belongs to.
+    once we know which local 'id' it belongs to.
     """
     conn = sqlite3.connect(DB_FILE)
     try:
         c = conn.cursor()
         c.execute("""
             UPDATE pending_trades
-               SET kraken_order_id = ?
-             WHERE id = ?
+            SET kraken_order_id = ?
+            WHERE id = ?
         """, (kraken_order_id, pending_id))
         conn.commit()
         if c.rowcount < 1:
@@ -603,16 +632,19 @@ def set_kraken_order_id_for_pending_trade(pending_id: int, kraken_order_id: str)
         conn.close()
 
 
+# ------------------------------------------------------------------------------
+# KRAKEN BALANCE HISTORY
+# ------------------------------------------------------------------------------
 def create_kraken_balance_table(conn=None):
     """
     Ensures a table 'kraken_balance_history' exists for storing snapshots
     of fetched Kraken balances over time.
 
     Columns:
-      - id: primary key
-      - timestamp: integer epoch time of the snapshot
-      - asset: text (e.g. "ZUSD", "XXBT", etc.)
-      - balance: real (the float balance at that snapshot)
+      - id
+      - timestamp
+      - asset
+      - balance
     """
     close_conn = False
     if conn is None:
@@ -642,9 +674,6 @@ def store_kraken_balances(balances: Dict[str, float], db_path: str = DB_FILE):
     """
     Appends a snapshot of balances to the 'kraken_balance_history' table.
     Each asset gets one row, so if you have 5 assets, you’ll insert 5 rows.
-
-    :param balances: dict like {"ZUSD": 100.25, "XXBT": 0.015, ...}
-    :param db_path: path to SQLite file
     """
     if not balances:
         logger.warning("[DB] store_kraken_balances called with empty dict => skipping.")
@@ -679,29 +708,11 @@ async def background_balance_updater(
 ):
     """
     A background coroutine that loops indefinitely:
-      1) fetches current Kraken balances via `kraken_rest_manager.fetch_balance()`
-      2) stores them in the DB
-      3) sleeps for refresh_interval seconds
-      4) repeats
 
-    You can import & call this from risk_manager.py if you want your RiskManager
-    to handle periodic refresh. For example:
-
-        import asyncio
-        from db import background_balance_updater
-
-        async def run_risk_manager_cycle():
-            # create your rest_manager, risk_manager, etc.
-            # then start the balance-updater in a background task:
-            asyncio.create_task(
-                background_balance_updater(kraken_rest_manager, 60.0)
-            )
-            # proceed with your main loop or other logic
-            # ...
-
-    :param kraken_rest_manager: An instance of your KrakenRestManager
-    :param refresh_interval: how many seconds to wait between each fetch
-    :param db_path: path to the SQLite database
+      1) Fetches current Kraken balances via kraken_rest_manager.fetch_balance()
+      2) Stores them in the DB
+      3) Sleeps for refresh_interval
+      4) Repeats
     """
     logger.info("[BalanceUpdater] Starting background coroutine to poll balances.")
     while True:
@@ -713,7 +724,6 @@ async def background_balance_updater(
         except Exception as e:
             logger.exception(f"[BalanceUpdater] Error in fetch/store loop => {e}")
 
-        # 3) Sleep before next poll
         await asyncio.sleep(refresh_interval)
 
 
@@ -721,7 +731,6 @@ def mark_pending_trade_closed(pending_id: int, reason: str = None):
     """
     If the trade is fully filled, mark status='closed'.
     We'll also create a final row in 'trades' outside (ws_data_feed or whichever).
-    This just updates the status in pending_trades for traceability.
     """
     conn = sqlite3.connect(DB_FILE)
     try:
@@ -743,8 +752,11 @@ def mark_pending_trade_closed(pending_id: int, reason: str = None):
 # =============================================================================
 # CREATE KRAKEN_ASSET_PAIRS TABLE (expanded)
 # =============================================================================
-## NEW: We store a wide range of columns from the /AssetPairs response
 def create_kraken_asset_pairs_table(conn=None):
+    """
+    Stores a wide range of columns from /AssetPairs. We'll do an 'INSERT OR REPLACE'
+    when upserting each pair. This function just ensures the table exists.
+    """
     close_conn = False
     if conn is None:
         conn = sqlite3.connect(DB_FILE)
@@ -754,7 +766,7 @@ def create_kraken_asset_pairs_table(conn=None):
         c = conn.cursor()
         c.execute("""
             CREATE TABLE IF NOT EXISTS kraken_asset_pairs (
-                pair_name TEXT PRIMARY KEY,    -- e.g. 'XXBTZUSD','XETHXXBT'
+                pair_name TEXT PRIMARY KEY,
                 altname TEXT,
                 wsname TEXT,
                 aclass_base TEXT,
@@ -766,16 +778,16 @@ def create_kraken_asset_pairs_table(conn=None):
                 pair_decimals INTEGER,
                 lot_decimals INTEGER,
                 lot_multiplier INTEGER,
-                leverage_buy TEXT,  -- stored as JSON string
-                leverage_sell TEXT, -- stored as JSON
-                fees TEXT,          -- stored as JSON
-                fees_maker TEXT,    -- stored as JSON
+                leverage_buy TEXT,   -- stored as JSON string
+                leverage_sell TEXT,  -- stored as JSON
+                fees TEXT,           -- stored as JSON
+                fees_maker TEXT,     -- stored as JSON
                 fee_volume_currency TEXT,
                 margin_call INTEGER,
                 margin_stop INTEGER,
-                ordermin TEXT,       -- store as string or float if you prefer
-                costmin TEXT,        -- store as string or float
-                tick_size TEXT,      -- store as string or float
+                ordermin TEXT,
+                costmin TEXT,
+                tick_size TEXT,
                 status TEXT,
                 long_position_limit INTEGER,
                 short_position_limit INTEGER,
@@ -801,9 +813,9 @@ def fetch_price_history_desc(pair: str, limit: int = 10):
     try:
         c = conn.cursor()
         c.execute("""
-            SELECT 
+            SELECT
                 timestamp,
-                bid_price, 
+                bid_price,
                 ask_price,
                 last_price
             FROM price_history
@@ -819,6 +831,7 @@ def fetch_price_history_desc(pair: str, limit: int = 10):
     finally:
         conn.close()
 
+
 def store_kraken_asset_pair_info(pair_name: str, pair_info: Dict[str, Any]):
     """
     Insert or replace the row in kraken_asset_pairs with the data from pair_info.
@@ -830,32 +843,34 @@ def store_kraken_asset_pair_info(pair_name: str, pair_info: Dict[str, Any]):
     try:
         c = conn.cursor()
         now_ts = int(time.time())
+
         # Extract fields
-        altname = pair_info.get("altname","")
-        wsname = pair_info.get("wsname","")
-        aclass_base = pair_info.get("aclass_base","")
-        base = pair_info.get("base","")
-        aclass_quote = pair_info.get("aclass_quote","")
-        quote = pair_info.get("quote","")
-        lot = pair_info.get("lot","")
-        cost_decimals = pair_info.get("cost_decimals",0)
-        pair_decimals = pair_info.get("pair_decimals",0)
-        lot_decimals = pair_info.get("lot_decimals",0)
-        lot_multiplier = pair_info.get("lot_multiplier",0)
+        altname = pair_info.get("altname", "")
+        wsname = pair_info.get("wsname", "")
+        aclass_base = pair_info.get("aclass_base", "")
+        base = pair_info.get("base", "")
+        aclass_quote = pair_info.get("aclass_quote", "")
+        quote = pair_info.get("quote", "")
+        lot = pair_info.get("lot", "")
+        cost_decimals = pair_info.get("cost_decimals", 0)
+        pair_decimals = pair_info.get("pair_decimals", 0)
+        lot_decimals = pair_info.get("lot_decimals", 0)
+        lot_multiplier = pair_info.get("lot_multiplier", 0)
+
         # Convert arrays to JSON
         leverage_buy = json.dumps(pair_info.get("leverage_buy", []))
         leverage_sell = json.dumps(pair_info.get("leverage_sell", []))
         fees = json.dumps(pair_info.get("fees", []))
         fees_maker = json.dumps(pair_info.get("fees_maker", []))
-        fee_volume_currency = pair_info.get("fee_volume_currency","")
-        margin_call = pair_info.get("margin_call",0)
-        margin_stop = pair_info.get("margin_stop",0)
-        ordermin = pair_info.get("ordermin","")
-        costmin = pair_info.get("costmin","")
-        tick_size = pair_info.get("tick_size","")
-        status = pair_info.get("status","")
-        long_pos_limit = pair_info.get("long_position_limit",0)
-        short_pos_limit = pair_info.get("short_position_limit",0)
+        fee_volume_currency = pair_info.get("fee_volume_currency", "")
+        margin_call = pair_info.get("margin_call", 0)
+        margin_stop = pair_info.get("margin_stop", 0)
+        ordermin = pair_info.get("ordermin", "")
+        costmin = pair_info.get("costmin", "")
+        tick_size = pair_info.get("tick_size", "")
+        status = pair_info.get("status", "")
+        long_pos_limit = pair_info.get("long_position_limit", 0)
+        short_pos_limit = pair_info.get("short_position_limit", 0)
 
         c.execute("""
             INSERT OR REPLACE INTO kraken_asset_pairs (
@@ -900,6 +915,7 @@ def store_kraken_asset_pair_info(pair_name: str, pair_info: Dict[str, Any]):
         logger.exception(f"Error storing asset pair info for {pair_name}: {e}")
     finally:
         conn.close()
+
 
 if __name__ == "__main__":
     init_db()
