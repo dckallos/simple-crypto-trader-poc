@@ -294,20 +294,20 @@ class RiskManagerDB:
         # create stop_loss_events => ensure
         create_stop_loss_events_table(self.db_path)
 
-        # ----------------------------------------------------------------------
-        # Helpers for asset naming
-        # ----------------------------------------------------------------------
-        def _get_quote_symbol(self, pair: str) -> str:
-            """
-            For "DOT/USD", returns the 'quote' symbol in Kraken format, e.g. "ZUSD".
-            """
-            return db_lookup.get_asset_value_for_pair(pair, value="quote")
+    # ----------------------------------------------------------------------
+    # Helpers for asset naming
+    # ----------------------------------------------------------------------
+    def _get_quote_symbol(self, pair: str) -> str:
+        """
+        For "DOT/USD", returns the 'quote' symbol in Kraken format, e.g. "ZUSD".
+        """
+        return db_lookup.get_asset_value_for_pair(pair, value="quote")
 
-        def _get_base_symbol(self, pair: str) -> str:
-            """
-            For "DOT/USD", returns the 'base' symbol in Kraken format, e.g. "XDOT".
-            """
-            return db_lookup.get_base_asset(pair)
+    def _get_base_symbol(self, pair: str) -> str:
+        """
+        For "DOT/USD", returns the 'base' symbol in Kraken format, e.g. "XDOT".
+        """
+        return db_lookup.get_base_asset(pair)
 
     # ----------------------------------------------------------------------
     # Price-check cycle => called in main.py with an async loop
@@ -1052,5 +1052,6 @@ class RiskManagerDB:
         like 'ETH/USD'. We rely on db_lookup or a known map. Adjust if needed.
         """
         return db_lookup.get_websocket_name_from_base_asset(asset_name)
+
 
 
