@@ -10,15 +10,20 @@ SQLite database utilities for:
 2) Storing ephemeral/pending trades in the 'pending_trades' table.
 3) Storing kraken asset-pair info in 'kraken_asset_pairs' for minOrder and other fields.
 4) Logging ledger entries, price history, cryptopanic data, lunarcrush data, AI context, etc.
+5) NEW: Storing AI snapshot data for ML usage (the 'ai_snapshots' table).
 
 Additional updates:
 -------------------
- - We have added a migration step after creating 'trades' that adds analytics-related columns
-   (lot_id, ai_model, source_config, ai_rationale, exchange_fill_time, trade_metrics_json).
- - This ensures we can track a trade's associated lot (if any), the AI model used, risk parameters,
-   rationale, fill time from the exchange, and any additional metrics.
+ - The 'ai_snapshots' table stores a wide variety of numeric and textual data:
+   * The vector of price changes used in the AI prompt (JSON)
+   * The last_price or other numeric stats
+   * A JSON field capturing LunarCrush or volatility data
+   * Some columns for “market conditions,” “bullish/bearish,” “risk_of_investment,” etc.
+   * Plus references to interval durations, stop_loss_pct, and so forth
 
-All other logic remains unchanged from prior versions.
+ - We have also added a short function store_ai_snapshot(...) to handle inserts.
+ - This schema is designed with a future Postgres migration in mind, using simple
+   typed columns (INTEGER/REAL/TEXT). Additional indexing can be done later.
 """
 
 import sqlite3
@@ -52,6 +57,7 @@ def init_db():
       - lunarcrush_timeseries
       - kraken_asset_pairs
       - ledger_entries
+      - NEW: ai_snapshots (stores extended info for ML)
 
     Then runs migrations on 'trades' to ensure extended analytics columns exist.
     """
@@ -200,6 +206,11 @@ def init_db():
         # ----------------------------------------------------------------------
         create_kraken_balance_table(conn)
 
+        # ----------------------------------------------------------------------
+        # 10) AI_SNAPSHOTS (NEW FOR ML)
+        # ----------------------------------------------------------------------
+        create_ai_snapshots_table(conn)
+
         conn.commit()
         logger.info("All DB tables ensured in init_db().")
 
@@ -275,6 +286,154 @@ def init_ledger_table(db_path: str = DB_FILE):
         conn.commit()
     except Exception as e:
         logger.exception(f"Error creating ledger_entries table: {e}")
+    finally:
+        conn.close()
+
+
+# =============================================================================
+# CREATE AI_SNAPSHOTS TABLE (NEW)
+# =============================================================================
+
+def create_ai_snapshots_table(conn=None):
+    """
+    Creates the 'ai_snapshots' table. This table is used to store extensive
+    contextual data for each AI inference or aggregator cycle, facilitating
+    future machine learning and analytics.
+
+    We store:
+      - id (PK)
+      - created_at (INT epoch)
+      - pair (TEXT) -> for multi-coin calls, you can store 'ALL' or repeated inserts
+      - aggregator_interval_secs (INT) -> from config
+      - stop_loss_pct, take_profit_pct, daily_drawdown_limit (REAL) -> risk configs
+      - price_changes_json (TEXT) -> the vector of minute-based % changes used in prompt
+      - last_price (REAL) -> the last known price
+      - lunarcrush_data_json (TEXT) -> wide JSON snapshot of LunarCrush metrics if needed
+      - coin_volatility (REAL) -> from LunarCrush or aggregator
+      - is_market_bullish (TEXT or boolean) -> user-labeled
+      - risk_estimate (REAL) -> an example numeric score
+      - notes (TEXT) -> for anything else
+
+    (You can expand as needed!)
+    """
+    close_conn = False
+    if conn is None:
+        conn = sqlite3.connect(DB_FILE)
+        close_conn = True
+
+    try:
+        c = conn.cursor()
+        # If you want typed columns for easier Postgres migration, we do so here:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS ai_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at INTEGER,
+                pair TEXT,
+                aggregator_interval_secs INTEGER,
+                stop_loss_pct REAL,
+                take_profit_pct REAL,
+                daily_drawdown_limit REAL,
+                price_changes_json TEXT,
+                last_price REAL,
+                lunarcrush_data_json TEXT,
+                coin_volatility REAL,
+                is_market_bullish TEXT,
+                risk_estimate REAL,
+                notes TEXT
+            )
+        """)
+        conn.commit()
+        logger.info("[DB] ai_snapshots table ensured.")
+    except Exception as e:
+        logger.exception(f"[DB] Error creating ai_snapshots table: {e}")
+    finally:
+        if close_conn:
+            conn.close()
+
+
+def store_ai_snapshot(
+    pair: str,
+    price_changes: List[float],
+    last_price: float,
+    aggregator_interval_secs: int,
+    stop_loss_pct: float,
+    take_profit_pct: float,
+    daily_drawdown_limit: float,
+    coin_volatility: float,
+    is_market_bullish: str,
+    risk_estimate: float,
+    lunarcrush_data: Dict[str, Any] = None,
+    notes: str = None,
+    db_path: str = DB_FILE
+):
+    """
+    Insert a single row into ai_snapshots with a wide variety of data.
+    This can be called each time we run the aggregator or do an AI inference.
+
+    :param pair: e.g. "ETH/USD"
+    :param price_changes: The array of minute-based % changes used in the prompt
+    :param last_price: e.g. 1234.56
+    :param aggregator_interval_secs: from config
+    :param stop_loss_pct: from config
+    :param take_profit_pct: from config
+    :param daily_drawdown_limit: from config or risk_manager
+    :param coin_volatility: from LunarCrush or aggregator
+    :param is_market_bullish: e.g. "YES","NO","MIXED" or similar
+    :param risk_estimate: a numeric measure if you have one
+    :param lunarcrush_data: a dict of lunarcrush metrics to store as JSON
+    :param notes: free-form text
+    :param db_path: path to the SQLite DB
+    """
+    now_ts = int(time.time())
+    price_changes_json_str = "[]"
+    if price_changes:
+        import json
+        price_changes_json_str = json.dumps(price_changes)
+
+    lunarcrush_data_json_str = "{}"
+    if lunarcrush_data:
+        import json
+        lunarcrush_data_json_str = json.dumps(lunarcrush_data)
+
+    try:
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO ai_snapshots (
+                created_at,
+                pair,
+                aggregator_interval_secs,
+                stop_loss_pct,
+                take_profit_pct,
+                daily_drawdown_limit,
+                price_changes_json,
+                last_price,
+                lunarcrush_data_json,
+                coin_volatility,
+                is_market_bullish,
+                risk_estimate,
+                notes
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            now_ts,
+            pair,
+            aggregator_interval_secs,
+            stop_loss_pct,
+            take_profit_pct,
+            daily_drawdown_limit,
+            price_changes_json_str,
+            last_price,
+            lunarcrush_data_json_str,
+            coin_volatility,
+            is_market_bullish,
+            risk_estimate,
+            notes
+        ))
+        conn.commit()
+        logger.info(f"[DB] Inserted ai_snapshot => pair={pair}, last_price={last_price}")
+    except Exception as e:
+        logger.exception(f"[DB] Error storing ai_snapshot => {e}")
     finally:
         conn.close()
 
