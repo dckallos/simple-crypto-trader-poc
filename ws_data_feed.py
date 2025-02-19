@@ -12,29 +12,21 @@ Implements two separate WebSocket client classes:
    - Subscribes to public market data feeds like "ticker" or "trade"
    - Saves price data in 'price_history' via store_price_history(...).
    - (OPTIONALLY) could call your risk_manager.on_price_update(...), but
-     we're removing that direct call now so your RiskManager can derive
-     prices from the DB on its own schedule.
+     we keep that in the RiskManager's own background DB cycle.
+   - Does *not* place trades—only receives data.
 
 2) KrakenPrivateWSClient:
    - Connects to wss://ws-auth.kraken.com
    - Subscribes to private feeds ("openOrders", "ownTrades", etc.)
-   - Can place/cancel orders
-   - Requires an API token from Kraken’s REST call to GetWebSocketsToken
-   - We record final fills in the 'trades' table (via ownTrades). We do not
-     maintain sub-positions here. Daily PnL or stop-loss is delegated to
-     your RiskManager or aggregator logic.
-
-Usage:
-   - For public feed:
-       public_ws = KrakenPublicWSClient(pairs=["ETH/USD","XBT/USD"], feed_type="ticker")
-       public_ws.start()
-   - For private feed:
-       private_ws = KrakenPrivateWSClient(token=..., risk_manager=...)
-       private_ws.start()
+   - Can place/cancel orders (via send_order, cancel_order)
+   - Requires an API token from Kraken’s /0/private/GetWebSocketsToken
+   - Records final fills in the 'trades' table (via ownTrades or order closures).
+   - Optionally calls risk_manager if we want to confirm partial-lot changes, etc.
 
 Db interactions:
-   - price_history: store real-time ticker/trade updates
-   - pending_trades/trades: final order fills and ephemeral states
+ - price_history: store real-time ticker/trade updates
+ - pending_trades/trades: track ephemeral states & final fills
+ - Possibly updates lot status in risk_manager on SELL fill
 """
 
 import ssl
@@ -85,12 +77,12 @@ class KrakenPublicWSClient:
     Subscribes to "ticker" or "trade" channels and continuously receives live market data.
 
     Key responsibilities:
-      - Maintaining a connection to Kraken's public feed(s).
-      - Storing the incoming data to 'price_history' table (via store_price_history).
-      - Optionally calling a callback (like on_ticker_callback) for user logic.
+      - Maintain a connection to Kraken's public feed(s).
+      - Store the incoming data to 'price_history' (via store_price_history).
+      - Optionally call a user-supplied callback (on_ticker_callback) for each new ticker.
 
-    In this version, we do *not* call risk_manager.on_price_update() from here,
-    because we've moved that logic into the RiskManager's own background DB cycle.
+    We do NOT call risk_manager.on_price_update() here. The RiskManager
+    does that by polling the DB on its own schedule.
     """
 
     def __init__(
@@ -109,7 +101,7 @@ class KrakenPublicWSClient:
         self.feed_type = feed_type
         self.on_ticker_callback = on_ticker_callback
 
-        # If you wanted risk_manager references, you can set them externally.
+        # Optional references
         self.risk_manager = None
         self.kraken_balances = None
 
@@ -121,8 +113,9 @@ class KrakenPublicWSClient:
 
     def start(self):
         """
-        Start the WebSocket client in a background thread. Once started, it attempts to
-        connect, subscribe, and process messages from Kraken until 'stop()' is called.
+        Start the WebSocket client in a background thread.
+        Once started, it attempts to connect, subscribe, and process messages
+        from Kraken until 'stop()' is called.
         """
         if self.running:
             logger.warning("KrakenPublicWSClient is already running => skipping start.")
@@ -151,8 +144,9 @@ class KrakenPublicWSClient:
 
     def _run_async_loop(self):
         """
-        Private method that runs in the background thread. Creates an asyncio loop,
-        attempts to connect, and consumes messages until 'stop()' is signaled.
+        Private method that runs in the background thread.
+        Creates an asyncio loop, attempts to connect, and consumes messages
+        until 'stop()' is signaled.
         """
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
@@ -168,9 +162,9 @@ class KrakenPublicWSClient:
         """
         The main async routine:
           - connect to wss://ws.kraken.com
-          - subscribe to your chosen channels
+          - subscribe to the chosen feed (ticker or trade)
           - read messages
-          - if disconnected, retry after 5s
+          - on disconnection or error => retry after 5s
         """
         while self.running:
             try:
@@ -181,9 +175,11 @@ class KrakenPublicWSClient:
 
                     # subscribe to the channels
                     await self._subscribe(ws)
-                    # read messages until a disconnection or stop
+
+                    # read messages until a disconnection or 'stop'
                     await self._consume_messages(ws)
-                    # if we exit the consume loop, reset self._ws
+
+                    # if we exit => reset
                     self._ws = None
 
             except Exception as e:
@@ -198,7 +194,7 @@ class KrakenPublicWSClient:
 
     async def _subscribe(self, ws):
         """
-        Subscribe to a particular feed_type ("ticker" or "trade") for your pairs.
+        Subscribe to "ticker" or "trade" feeds for the given pairs.
         """
         sub_data = {
             "event": "subscribe",
@@ -217,7 +213,7 @@ class KrakenPublicWSClient:
                 msg = await ws.recv()
                 await self._handle_message(msg)
             except websockets.exceptions.ConnectionClosed:
-                logger.warning("[PublicWS] Connection closed => break out of consume loop")
+                logger.warning("[PublicWS] Connection closed => stopping read loop.")
                 break
             except Exception as ex:
                 logger.exception(f"[PublicWS] Error in consume => {ex}")
@@ -225,8 +221,8 @@ class KrakenPublicWSClient:
 
     async def _handle_message(self, raw_msg: str):
         """
-        Parse the incoming JSON. If it's a system-level event, handle that.
-        Otherwise, route 'ticker' or 'trade' data to the relevant method.
+        Parse the incoming JSON. System-level messages (heartbeat, subscriptionStatus, etc.)
+        get logged or ignored. Ticker or trade updates get passed along.
         """
         try:
             data = json.loads(raw_msg)
@@ -234,8 +230,8 @@ class KrakenPublicWSClient:
             logger.error(f"[PublicWS] JSON parse error => {raw_msg}")
             return
 
+        # If data is a dict, it might be a system event
         if isinstance(data, dict):
-            # Might be "subscriptionStatus", "systemStatus", "heartbeat", etc.
             event = data.get("event")
             if event in ["subscribe", "subscriptionStatus", "heartbeat", "systemStatus"]:
                 logger.debug(f"[PublicWS] System event => {data}")
@@ -243,7 +239,7 @@ class KrakenPublicWSClient:
                 logger.debug(f"[PublicWS] Unhandled dict => {data}")
             return
 
-        # If it's a list => typically => [channelID, payload, feed_name, pair]
+        # If data is a list => typically => [channelID, payload, feed_name, pair]
         if isinstance(data, list):
             if len(data) < 4:
                 logger.debug(f"[PublicWS] short data => {data}")
@@ -260,8 +256,7 @@ class KrakenPublicWSClient:
     async def _handle_ticker(self, ticker_update: dict, pair: str):
         """
         For "ticker" updates => parse ask/bid/last/volume => store in price_history.
-        Then call on_ticker_callback if any. We do *not* call risk_manager here,
-        since your new approach is for the risk_manager to read from DB on its own schedule.
+        Then optionally call on_ticker_callback.
         """
         ask_info = ticker_update.get("a", [])
         bid_info = ticker_update.get("b", [])
@@ -273,7 +268,7 @@ class KrakenPublicWSClient:
         last_price = float(last_info[0]) if last_info else 0.0
         volume_val = float(vol_info[0]) if vol_info else 0.0
 
-        # store in DB => 'price_history' table
+        # Store in DB => 'price_history'
         store_price_history(
             pair=pair,
             bid=bid_price,
@@ -286,15 +281,10 @@ class KrakenPublicWSClient:
         if self.on_ticker_callback and last_price > 0:
             self.on_ticker_callback(pair, last_price)
 
-        # NOTE: We do *not* call risk_manager.on_price_update(...) here.
-        # Instead, risk_manager handles it by reading from the DB.
-
     async def _handle_trade(self, trades_chunk, pair: str):
         """
         For 'trade' feed => each item => [price, volume, time, side, orderType, misc].
-        We can store these trade prices in 'price_history' if you want a record
-        (with last=trade_price, bid=0, ask=0). Typically you'd only store ticker data,
-        but if you want trades as well, do it here.
+        We'll store these as price_history rows with last=trade_price, volume=trade_volume.
         """
         for tr in trades_chunk:
             price_val = float(tr[0])
@@ -316,8 +306,8 @@ class KrakenPublicWSClient:
 class KrakenPrivateWSClient:
     """
     A WebSocket client dedicated to PRIVATE feeds from Kraken (wss://ws-auth.kraken.com).
-    Subscribes to openOrders, ownTrades, etc. We do not handle public feed logic here.
-    Orders/fills are recorded in 'pending_trades' and 'trades' as they occur.
+    Subscribes to openOrders, ownTrades, etc.
+    Orders/fills are tracked in 'pending_trades' and 'trades'.
     """
 
     def __init__(
@@ -327,9 +317,9 @@ class KrakenPrivateWSClient:
         risk_manager=None
     ):
         """
-        :param token: The token from REST => /0/private/GetWebSocketsToken
+        :param token: The API token from REST => /0/private/GetWebSocketsToken
         :param on_private_event_callback: optional callback for private events
-        :param risk_manager: optional RiskManager instance if you want to do daily drawdown checks, etc.
+        :param risk_manager: optional RiskManager instance for e.g. partial-lot updates
         """
         self.url_private = "wss://ws-auth.kraken.com"
         self.token = token
@@ -343,7 +333,7 @@ class KrakenPrivateWSClient:
         self._thread = None
 
     def start(self):
-        """Spins up a thread that runs an asyncio loop => connect => subscribe => read messages."""
+        """Start the Private WS in a background thread => connect => subscribe => read messages."""
         if self.running:
             logger.warning("KrakenPrivateWSClient is already running => skip.")
             return
@@ -354,7 +344,7 @@ class KrakenPrivateWSClient:
         logger.info("[KrakenPrivateWSClient] started => private feed.")
 
     def stop(self):
-        """Signals the loop to exit, then joins the background thread."""
+        """Stops the Private WS => signals exit => joins the thread."""
         if not self.running:
             logger.info("[KrakenPrivateWSClient] Not running or already stopped.")
             return
@@ -376,7 +366,7 @@ class KrakenPrivateWSClient:
             self.loop.close()
 
     async def _main_loop(self):
-        """Attempt to connect => subscribe => read messages => if disconnected, retry in 5s."""
+        """Connect => subscribe => read messages => if disconnected, retry in 5s until stopped."""
         while self.running:
             try:
                 logger.info("[PrivateWS] Connecting to wss://ws-auth.kraken.com ...")
@@ -404,7 +394,7 @@ class KrakenPrivateWSClient:
             logger.warning("[PrivateWS] No token => cannot subscribe.")
             return
 
-        # 1) openOrders
+        # 1) openOrders subscription
         msg_open = {
             "event": "subscribe",
             "subscription": {
@@ -415,7 +405,7 @@ class KrakenPrivateWSClient:
         await ws.send(json.dumps(msg_open))
         logger.info("[PrivateWS] subscribed => openOrders")
 
-        # 2) ownTrades
+        # 2) ownTrades subscription
         msg_trades = {
             "event": "subscribe",
             "subscription": {
@@ -434,7 +424,7 @@ class KrakenPrivateWSClient:
                 raw_msg = await ws.recv()
                 await self._handle_message(raw_msg)
             except websockets.exceptions.ConnectionClosed:
-                logger.warning("[PrivateWS] Connection closed => break loop")
+                logger.warning("[PrivateWS] Connection closed => break loop.")
                 break
             except Exception as e:
                 logger.exception(f"[PrivateWS] => {e}")
@@ -442,8 +432,7 @@ class KrakenPrivateWSClient:
 
     async def _handle_message(self, raw_msg: str):
         """
-        Handles any private feed messages:
-          - addOrderStatus, cancelOrderStatus, openOrders, ownTrades, etc.
+        Handles private feed messages: openOrders, ownTrades, addOrderStatus, etc.
         """
         try:
             data = json.loads(raw_msg)
@@ -451,6 +440,7 @@ class KrakenPrivateWSClient:
             logger.error(f"[PrivateWS] JSON parse error => {raw_msg}")
             return
 
+        # Possibly system events
         if isinstance(data, dict):
             ev = data.get("event")
             if ev in ["subscriptionStatus", "heartbeat", "systemStatus"]:
@@ -461,12 +451,11 @@ class KrakenPrivateWSClient:
                 self.on_private_event_callback(data)
             return
 
-        # If data is a list => e.g. [ [some data], "ownTrades", {...} ]
+        # If data is a list => e.g. [someList, "ownTrades", {...}] or [someList, "openOrders", {...}]
         if isinstance(data, list):
             if len(data) < 2:
                 logger.debug(f"[PrivateWS] short data => {data}")
                 return
-
             feed_name = data[1]
             if feed_name == "openOrders":
                 self._process_open_orders(data[0])
@@ -481,7 +470,7 @@ class KrakenPrivateWSClient:
     def _process_private_order_message(self, msg: dict):
         """
         Called when we get addOrderStatus or cancelOrderStatus or error messages.
-        We only update 'pending_trades', do not finalize actual trade fills here.
+        We'll update 'pending_trades' accordingly. Actual fills happen in ownTrades or by final closure.
         """
         event_type = msg.get("event", "")
         if event_type != "addOrderStatus":
@@ -500,8 +489,9 @@ class KrakenPrivateWSClient:
             vol_exec = float(msg.get("vol_exec", "0.0"))
             avg_price = float(msg.get("avg_price", "0.0"))
             fee_val = float(msg.get("fee", "0.0"))
+
             if vol_exec == 0:
-                # fully unfilled => reject
+                # fully unfilled => just mark rejected
                 mark_pending_trade_rejected_by_kraken_id(txid, status_str)
             else:
                 # partial => final close
@@ -515,15 +505,18 @@ class KrakenPrivateWSClient:
         elif status_str == "ok":
             # order accepted
             if userref:
-                set_kraken_order_id_for_pending_trade(int(userref), txid)
+                try:
+                    set_kraken_order_id_for_pending_trade(int(userref), txid)
+                except ValueError:
+                    logger.warning(f"[PrivateWS] userref not an int => {userref}")
             mark_pending_trade_open_by_kraken_id(txid)
         else:
-            logger.debug(f"[PrivateWS] addOrderStatus => {txid}, status={status_str}")
+            logger.debug(f"[PrivateWS] addOrderStatus => {txid}, status={status_str} => ignoring.")
 
     def _process_open_orders(self, order_chunk):
         """
         openOrders feed => [ { txid: {...} }, ...]
-        We only manage 'pending_trades'. Actual trade fills come from 'ownTrades'.
+        We'll keep 'pending_trades' in sync. Final fills come from ownTrades.
         """
         if not isinstance(order_chunk, list):
             return
@@ -537,31 +530,34 @@ class KrakenPrivateWSClient:
                 vol_exec_str = info.get("vol_exec", "0.0")
                 vol_exec = float(vol_exec_str)
 
-                # --- NEW: record kraken_order_id in pending trades ---
+                # If we can link userref => pending_id
                 if userref:
                     try:
                         set_kraken_order_id_for_pending_trade(int(userref), txid)
                         logger.debug(f"[PrivateWS] Mapped userref={userref} -> kraken_order_id={txid}")
                     except ValueError:
-                        logger.warning(f"[PrivateWS] userref is not an int? userref={userref}")
+                        logger.warning(f"[PrivateWS] userref is not int => {userref}")
 
                 if status_str in ("canceled", "expired"):
                     if vol_exec == 0:
+                        # no fills => treat as rejected
                         mark_pending_trade_rejected_by_kraken_id(txid, status_str)
                     else:
+                        # partial fill => finalize
                         self._finalize_trade_from_kraken(txid, vol_exec, 0.0, 0.0)
                 elif status_str == "closed":
                     self._finalize_trade_from_kraken(txid, vol_exec, 0.0, 0.0)
                 elif status_str == "open":
                     mark_pending_trade_open_by_kraken_id(txid)
                 else:
-                    logger.debug(f"[PrivateWS] order_id={txid}, status={status_str}, ignoring.")
+                    logger.debug(f"[PrivateWS] openOrders => order_id={txid}, status={status_str}, ignoring.")
 
     def _process_own_trades(self, trades_chunk):
         """
         ownTrades => actual fills.
-        Each item => { trade_id: {"type":"buy","vol":"0.01","pair":"ETH/USD","price":"1800.00", ...} }.
+        Each item => { 'TRADE_ID': {"type":"buy","vol":"0.01","pair":"ETH/USD","price":"1800.00", ...} }.
         We'll parse and call _store_own_trade_if_new(...) with all parameters.
+        We may store exchange_fill_time if 'time' is available.
         """
         if not isinstance(trades_chunk, list):
             return
@@ -571,20 +567,25 @@ class KrakenPrivateWSClient:
                 continue
 
             for trade_id, trade_obj in item.items():
-                # Extract fields from trade_obj
-                side_str = trade_obj.get("type", "").upper()  # "BUY" or "SELL"
+                # Example fields => "type", "vol", "pair", "price", "fee", "time"
+                side_str = trade_obj.get("type", "").upper()  # "BUY" / "SELL"
                 pair_str = trade_obj.get("pair", "UNKNOWN")
                 vol_str = trade_obj.get("vol", "0.0")
                 px_str = trade_obj.get("price", "0.0")
                 fee_str = trade_obj.get("fee", "0.0")
 
-                # Convert numeric strings
                 quantity = float(vol_str)
                 fill_price = float(px_str)
                 fill_fee = float(fee_str)
 
-                # Optionally parse 'time', but we can get a timestamp from time.time() if we want.
-                # time_float = float(trade_obj.get("time", "0"))  # if needed
+                # If we want to store the exchange-provided fill time:
+                # It's often a float epoch, e.g. 1675797060.1234
+                exchange_fill_time = None
+                if "time" in trade_obj:
+                    try:
+                        exchange_fill_time = int(float(trade_obj["time"]))
+                    except:
+                        pass
 
                 self._store_own_trade_if_new(
                     trade_id=trade_id,
@@ -593,8 +594,9 @@ class KrakenPrivateWSClient:
                     quantity=quantity,
                     fill_price=fill_price,
                     fee=fill_fee,
-                    source=None,  # or fill from somewhere if available
-                    rationale=None  # or fill from somewhere if available
+                    source=None,   # We'll override from pending_trades if found
+                    rationale=None, # We'll override from pending_trades if found
+                    exchange_fill_time=exchange_fill_time
                 )
 
     def _store_own_trade_if_new(
@@ -606,64 +608,60 @@ class KrakenPrivateWSClient:
             fill_price: float,
             fee: float,
             source: str = None,
-            rationale: str = None
+            rationale: str = None,
+            exchange_fill_time: int = None
     ):
         """
         Insert a new row into 'trades' if we haven't inserted this trade_id yet.
 
-        Additionally:
-          1) We'll look up 'source' and 'rationale' in the 'pending_trades' table
-             (matching kraken_order_id = trade_id).
-          2) If found, we override the 'source' or 'rationale' parameters with those
-             from the pending_trades table, unless they're None there as well.
-          3) Then we insert into 'trades' with the final source/rationale.
-
-        :param trade_id: The unique Kraken trade ID or order ID
-        :param side: "BUY" or "SELL"
-        :param pair: e.g. "ETH/USD"
-        :param quantity: how many coins filled
-        :param fill_price: the fill price
-        :param fee: total fee
-        :param source: e.g. "ai_strategy" or "risk_manager" — overridden if found in pending_trades
-        :param rationale: e.g. GPT text or "stop-loss" / "take-profit" — overridden if found
+        Steps:
+          1) Check if 'trades' already has this order_id=trade_id => skip if so.
+          2) If not, look up 'pending_trades' (kraken_order_id=trade_id) =>
+             retrieve (lot_id, source, rationale).
+          3) Insert final row in 'trades' with these extended fields:
+               - lot_id
+               - source
+               - rationale (or any 'ai_rationale' if you want)
+               - exchange_fill_time
         """
         conn = sqlite3.connect("trades.db")
         try:
             c = conn.cursor()
 
-            # 1) Check if we've already inserted this trade_id => skip
+            # 1) Already exist?
             c.execute("""
-                SELECT id
-                FROM trades
+                SELECT id FROM trades
                 WHERE order_id=?
                 LIMIT 1
             """, (trade_id,))
             row = c.fetchone()
             if row:
-                return  # Already recorded => exit early
+                return  # already recorded
 
-            # 2) Attempt to fetch source, rationale from pending_trades if they exist
+            # 2) Attempt to fetch lot_id, source, rationale from pending_trades
             c.execute("""
-                SELECT source, rationale
+                SELECT lot_id, source, rationale
                 FROM pending_trades
                 WHERE kraken_order_id=?
                 LIMIT 1
             """, (trade_id,))
             pend_row = c.fetchone()
+            lot_id = None
             if pend_row:
-                pending_source, pending_rationale = pend_row
-                # Only override if they exist
+                lot_id, pending_source, pending_rationale = pend_row
                 if pending_source is not None:
                     source = pending_source
                 if pending_rationale is not None:
                     rationale = pending_rationale
 
-            # 3) Insert new row into 'trades' with final source/rationale
-            ts = int(time.time())  # or parse real fill-time if you like
+            # 3) Insert into 'trades', using extended columns.
+            ts_local = int(time.time())  # local insertion time
+            # realized_pnl => set to NULL until realized is calculated
+            # also store 'exchange_fill_time' if present
 
             c.execute("""
                 INSERT INTO trades (
-                    timestamp,
+                    timestamp,        -- local insertion time
                     pair,
                     side,
                     quantity,
@@ -672,11 +670,14 @@ class KrakenPrivateWSClient:
                     fee,
                     realized_pnl,
                     source,
-                    rationale
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                    rationale,
+                    lot_id,
+                    ai_rationale,
+                    exchange_fill_time
+                ) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
             """, (
-                ts,
+                ts_local,
                 pair,
                 side,
                 quantity,
@@ -684,24 +685,31 @@ class KrakenPrivateWSClient:
                 trade_id,
                 fee,
                 source,
-                rationale
+                rationale,
+                lot_id,
+                rationale,  # or store separately if you want a different ai_rationale
+                exchange_fill_time
             ))
             conn.commit()
 
             logger.info(
                 f"[PrivateWS] Inserted new fill => trade_id={trade_id}, side={side}, "
-                f"qty={quantity}, px={fill_price}, source={source}, rationale={rationale}"
+                f"qty={quantity}, px={fill_price}, fee={fee}, lot_id={lot_id}, source={source}"
             )
+
+            # Optionally we can do risk_manager callback, but typically we rely on finalize or
+            # on_pending_trade_closed for that. So we skip here.
 
         except Exception as e:
             logger.exception(f"[PrivateWS] Error inserting ownTrades => {e}")
         finally:
             conn.close()
 
-    def send_order(self, pair: str, side: str, ordertype: str, volume: float, price: float = None, userref: int = None):
+    def send_order(self, pair: str, side: str, ordertype: str, volume: float,
+                   price: float = None, userref: int = None):
         """
-        e.g. self.send_order("XBT/USD", "buy", "market", 0.01)
-        This triggers an 'addOrder' event => 'addOrderStatus' to confirm success or error.
+        e.g. send_order("XBT/USD", "buy", "market", 0.01)
+        Triggers 'addOrder' => 'addOrderStatus' for confirmation.
         """
         if not self.token:
             logger.warning("[PrivateWS] No token => cannot place order.")
@@ -752,49 +760,43 @@ class KrakenPrivateWSClient:
         if self.loop:
             asyncio.run_coroutine_threadsafe(_cancel(), self.loop)
 
-    def _finalize_trade_from_kraken(self, kraken_order_id: str, filled_size: float, avg_fill_price: float, fee: float):
+    def _finalize_trade_from_kraken(self, kraken_order_id: str, filled_size: float,
+                                    avg_fill_price: float, fee: float):
         """
-        Called whenever an order is canceled/expired/closed => finalize pending_trades row.
-        Then we also let risk_manager know if there's a related lot.
-
-        1) Look up the pending_trades row (which includes source, rationale, etc.).
-        2) Mark it 'closed'.
-        3) Insert a final record into 'trades' via _store_own_trade_if_new(...) if it isn't inserted yet.
-           (Because ownTrades feed might also do it, but if it's partial fill we handle it here.)
-        4) If there's a lot_id => call risk_manager.on_pending_trade_closed(...).
+        Called if an order is canceled/expired/closed => finalize pending_trades
+        row. Insert final trade in `trades` if not yet inserted. Then, if we have
+        a lot_id => notify risk_manager.on_pending_trade_closed(...).
         """
         row = _fetch_pending_trade_by_kraken_id(kraken_order_id)
         if not row:
             logger.warning(f"[PrivateWS] No pending_trade row for kraken_order_id={kraken_order_id}")
             return
 
-        # row: (id, pair, side, requested_qty, lot_id, source, rationale)
+        # row => (id, pair, side, requested_qty, lot_id, source, rationale)
         pending_id = row[0]
         pair = row[1]
         side = row[2]
         requested_qty = row[3]
         lot_id = row[4]
-        source = row[5]  # "risk_manager" or "ai_strategy", etc.
-        rationale = row[6]  # "stop-loss", "take-profit", or GPT text, etc.
+        source = row[5]
+        rationale = row[6]
 
         reason = f"final fill size={filled_size}, fee={fee}"
         mark_pending_trade_closed(pending_id, reason=reason)
         logger.info(f"[PrivateWS] Marked pending_id={pending_id} closed => fill={filled_size}, fee={fee}")
 
-        # Insert row into `trades` if needed (with the new source/rationale).
-        # Usually, ownTrades feed also calls _store_own_trade_if_new. But if you want
-        # to force an entry here, you can do so. The typical approach is to rely on
-        # ownTrades to do the actual insertion. If you want them to definitely have source/rationale,
-        # we can do:
+        # Insert row into trades if not exist
+        # or call _store_own_trade_if_new so it also merges lot_id, source, rationale
         self._store_own_trade_if_new(
-            trade_id=kraken_order_id,  # we treat the Kraken ID as 'order_id'
+            trade_id=kraken_order_id,
             side=side,
             pair=pair,
             quantity=filled_size,
             fill_price=avg_fill_price,
             fee=fee,
             source=source,
-            rationale=rationale
+            rationale=rationale,
+            exchange_fill_time=None  # we do not have a direct time here in addOrderStatus
         )
 
         # If there's a lot => inform risk_manager
@@ -814,8 +816,6 @@ def _fetch_pending_trade_by_kraken_id(kraken_order_id: str):
     """
     Returns (id, pair, side, requested_qty, lot_id, source, rationale)
     from 'pending_trades' where kraken_order_id=?.
-
-    We fetch 'source' and 'rationale' so that final trades can store them.
     """
     conn = sqlite3.connect("trades.db")
     try:
@@ -839,9 +839,10 @@ def _fetch_pending_trade_by_kraken_id(kraken_order_id: str):
     finally:
         conn.close()
 
+
 def mark_pending_trade_open_by_kraken_id(kraken_order_id: str):
     """
-    If the order is accepted => pending_trades => status='open'.
+    If the order is accepted => set pending_trades.status='open'.
     """
     conn = sqlite3.connect("trades.db")
     try:
@@ -862,7 +863,7 @@ def mark_pending_trade_open_by_kraken_id(kraken_order_id: str):
 
 def mark_pending_trade_rejected_by_kraken_id(kraken_order_id: str, reason: str = None):
     """
-    If an order is rejected by Kraken, set status='rejected'.
+    If an order is rejected/canceled by Kraken, set status='rejected'.
     """
     conn = sqlite3.connect("trades.db")
     try:
@@ -874,7 +875,7 @@ def mark_pending_trade_rejected_by_kraken_id(kraken_order_id: str, reason: str =
         """, (reason, kraken_order_id))
         conn.commit()
         if c.rowcount < 1:
-            logger.debug(f"[PrivateWS] No pending row found with kraken_order_id={kraken_order_id} to reject.")
+            logger.debug(f"[PrivateWS] No pending_trades row found with kraken_order_id={kraken_order_id} => cannot reject.")
     except Exception as e:
         logger.exception(f"Error marking trade rejected => {e}")
     finally:
