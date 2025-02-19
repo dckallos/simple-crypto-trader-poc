@@ -1,10 +1,14 @@
+#!/usr/bin/env python3
 # =============================================================================
 # FILE: risk_manager.py
 # =============================================================================
 """
-Production version of risk_manager.py with adjustments to avoid leaving dust
-positions below the exchange minimum, and ensure all BUY trades exceed the
-minimum purchase cost (in USD).
+Production version of risk_manager.py with new logic:
+ - Replaces has_sold_in_between with lot_status text column (ACTIVE, PENDING_SELL, PARTIAL_SOLD, CLOSED).
+ - Persists additional fields (origin_source, strategy_version, risk_params_json, time_closed).
+ - Adds a new 'stop_loss_events' table to log each SL trigger.
+ - Removes the unconditional DELETE in rebuild_lots_from_ledger_entries, supporting a more "incremental" approach.
+ - Adds lightweight migrations for both holding_lots and trades to store new columns.
 """
 
 import logging
@@ -27,54 +31,175 @@ logger.setLevel(logging.INFO)
 
 DB_FILE = "trades.db"  # Path to your SQLite DB file
 
-
 # ------------------------------------------------------------------------------
-# Utility to initialize 'holding_lots' table
+# Utility: Initialize or migrate 'holding_lots' and 'stop_loss_events'
 # ------------------------------------------------------------------------------
 
 def init_holding_lots_table(db_path: str = DB_FILE) -> None:
     """
-    Ensures the holding_lots table exists in the SQLite database.
-    Each row represents a distinct “lot” of an asset purchased, with:
-      - purchase_price: Weighted cost basis (including fees) for this lot
-      - initial_quantity: Original quantity bought (used to limit partial T/P sells)
-      - quantity: Current quantity of this lot still open
-      - date_purchased: integer (epoch time)
-      - has_sold_in_between:
-           0 => future buys can merge cost basis
-           1 => partial sells, so no further merges
-           2 => pending a SELL (we won't re-trigger on_price_update)
+    Ensures the holding_lots table exists, and adds new columns if missing:
+      - lot_status (TEXT) => 'ACTIVE', 'PENDING_SELL', 'PARTIAL_SOLD', 'CLOSED'
+      - origin_source (TEXT) => e.g. 'gpt', 'manual'
+      - strategy_version (TEXT) => e.g. 'v1.0'
+      - risk_params_json (TEXT) => JSON snapshot of risk settings
+      - time_closed (INTEGER) => epoch when lot closed
+
+    We also remove references to has_sold_in_between in the schema,
+    or we keep it if it already exists. We'll do a migration approach.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        c = conn.cursor()
+        # Create table if not exists (the old version):
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS holding_lots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pair TEXT,
+            purchase_price REAL,
+            initial_quantity REAL,
+            quantity REAL,
+            date_purchased INTEGER
+            -- old column has_sold_in_between might exist from prior versions
+        )
+        """)
+
+        # Check columns, add them if missing:
+        existing_cols = _get_existing_columns(c, "holding_lots")
+
+        if "lot_status" not in existing_cols:
+            logger.info("[RiskManager] MIGRATION: adding column 'lot_status' to holding_lots.")
+            c.execute("ALTER TABLE holding_lots ADD COLUMN lot_status TEXT DEFAULT 'ACTIVE'")
+
+        if "origin_source" not in existing_cols:
+            logger.info("[RiskManager] MIGRATION: adding column 'origin_source' to holding_lots.")
+            c.execute("ALTER TABLE holding_lots ADD COLUMN origin_source TEXT")
+
+        if "strategy_version" not in existing_cols:
+            logger.info("[RiskManager] MIGRATION: adding column 'strategy_version' to holding_lots.")
+            c.execute("ALTER TABLE holding_lots ADD COLUMN strategy_version TEXT")
+
+        if "risk_params_json" not in existing_cols:
+            logger.info("[RiskManager] MIGRATION: adding column 'risk_params_json' to holding_lots.")
+            c.execute("ALTER TABLE holding_lots ADD COLUMN risk_params_json TEXT")
+
+        if "time_closed" not in existing_cols:
+            logger.info("[RiskManager] MIGRATION: adding column 'time_closed' to holding_lots.")
+            c.execute("ALTER TABLE holding_lots ADD COLUMN time_closed INTEGER")
+
+        conn.commit()
+
+        logger.info("[RiskManager] holding_lots table ensured with new columns.")
+    except Exception as exc:
+        logger.exception(f"[RiskManager] Error creating/migrating holding_lots => {exc}")
+    finally:
+        conn.close()
+
+
+def create_stop_loss_events_table(db_path: str = DB_FILE) -> None:
+    """
+    Creates a new table 'stop_loss_events' to log each time a stop-loss is triggered.
+    This can help you do analytics on how often your SL rules are firing.
+
+    Columns:
+      - id (PK)
+      - lot_id => references which lot triggered
+      - triggered_at => epoch time
+      - current_price => price at moment of trigger
+      - reason => free text
+      - risk_params_json => snapshot of relevant risk parameters
     """
     conn = sqlite3.connect(db_path)
     try:
         c = conn.cursor()
         c.execute("""
-        CREATE TABLE IF NOT EXISTS holding_lots (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          pair TEXT,
-          purchase_price REAL,
-          initial_quantity REAL,
-          quantity REAL,
-          date_purchased INTEGER,
-          has_sold_in_between INTEGER DEFAULT 0
+        CREATE TABLE IF NOT EXISTS stop_loss_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lot_id INTEGER,
+            triggered_at INTEGER,
+            current_price REAL,
+            reason TEXT,
+            risk_params_json TEXT
         )
         """)
         conn.commit()
-        logger.info("[RiskManager] holding_lots table ensured.")
-    except Exception as exc:
-        logger.exception(f"[RiskManager] Error creating holding_lots table => {exc}")
+        logger.info("[RiskManager] stop_loss_events table ensured.")
+    except Exception as e:
+        logger.exception(f"[RiskManager] Error creating stop_loss_events => {e}")
+    finally:
+        conn.close()
+
+
+def _get_existing_columns(cursor: sqlite3.Cursor, table_name: str) -> List[str]:
+    """
+    Utility: return a list of column names for a given table.
+    """
+    cursor.execute(f"PRAGMA table_info({table_name})")
+    rows = cursor.fetchall()
+    return [row[1] for row in rows]
+
+
+# ------------------------------------------------------------------------------
+# Utility: Migrate trades table for extended columns
+# ------------------------------------------------------------------------------
+
+def _maybe_migrate_trades_table(db_path: str) -> None:
+    """
+    Checks for new columns in 'trades' and adds them if missing:
+      - lot_id (INTEGER)
+      - ai_model (TEXT)
+      - source_config (TEXT) => to store JSON risk config
+      - ai_rationale (TEXT)
+      - exchange_fill_time (INTEGER) => actual fill time from the exchange
+      - trade_metrics_json (TEXT) => e.g. storing peak adverse excursion, etc.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        c = conn.cursor()
+        existing_cols = _get_existing_columns(c, "trades")
+
+        if "lot_id" not in existing_cols:
+            logger.info("[RiskManager] MIGRATION: adding column 'lot_id' to trades.")
+            c.execute("ALTER TABLE trades ADD COLUMN lot_id INTEGER")
+
+        if "ai_model" not in existing_cols:
+            logger.info("[RiskManager] MIGRATION: adding column 'ai_model' to trades.")
+            c.execute("ALTER TABLE trades ADD COLUMN ai_model TEXT")
+
+        if "source_config" not in existing_cols:
+            logger.info("[RiskManager] MIGRATION: adding column 'source_config' to trades.")
+            c.execute("ALTER TABLE trades ADD COLUMN source_config TEXT")
+
+        if "ai_rationale" not in existing_cols:
+            logger.info("[RiskManager] MIGRATION: adding column 'ai_rationale' to trades.")
+            c.execute("ALTER TABLE trades ADD COLUMN ai_rationale TEXT")
+
+        if "exchange_fill_time" not in existing_cols:
+            logger.info("[RiskManager] MIGRATION: adding column 'exchange_fill_time' to trades.")
+            c.execute("ALTER TABLE trades ADD COLUMN exchange_fill_time INTEGER")
+
+        if "trade_metrics_json" not in existing_cols:
+            logger.info("[RiskManager] MIGRATION: adding column 'trade_metrics_json' to trades.")
+            c.execute("ALTER TABLE trades ADD COLUMN trade_metrics_json TEXT")
+
+        conn.commit()
+    except Exception as e:
+        logger.exception(f"[RiskManager] Error migrating trades table => {e}")
     finally:
         conn.close()
 
 
 # ------------------------------------------------------------------------------
-# RiskManagerDB
+# Primary Class: RiskManagerDB
 # ------------------------------------------------------------------------------
+
 class RiskManagerDB:
     """
     The core class for stop-loss / take-profit logic, plus the new rules:
       1. Force all BUY orders to exceed the exchange's minimum cost in USD
-      2. If a partial SELL would leave leftover < 110% of the min. order size, SELL the entire stake.
+      2. If partial SELL leftover is < 110% of exchange min order, SELL it all
+      3. Replaces old integer-based 'has_sold_in_between' with 'lot_status' text
+      4. Logs stop-loss triggers to 'stop_loss_events'
+      5. Single final PnL on fully closed lots
     """
 
     def __init__(
@@ -89,7 +214,7 @@ class RiskManagerDB:
         """
         :param db_path: Path to SQLite DB
         :param max_position_size: Hard clamp on number of coins per trade
-        :param max_daily_drawdown: e.g. -0.02 => if realized daily PnL < -2%, do not allow new BUYs
+        :param max_daily_drawdown: e.g. -0.02 => if realized daily PnL < -2%, skip new BUYs
         :param initial_spending_account: A simple budget cap if desired
         :param private_ws_client: e.g. KrakenPrivateWSClient
         :param place_live_orders: if True => we call private_ws_client.send_order(...) after new SL/TP SELL
@@ -105,23 +230,26 @@ class RiskManagerDB:
 
     def initialize(self) -> None:
         """
-        Ensures the 'trades' and 'holding_lots' tables exist.
+        Ensures the trades + holding_lots + stop_loss_events are up-to-date.
+        Also runs migrations to add new columns if they don’t exist.
         """
+        # 1) Ensure trades table
         conn = sqlite3.connect(self.db_path)
         try:
             c = conn.cursor()
             c.execute("""
             CREATE TABLE IF NOT EXISTS trades (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              timestamp INTEGER,
-              kraken_trade_id TEXT,
-              pair TEXT,
-              side TEXT,
-              quantity REAL,
-              price REAL,
-              order_id TEXT,
-              fee REAL DEFAULT 0,
-              realized_pnl REAL
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER,
+                kraken_trade_id TEXT,
+                pair TEXT,
+                side TEXT,
+                quantity REAL,
+                price REAL,
+                order_id TEXT,
+                fee REAL DEFAULT 0,
+                realized_pnl REAL
+                -- new columns get added below with migration
             )
             """)
             conn.commit()
@@ -131,32 +259,37 @@ class RiskManagerDB:
         finally:
             conn.close()
 
+        # 2) Migrate trades for new columns (lot_id, ai_model, etc.)
+        _maybe_migrate_trades_table(self.db_path)
+
+        # 3) holding_lots => ensure + migrate
         init_holding_lots_table(self.db_path)
 
+        # 4) create stop_loss_events
+        create_stop_loss_events_table(self.db_path)
+
     # ----------------------------------------------------------------------
-    # 1) Start an async loop that calls on_price_update(...) from DB prices
+    # 1) Price-check cycle
     # ----------------------------------------------------------------------
     async def start_db_price_check_cycle(
         self,
         pairs: List[str]
     ):
         """
-        An asynchronous loop that does the following forever:
-          1) Waits 30s after initialization to ensure private feed is connected
-          2) For each pair in 'pairs':
-             - query price_history => find the newest row => get 'last_price'
-             - call on_price_update(pair, that_price, <balances dict>)
-          3) Sleep for 'interval' seconds
-          4) Repeat
+        An asynchronous loop that:
+         - Waits some time for private feed
+         - For each pair, reads the last price from DB
+         - Calls on_price_update => check SL/TP
+         - Sleeps for 'interval' seconds
+         - Repeats until canceled
         """
         import asyncio
 
         dynamic_interval = ConfigLoader.get_value("risk_manager_interval_seconds", 30.0)
         logger.debug(f"[RiskManager] Sleeping for {dynamic_interval} seconds.")
 
-        # Delay after init to ensure private feed is connected, etc.
+        # Delay to ensure private feed is connected
         logger.info("[RiskManager] Delaying 30 seconds after init before first price check.")
-
         initial_risk_manager_sleep = ConfigLoader.get_value("initial_risk_manager_sleep_seconds", 30.0)
         await asyncio.sleep(initial_risk_manager_sleep)
         logger.info("[RiskManager] Proceeding with price check cycle now.")
@@ -179,12 +312,11 @@ class RiskManagerDB:
             except Exception as e:
                 logger.exception(f"[RiskManager] DB price check cycle => error => {e}")
 
-            # 2) Sleep using *live* config
             dynamic_interval = ConfigLoader.get_value("risk_manager_interval_seconds", 30.0)
             logger.debug(f"[RiskManager] Sleeping for {dynamic_interval} seconds.")
             await asyncio.sleep(dynamic_interval)
 
-    logger.info("[RiskManager] price_check_cycle has exited.")
+        logger.info("[RiskManager] price_check_cycle has exited.")
 
     def _fetch_latest_price_for_pair(self, pair: str) -> float:
         """
@@ -211,6 +343,9 @@ class RiskManagerDB:
         finally:
             conn.close()
 
+    # ----------------------------------------------------------------------
+    # 2) on_price_update => check SL/TP => create SELL if triggered
+    # ----------------------------------------------------------------------
     def on_price_update(
         self,
         pair: str,
@@ -220,19 +355,8 @@ class RiskManagerDB:
         take_profit_pct: float = ConfigLoader.get_value("take_profit_percent", 0.02)
     ):
         """
-        For each open lot of `pair`, check if current_price triggers a stop-loss or take-profit.
-        If triggered, we:
-          - Create a SELL 'pending_trade' row with `lot_id` and also store source/rationale:
-              source="risk_manager", rationale="stop-loss" or "take-profit"
-          - Then ONLY if we successfully placed the Kraken order do we mark that lot
-            as "pending sell" (has_sold_in_between=2). If the private feed is not
-            connected, we skip marking the lot and will try again in the next cycle.
-
-        :param pair: e.g. "ETH/USD"
-        :param current_price: The latest known price for 'pair'
-        :param kraken_balances: A dict of user balances (unused here, but provided for future logic)
-        :param stop_loss_pct: e.g. 0.05 => 5% below cost basis triggers stop-loss
-        :param take_profit_pct: e.g. 0.02 => 2% above cost basis triggers take-profit
+        Checks each open lot => if SL or TP triggered => place SELL => set lot_status='PENDING_SELL'.
+        Also logs to stop_loss_events if a SL is triggered.
         """
         lots = self._load_lots_for_pair(pair)
         if not lots:
@@ -240,28 +364,28 @@ class RiskManagerDB:
 
         for lot in lots:
             lot_id = lot["id"]
-            lot_price = lot["purchase_price"]
-            lot_qty = lot["quantity"]
-            init_qty = lot["initial_quantity"]
-            has_sold_flag = lot["has_sold_in_between"]
+            lot_price = float(lot["purchase_price"])
+            lot_qty = float(lot["quantity"])
+            init_qty = float(lot["initial_quantity"])
+            lot_status = lot.get("lot_status", "ACTIVE")
 
-            # Skip empty or pending-sell lots
-            if lot_qty <= 0 or has_sold_flag == 2:
+            if lot_qty <= 0 or lot_status == "PENDING_SELL" or lot_status == "CLOSED":
+                # skip if empty or already pending sell or closed
                 continue
 
-            # -----------------------------
             # STOP LOSS
-            # -----------------------------
-            if current_price <= lot_price * (1.0 - stop_loss_pct):
+            if stop_loss_pct > 0.0 and current_price <= lot_price * (1.0 - stop_loss_pct):
                 reason = f"STOP_LOSS triggered at price={current_price:.4f}"
                 logger.info(f"[RiskManager] Stop-loss => lot_id={lot_id}, SELL all {lot_qty:.4f} of {pair}")
+
+                self._record_stop_loss_event(lot_id, current_price, reason)
 
                 min_order_size = db_lookup.get_ordermin(pair)
                 if lot_qty < min_order_size:
                     logger.warning(
-                        f"[RiskManager] lot_id={lot_id} => SELL qty={lot_qty:.4f} below exchange min={min_order_size:.4f}. Skipping..."
+                        f"[RiskManager] lot_id={lot_id} => SELL qty={lot_qty:.4f} below exch min={min_order_size:.4f}. Skipping..."
                     )
-                    # Optionally mark this lot as dust if you'd rather not keep it
+                    # optionally mark as dust or do some other fallback
                     continue
 
                 pending_id = create_pending_trade(
@@ -276,18 +400,16 @@ class RiskManagerDB:
                 if success:
                     self._mark_lot_as_pending_sell(lot_id)
                 else:
-                    logger.warning("[RiskManager] Private feed not open => skipping mark 'pending sell'. Will retry next cycle.")
+                    logger.warning("[RiskManager] Private feed not open => skipping => will retry next cycle.")
                 continue
 
-            # -----------------------------
             # TAKE PROFIT
-            # -----------------------------
-            if current_price >= lot_price * (1.0 + take_profit_pct):
+            if take_profit_pct > 0.0 and current_price >= lot_price * (1.0 + take_profit_pct):
                 # Proposed partial sale
                 sell_size = min(init_qty, lot_qty)
                 min_order_size = db_lookup.get_ordermin(pair)
 
-                # ## CHANGED: If leftover < 1.1 * min_order_size => sell full lot
+                # If leftover < 1.1 x min_order => sell entire lot
                 leftover = lot_qty - sell_size
                 if leftover > 0 and leftover < (1.1 * min_order_size):
                     logger.info(
@@ -297,9 +419,8 @@ class RiskManagerDB:
 
                 if sell_size < min_order_size:
                     logger.warning(
-                        f"[RiskManager] lot_id={lot_id} => SELL qty={sell_size:.4f} below exchange min={min_order_size:.4f}. Skipping..."
+                        f"[RiskManager] lot_id={lot_id} => SELL qty={sell_size:.4f} below exch min={min_order_size:.4f}. Skipping..."
                     )
-                    # Optionally mark this lot as dust if you'd rather not keep it
                     continue
 
                 reason = f"TAKE_PROFIT triggered at price={current_price:.4f}"
@@ -317,29 +438,38 @@ class RiskManagerDB:
                 if success:
                     self._mark_lot_as_pending_sell(lot_id)
                 else:
-                    logger.warning("[RiskManager] Private feed not open => skipping mark 'pending sell'. Will retry next cycle.")
+                    logger.warning("[RiskManager] Private feed not open => skipping => will retry next cycle.")
 
-    def _mark_lot_as_pending_sell(self, lot_id: int):
+    def _record_stop_loss_event(self, lot_id: int, current_price: float, reason: str):
         """
-        Mark the lot as has_sold_in_between=2 so we don't re-trigger sells each cycle.
+        Insert a row in stop_loss_events table for analytics.
+        Potentially store risk_params_json with the current SL/TP config, if desired.
         """
+        risk_params_dict = {
+            "stop_loss_percent": ConfigLoader.get_value("stop_loss_percent", 0.05),
+            "take_profit_percent": ConfigLoader.get_value("take_profit_percent", 0.02),
+            "daily_drawdown_limit": self.max_daily_drawdown
+        }
+        import json
+        rp_json = json.dumps(risk_params_dict)
+
         conn = sqlite3.connect(self.db_path)
         try:
             c = conn.cursor()
             c.execute("""
-            UPDATE holding_lots
-            SET has_sold_in_between=2
-            WHERE id=?
-            """, (lot_id,))
+            INSERT INTO stop_loss_events (lot_id, triggered_at, current_price, reason, risk_params_json)
+            VALUES (?, ?, ?, ?, ?)
+            """, (lot_id, int(time.time()), current_price, reason, rp_json))
             conn.commit()
-            logger.info(f"[RiskManager] Marked lot_id={lot_id} as pending SELL (2).")
+            logger.info(f"[RiskManager] stop_loss_events => recorded SL event => lot_id={lot_id}, reason={reason}")
         except Exception as e:
-            logger.exception(f"[RiskManager] _mark_lot_as_pending_sell => {e}")
+            logger.exception(f"[RiskManager] error in _record_stop_loss_event => {e}")
         finally:
             conn.close()
 
+
     # ----------------------------------------------------------------------
-    # 3) Called by the private feed once the SELL is actually closed on Kraken
+    # 3) On SELL fill => on_pending_trade_closed => update leftover or close
     # ----------------------------------------------------------------------
     def on_pending_trade_closed(
         self,
@@ -349,13 +479,9 @@ class RiskManagerDB:
         fill_price: float
     ):
         """
-        Once the private feed says the SELL or BUY is fully closed on Kraken,
-        update or remove the lot accordingly.
-
-        - For a SELL => either remove the lot (if fill_size >= lot.quantity),
-          or do a partial leftover update.
-        - For a BUY => Typically merges are handled at add_or_combine_lot time,
-          so no special logic here by default.
+        Called once the private feed says SELL (or BUY) is fully closed on Kraken.
+        If SELL => remove or partially leftover. If leftover remains, set lot_status='PARTIAL_SOLD'.
+        If zero leftover => set lot_status='CLOSED', time_closed=Now.
         """
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
@@ -367,49 +493,64 @@ class RiskManagerDB:
                 logger.warning(f"[RiskManager] on_pending_trade_closed => no lot_id={lot_id} found.")
                 return
 
-            current_qty = float(lot["quantity"])
+            lot_qty = float(lot["quantity"])
+            lot_status = lot.get("lot_status", "ACTIVE")
 
             if side.upper() == "SELL":
-                leftover = current_qty - fill_size
+                leftover = lot_qty - fill_size
                 if leftover <= 0:
                     # fully sold
-                    c.execute("DELETE FROM holding_lots WHERE id=?", (lot_id,))
-                    logger.info(f"[RiskManager] Removed lot_id={lot_id} fully sold.")
+                    c.execute("""
+                    UPDATE holding_lots
+                       SET quantity=0,
+                           lot_status='CLOSED',
+                           time_closed=?
+                     WHERE id=?
+                    """, (int(time.time()), lot_id))
+                    logger.info(f"[RiskManager] Fully sold lot_id={lot_id} => CLOSED.")
                 else:
                     # partial leftover
                     c.execute("""
                     UPDATE holding_lots
-                    SET quantity=?, has_sold_in_between=1
-                    WHERE id=?
+                       SET quantity=?,
+                           lot_status='PARTIAL_SOLD'
+                     WHERE id=?
                     """, (leftover, lot_id))
-                    logger.info(
-                        f"[RiskManager] Partial leftover => lot_id={lot_id}, leftover={leftover:.4f}"
-                    )
+                    logger.info(f"[RiskManager] Partial leftover => lot_id={lot_id}, leftover={leftover:.4f}")
                 conn.commit()
+
             else:
-                # side=BUY => typically no special logic here
-                logger.debug("[RiskManager] side=BUY => no action needed for on_pending_trade_closed.")
+                # side=BUY => merges are handled by add_or_combine_lot.
+                logger.debug("[RiskManager] side=BUY => no special logic in on_pending_trade_closed.")
         except Exception as e:
             logger.exception(f"[RiskManager] on_pending_trade_closed => {e}")
         finally:
             conn.close()
 
     # ----------------------------------------------------------------------
-    # 4) Combine or Insert new "lot" upon a BUY
+    # 4) Add or Combine new BUY
     # ----------------------------------------------------------------------
-    def add_or_combine_lot(self, pair: str, buy_quantity: float, buy_price: float):
+    def add_or_combine_lot(
+        self,
+        pair: str,
+        buy_quantity: float,
+        buy_price: float,
+        origin_source: str = "gpt",
+        strategy_version: str = "v1.0",
+        risk_params_json: str = None
+    ):
         """
-        Called once a BUY finalizes. If an existing open lot with has_sold_in_between=0 is found,
-        merge cost basis; else create a new lot.
+        Called when a BUY is final. Merges with an ACTIVE lot or creates new.
+        We also store origin_source, strategy_version, etc. for data science.
         """
         if buy_quantity <= 0 or buy_price <= 0:
             return
+
         existing_lot = self._find_open_lot_without_sells(pair)
         if existing_lot:
             lot_id = existing_lot["id"]
-            old_qty = existing_lot["quantity"]
-            old_price = existing_lot["purchase_price"]
-
+            old_qty = float(existing_lot["quantity"])
+            old_price = float(existing_lot["purchase_price"])
             total_qty = old_qty + buy_quantity
             new_price = ((old_qty * old_price) + (buy_quantity * buy_price)) / total_qty
 
@@ -420,9 +561,16 @@ class RiskManagerDB:
             self._update_combined_lot(lot_id, new_price, total_qty, old_qty, buy_quantity)
         else:
             now_ts = int(time.time())
-            self._insert_new_lot(pair, buy_price, buy_quantity, now_ts)
+            self._insert_new_lot(
+                pair,
+                buy_price,
+                buy_quantity,
+                now_ts,
+                origin_source=origin_source,
+                strategy_version=strategy_version,
+                risk_params_json=risk_params_json
+            )
 
-    ## Enforce min buy cost in adjust_trade
     def adjust_trade(
         self,
         signal: str,
@@ -432,10 +580,8 @@ class RiskManagerDB:
         kraken_balances: Dict[str, float]
     ) -> Tuple[str, float]:
         """
-        1) If daily drawdown below threshold => skip new BUY
-        2) clamp final_size to self.max_position_size
-        3) check user capacity
-        4) NEW: require cost >= min purchase cost
+        Check daily drawdown, clamp final_size, ensure cost >= minCost, ensure balance is enough, etc.
+        Return (action, final_size).
         """
         # daily drawdown block
         if self.max_daily_drawdown is not None:
@@ -453,14 +599,13 @@ class RiskManagerDB:
         if final_size <= 0:
             return ("HOLD", 0.0)
 
+        # If BUY => check cost and user capacity
         if signal == "BUY":
             cost = final_size * current_price
-
-            ## CHANGED: enforce min purchase cost in USD
             min_cost = db_lookup.get_minimum_cost_in_usd(pair)
             if cost < min_cost:
                 logger.info(
-                    f"[RiskManager] Proposed BUY cost={cost:.2f} < min cost={min_cost:.2f}. Skipping..."
+                    f"[RiskManager] Proposed BUY cost={cost:.2f} < min cost={min_cost:.2f} => skip."
                 )
                 return ("HOLD", 0.0)
 
@@ -476,7 +621,8 @@ class RiskManagerDB:
                 logger.info(f"[RiskManager] insufficient {usd_symbol}, cost={cost:.2f}, have={free_usd:.2f}")
                 return ("HOLD", 0.0)
 
-        else:  # SELL => check base coin
+        # If SELL => ensure enough base coins
+        else:
             base_sym = self._get_base_symbol(pair)
             free_coins = kraken_balances.get(base_sym, 0.0)
             if final_size > free_coins:
@@ -513,6 +659,9 @@ class RiskManagerDB:
         finally:
             conn.close()
 
+    # ----------------------------------------------------------------------
+    # Possibly place real order
+    # ----------------------------------------------------------------------
     def _maybe_place_kraken_order(
         self,
         pair: str,
@@ -521,15 +670,13 @@ class RiskManagerDB:
         pending_id: int = None
     ) -> bool:
         """
-        Place a live market order if place_live_orders=True and private_ws_client is available.
-        Returns True if order was handed off to the private feed, else False.
+        If place_live_orders=True and private_ws_client is available => place a market order.
+        Returns True if handed off, else False.
         """
         if not self.place_live_orders:
-            return True
+            return True  # "Pretend" success in test mode
         if not self.private_ws_client or not self.private_ws_client.running:
-            logger.warning(
-                "[RiskManager] Private feed not open => cannot place real order => returning False."
-            )
+            logger.warning("[RiskManager] Private feed not open => cannot place real order => returning False.")
             return False
 
         side_for_kraken = "buy" if action.upper() == "BUY" else "sell"
@@ -546,21 +693,70 @@ class RiskManagerDB:
         return True
 
     # ----------------------------------------------------------------------
-    # Utility: Insert new lot
+    # Internals: mark a lot as PENDING_SELL
     # ----------------------------------------------------------------------
-    def _insert_new_lot(self, pair: str, purchase_price: float, quantity: float, date_purchased: int):
+    def _mark_lot_as_pending_sell(self, lot_id: int):
+        """
+        Mark the lot as lot_status='PENDING_SELL' so we skip re-triggers.
+        """
+        conn = sqlite3.connect(self.db_path)
+        try:
+            c = conn.cursor()
+            c.execute("""
+            UPDATE holding_lots
+               SET lot_status='PENDING_SELL'
+             WHERE id=?
+            """, (lot_id,))
+            conn.commit()
+            logger.info(f"[RiskManager] Marked lot_id={lot_id} => PENDING_SELL.")
+        except Exception as e:
+            logger.exception(f"[RiskManager] _mark_lot_as_pending_sell => {e}")
+        finally:
+            conn.close()
+
+    # ----------------------------------------------------------------------
+    # Insert new lot (ACTIVE)
+    # ----------------------------------------------------------------------
+    def _insert_new_lot(
+        self,
+        pair: str,
+        purchase_price: float,
+        quantity: float,
+        date_purchased: int,
+        origin_source: str = "gpt",
+        strategy_version: str = "v1.0",
+        risk_params_json: str = None
+    ):
         conn = sqlite3.connect(self.db_path)
         try:
             c = conn.cursor()
             c.execute("""
             INSERT INTO holding_lots (
-              pair, purchase_price, initial_quantity, quantity, date_purchased, has_sold_in_between
+                pair,
+                purchase_price,
+                initial_quantity,
+                quantity,
+                date_purchased,
+                lot_status,
+                origin_source,
+                strategy_version,
+                risk_params_json,
+                time_closed
             )
-            VALUES (?, ?, ?, ?, ?, 0)
-            """, (pair, purchase_price, quantity, quantity, date_purchased))
+            VALUES (?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, NULL)
+            """, (
+                pair,
+                purchase_price,
+                quantity,
+                quantity,
+                date_purchased,
+                origin_source,
+                strategy_version,
+                risk_params_json
+            ))
             conn.commit()
             logger.info(
-                f"[RiskManager] Inserted new lot => pair={pair}, qty={quantity:.4f}, px={purchase_price:.4f}"
+                f"[RiskManager] Inserted new lot => pair={pair}, qty={quantity:.4f}, px={purchase_price:.4f}, status=ACTIVE"
             )
         except Exception as e:
             logger.exception(f"[RiskManager] _insert_new_lot => {e}")
@@ -568,7 +764,7 @@ class RiskManagerDB:
             conn.close()
 
     # ----------------------------------------------------------------------
-    # Utility: Weighted cost basis update
+    # Weighted cost basis update
     # ----------------------------------------------------------------------
     def _update_combined_lot(
         self,
@@ -579,12 +775,13 @@ class RiskManagerDB:
         add_qty: float
     ):
         """
-        Weighted cost basis update; also update initial_quantity by the new buy.
+        Weighted cost basis => update purchase_price, initial_quantity, quantity.
+        We keep the lot_status as is unless you want to reset it to ACTIVE.
         """
         conn = sqlite3.connect(self.db_path)
         try:
             c = conn.cursor()
-            c.execute("SELECT initial_quantity FROM holding_lots WHERE id=?", (lot_id,))
+            c.execute("SELECT initial_quantity, lot_status FROM holding_lots WHERE id=?", (lot_id,))
             row = c.fetchone()
             if not row:
                 logger.warning(f"[RiskManager] No lot found with id={lot_id} to combine.")
@@ -594,10 +791,11 @@ class RiskManagerDB:
 
             c.execute("""
             UPDATE holding_lots
-            SET purchase_price=?,
-                initial_quantity=?,
-                quantity=?
-            WHERE id=?
+               SET purchase_price=?,
+                   initial_quantity=?,
+                   quantity=?,
+                   lot_status='ACTIVE' -- after a new buy, it should be ACTIVE
+             WHERE id=?
             """, (new_price, new_init_qty, new_qty, lot_id))
             conn.commit()
         except Exception as e:
@@ -606,7 +804,7 @@ class RiskManagerDB:
             conn.close()
 
     # ----------------------------------------------------------------------
-    # Utility: find an open lot for merging
+    # Find an open lot => we only merge with lot_status='ACTIVE'
     # ----------------------------------------------------------------------
     def _find_open_lot_without_sells(self, pair: str) -> Optional[dict]:
         conn = sqlite3.connect(self.db_path)
@@ -614,11 +812,13 @@ class RiskManagerDB:
         try:
             c = conn.cursor()
             c.execute("""
-            SELECT id, pair, purchase_price, initial_quantity, quantity, date_purchased, has_sold_in_between
-            FROM holding_lots
-            WHERE pair=? AND quantity>0 AND has_sold_in_between=0
-            ORDER BY id ASC
-            LIMIT 1
+            SELECT *
+              FROM holding_lots
+             WHERE pair=?
+               AND quantity>0
+               AND lot_status='ACTIVE'
+             ORDER BY id ASC
+             LIMIT 1
             """, (pair,))
             row = c.fetchone()
             return dict(row) if row else None
@@ -629,7 +829,7 @@ class RiskManagerDB:
             conn.close()
 
     # ----------------------------------------------------------------------
-    # Utility: load all open lots for a pair
+    # Load all open lots for a pair => 'quantity>0' => not closed
     # ----------------------------------------------------------------------
     def _load_lots_for_pair(self, pair: str) -> List[dict]:
         conn = sqlite3.connect(self.db_path)
@@ -638,9 +838,11 @@ class RiskManagerDB:
         try:
             c = conn.cursor()
             c.execute("""
-            SELECT id, pair, purchase_price, initial_quantity, quantity, date_purchased, has_sold_in_between
-            FROM holding_lots
-            WHERE pair=? AND quantity>0
+            SELECT *
+              FROM holding_lots
+             WHERE pair=?
+               AND quantity>0
+               AND lot_status!='CLOSED'
             """, (pair,))
             rows = c.fetchall()
             results = [dict(r) for r in rows]
@@ -654,39 +856,39 @@ class RiskManagerDB:
     # Helpers for asset naming
     # ----------------------------------------------------------------------
     def _get_quote_symbol(self, pair: str) -> str:
-        """
-        For "DOT/USD", returns the quote symbol in Kraken's format, e.g. "ZUSD"
-        """
         return db_lookup.get_asset_value_for_pair(pair, value="quote")
 
     def _get_base_symbol(self, pair: str) -> str:
-        """
-        For "DOT/USD", returns the base symbol in Kraken's format, e.g. "XDOT"
-        """
         return db_lookup.get_base_asset(pair)
 
     # ----------------------------------------------------------------------
-    # Rebuild from ledger (unchanged from your existing snippet)
+    # Rebuild lots from ledger - now incremental approach
     # ----------------------------------------------------------------------
     def rebuild_lots_from_ledger_entries(self):
         """
-        Example ledger-based rebuild (unchanged from your snippet).
+        Example incremental rebuild approach:
+         1) We do NOT delete holding_lots unconditionally.
+         2) We read ledger_entries for new trades that we haven't applied yet.
+         3) For each new buy => add_or_combine_lot, for each sell => apply partial leftover.
+
+        If you prefer approach C (real-time hooking), you can run a narrower approach to
+        only add new lines. The code below is an example snippet that used to do a full rebuild.
+        It's left as a reference, but the unconditional DELETE is removed.
+
+        Adjust to your liking for partial or incremental merges.
         """
+        logger.info("[RiskManager] Attempting incremental rebuild from ledger => no unconditional DELETE.")
         conn = sqlite3.connect(self.db_path)
         try:
             c = conn.cursor()
-            logger.info("[RiskManager] Rebuilding lots from ledger => clearing existing holding_lots.")
-            c.execute("DELETE FROM holding_lots")
-            conn.commit()
-
+            # EXAMPLE: fetch all "trade" ledger rows in ascending order
             c.execute("""
             SELECT ledger_id, refid, time, asset, amount, fee, balance
-            FROM ledger_entries
-            WHERE type='trade'
-            ORDER BY time ASC, ledger_id ASC
+              FROM ledger_entries
+             WHERE type='trade'
+             ORDER BY time ASC, ledger_id ASC
             """)
             rows = c.fetchall()
-
             from collections import defaultdict
             trades_by_refid = defaultdict(list)
             for (ledger_id, refid, tstamp, asset, amt, fee, bal) in rows:
@@ -699,8 +901,7 @@ class RiskManagerDB:
                     "balance": bal
                 })
 
-            refids_sorted = sorted(trades_by_refid.keys(),
-                                   key=lambda r: trades_by_refid[r][0]["time"])
+            refids_sorted = sorted(trades_by_refid.keys(), key=lambda r: trades_by_refid[r][0]["time"])
             for refid in refids_sorted:
                 ledger_group = trades_by_refid[refid]
                 if len(ledger_group) < 2:
@@ -710,7 +911,7 @@ class RiskManagerDB:
                 maybe_zusd = [x for x in ledger_group if x["asset"].upper().startswith("Z")]
                 maybe_coin = [x for x in ledger_group if not x["asset"].upper().startswith("Z")]
                 if not maybe_zusd or not maybe_coin:
-                    logger.warning(f"[RiskManager] refid={refid} doesn't have Z + coin => skipping.")
+                    logger.warning(f"[RiskManager] refid={refid} => missing Z + coin => skipping.")
                     continue
 
                 zusd_row = maybe_zusd[0]
@@ -723,10 +924,12 @@ class RiskManagerDB:
                     cost_usd = abs(zusd_amt)
                     if abs(buy_qty) > 0:
                         avg_price = cost_usd / buy_qty
+                        # Simply do an add_or_combine with no forced delete
                         self.add_or_combine_lot(
                             pair=self._get_pair_name(coin_row["asset"]),
                             buy_quantity=buy_qty,
-                            buy_price=avg_price
+                            buy_price=avg_price,
+                            origin_source="external_ledger"
                         )
                 else:
                     sell_qty = abs(coin_amt)
@@ -739,7 +942,7 @@ class RiskManagerDB:
                             sell_price=avg_price
                         )
 
-            logger.info("[RiskManager] Completed rebuilding lots from ledger entries.")
+            logger.info("[RiskManager] Completed incremental rebuilding from ledger entries.")
         except Exception as e:
             logger.exception(f"[RiskManager] Error in rebuild_lots_from_ledger_entries => {e}")
         finally:
@@ -747,22 +950,22 @@ class RiskManagerDB:
 
     def _apply_historical_sell_ledger(self, pair: str, sell_qty: float, sell_price: float):
         """
-        Helper for applying historical SELL lines from ledger => removing or partial leftover in holding_lots.
+        Example partial leftover approach for an external SELL recognized from ledger.
+        We find any lot that is 'ACTIVE' or 'PARTIAL_SOLD' and decrement quantity.
         """
         if sell_qty <= 0:
             return
-
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         try:
             c = conn.cursor()
             c.execute("""
-            SELECT id, quantity, purchase_price, initial_quantity
-            FROM holding_lots
-                WHERE pair=?
-                  AND quantity>0
-                  AND has_sold_in_between != 2
-            ORDER BY id ASC
+            SELECT id, quantity, lot_status
+              FROM holding_lots
+             WHERE pair=?
+               AND quantity>0
+               AND lot_status!='CLOSED'
+             ORDER BY id ASC
             """, (pair,))
             rows = c.fetchall()
 
@@ -770,22 +973,33 @@ class RiskManagerDB:
             for row in rows:
                 lot_id = row["id"]
                 lot_qty = float(row["quantity"])
+                lot_status = row["lot_status"] or "ACTIVE"
 
                 if qty_to_sell <= 0:
                     break
 
                 if lot_qty <= qty_to_sell:
-                    c.execute("DELETE FROM holding_lots WHERE id=?", (lot_id,))
-                    logger.debug(f"[RiskManager] Ledger SELL => fully removed lot_id={lot_id}")
+                    # fully remove
+                    c.execute("""
+                    UPDATE holding_lots
+                       SET quantity=0,
+                           lot_status='CLOSED',
+                           time_closed=?
+                     WHERE id=?
+                    """, (int(time.time()), lot_id))
+                    logger.debug(f"[RiskManager] Ledger SELL => closed lot_id={lot_id}")
                     qty_to_sell -= lot_qty
                 else:
                     leftover = lot_qty - qty_to_sell
+                    new_status = 'PARTIAL_SOLD' if leftover > 0 else 'CLOSED'
                     c.execute("""
                     UPDATE holding_lots
-                    SET quantity=?, has_sold_in_between=1
-                    WHERE id=?
-                    """, (leftover, lot_id))
-                    logger.debug(f"[RiskManager] Ledger SELL => lot_id={lot_id}, leftover={leftover}")
+                       SET quantity=?,
+                           lot_status=?,
+                           time_closed=CASE WHEN ?='CLOSED' THEN ? ELSE time_closed END
+                     WHERE id=?
+                    """, (leftover, new_status, new_status, int(time.time()), lot_id))
+                    logger.debug(f"[RiskManager] Ledger SELL => lot_id={lot_id}, leftover={leftover:.4f}")
                     qty_to_sell = 0
 
             conn.commit()
