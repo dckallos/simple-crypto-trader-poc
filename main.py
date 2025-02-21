@@ -5,22 +5,22 @@
 """
 main.py
 
-Consolidated single-aggregator design with ai_snapshots integration:
+Consolidated single-aggregator design with enhanced ai_snapshots integration:
 --------------------------------------------------------------------
-This version retains the original workflow while adding storage to the 'ai_snapshots' table
-for each coin during the aggregator_cycle:
+This version retains the original workflow while enhancing the 'ai_snapshots' table
+with advanced metrics during the aggregator_cycle:
 
 1) Fetches ledger data => updates local DB
 2) Fetches current Kraken balances => determines ZUSD
-3) Builds aggregator data for each pair => stores raw data in ai_snapshots
+3) Builds aggregator data for each pair => stores enhanced data in ai_snapshots
 4) Loads a Mustache template name from config (prompt_template_name or fallback)
 5) Renders the Mustache template with aggregator data
 6) Calls AIStrategy => predict_from_prompt => GPT => create pending trades => possibly place real orders
 
-New Additions:
-- In aggregator_cycle, for each pair in aggregator_list, we call db.store_ai_snapshot
-  with price changes, last price, risk parameters, and optional LunarCrush data.
-- We infer a simple 'is_market_bullish' based on recent price changes.
+Enhancements:
+- Volatility: Computes coin_volatility from price_changes or fetches from LunarCrush.
+- Market Sentiment: Uses LunarCrush sentiment for is_market_bullish ("YES" > 65, "NO" < 35, "MIXED" otherwise).
+- Risk Estimate: Combines GPT confidence (70%) with historical trade success rate (30%).
 - All unrelated logic (e.g., WebSocket handling, risk management) remains unchanged.
 
 Graceful exit via KeyboardInterrupt cancels the risk_manager_task and stops WebSockets.
@@ -39,6 +39,7 @@ import json
 import warnings
 import sqlite3
 from typing import Optional, Dict, Any, List
+import statistics
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -68,6 +69,7 @@ class NoHeartbeatFilter(logging.Filter):
     in their message (case-insensitive). This helps remove repetitive messages
     from ws_data_feed.py without raising the log level or altering other logs.
     """
+
     def filter(self, record: logging.LogRecord) -> bool:
         message = record.getMessage().lower()
         if "heartbeat" in message:
@@ -112,6 +114,7 @@ LOG_CONFIG = {
     }
 }
 
+
 def compute_minute_percent_changes(price_records: list[tuple[int, float]]) -> list[float]:
     """
     Given a list of (timestamp, price) in ascending order, return an array of % changes
@@ -127,7 +130,7 @@ def compute_minute_percent_changes(price_records: list[tuple[int, float]]) -> li
     """
     changes = []
     for i in range(1, len(price_records)):
-        _, prev_price = price_records[i-1]
+        _, prev_price = price_records[i - 1]
         _, curr_price = price_records[i]
         if prev_price == 0:
             pct_change = 0.0
@@ -135,6 +138,7 @@ def compute_minute_percent_changes(price_records: list[tuple[int, float]]) -> li
             pct_change = (curr_price - prev_price) / prev_price * 100.0
         changes.append(pct_change)
     return changes
+
 
 def convert_base_asset_keys_to_wsname(trade_balances: Dict[str, float]) -> Dict[str, float]:
     """
@@ -155,6 +159,7 @@ def convert_base_asset_keys_to_wsname(trade_balances: Dict[str, float]) -> Dict[
             logger.warning(f"No wsname found for base_asset={base_asset}, skipping.")
             pass
     return new_dict
+
 
 def setup_logging():
     """
@@ -222,13 +227,13 @@ def fetch_kraken_balance(api_key: str, api_secret: str) -> Dict[str, float]:
 
 
 def fetch_and_store_kraken_ledger(
-    api_key: str,
-    api_secret: str,
-    asset: str = None,
-    ledger_type: str = "all",
-    start: int = None,
-    end: int = None,
-    db_path: str = "trades.db"
+        api_key: str,
+        api_secret: str,
+        asset: str = None,
+        ledger_type: str = "all",
+        start: int = None,
+        end: int = None,
+        db_path: str = "trades.db"
 ):
     """
     Calls /0/private/Ledgers with the specified filters, then upserts each ledger entry
@@ -331,10 +336,11 @@ def get_latest_zusd_balance(db_path="trades.db") -> float:
     finally:
         conn.close()
 
+
 def fetch_and_store_kraken_public_asset_pairs(
-    pair_list: Optional[List[str]] = None,
-    info: str = "info",
-    country_code: Optional[str] = None
+        pair_list: Optional[List[str]] = None,
+        info: str = "info",
+        country_code: Optional[str] = None
 ):
     """
     (Truncated doc) => Retrieves and stores kraken asset pairs in 'kraken_asset_pairs'.
@@ -402,7 +408,7 @@ def format_no_sci(value: float, decimal_places: int = 8) -> str:
 
 class HybridApp:
     """
-    Aggregator with a single aggregator_cycle method, now storing data in ai_snapshots.
+    Aggregator with a single aggregator_cycle method, now storing enhanced data in ai_snapshots.
     on_ticker => aggregator_cycle every aggregator_interval seconds.
 
     aggregator_cycle =>
@@ -412,13 +418,13 @@ class HybridApp:
     """
 
     def __init__(
-        self,
-        pairs: List[str],
-        strategy: AIStrategy,
-        aggregator_interval: int,
-        private_ws_client: Optional[KrakenPrivateWSClient],
-        kraken_api_key: str,
-        kraken_api_secret: str
+            self,
+            pairs: List[str],
+            strategy: AIStrategy,
+            aggregator_interval: int,
+            private_ws_client: Optional[KrakenPrivateWSClient],
+            kraken_api_key: str,
+            kraken_api_secret: str
     ):
         self.pairs = pairs
         self.strategy = strategy
@@ -446,26 +452,110 @@ class HybridApp:
             self.aggregator_cycle()
             self.last_agg_ts = now
 
+    def _compute_volatility(self, pair: str, price_changes: List[float]) -> float:
+        """
+        Compute volatility as the standard deviation of price_changes.
+        If insufficient data (< 2 points), fetch from lunarcrush_data.
+        """
+        if len(price_changes) >= 2:
+            try:
+                return statistics.stdev(price_changes)
+            except statistics.StatisticsError:
+                logger.warning(f"[Aggregator] Volatility calculation failed for {pair}, falling back to LunarCrush.")
+
+        # Fallback to LunarCrush
+        symbol = db_lookup.get_formatted_name_from_pair_name(pair)
+        conn = sqlite3.connect(DB_FILE)
+        try:
+            c = conn.cursor()
+            c.execute("""
+                SELECT volatility
+                FROM lunarcrush_data
+                WHERE UPPER(symbol) = ?
+                ORDER BY timestamp DESC
+                LIMIT 1
+            """, (symbol.upper(),))
+            row = c.fetchone()
+            return float(row[0]) if row and row[0] is not None else 0.0
+        except Exception as e:
+            logger.exception(f"[Aggregator] Error fetching LunarCrush volatility for {pair}: {e}")
+            return 0.0
+        finally:
+            conn.close()
+
+    def _get_market_sentiment(self, pair: str) -> str:
+        """
+        Fetch the latest sentiment from lunarcrush_data and classify market condition.
+        Returns "YES" if sentiment > 65, "NO" if < 35, "MIXED" otherwise.
+        """
+        symbol = db_lookup.get_formatted_name_from_pair_name(pair)
+        conn = sqlite3.connect(DB_FILE)
+        try:
+            c = conn.cursor()
+            c.execute("""
+                SELECT sentiment
+                FROM lunarcrush_data
+                WHERE UPPER(symbol) = ?
+                ORDER BY timestamp DESC
+                LIMIT 1
+            """, (symbol.upper(),))
+            row = c.fetchone()
+            sentiment = float(row[0]) if row and row[0] is not None else 50.0  # Default to neutral
+            if sentiment > 65:
+                return "YES"
+            elif sentiment < 35:
+                return "NO"
+            else:
+                return "MIXED"
+        except Exception as e:
+            logger.exception(f"[Aggregator] Error fetching sentiment for {pair}: {e}")
+            return "MIXED"
+        finally:
+            conn.close()
+
+    def _compute_risk_estimate(self, pair: str, gpt_confidence: float) -> float:
+        """
+        Compute risk estimate as a weighted average: 70% GPT confidence, 30% historical trade success rate.
+        """
+        # Fetch historical success rate from trades table
+        conn = sqlite3.connect(DB_FILE)
+        try:
+            c = conn.cursor()
+            c.execute("""
+                SELECT COUNT(*) as wins, (SELECT COUNT(*) FROM trades WHERE pair = ? AND realized_pnl IS NOT NULL) as total
+                FROM trades
+                WHERE pair = ? AND realized_pnl > 0
+            """, (pair, pair))
+            row = c.fetchone()
+            wins, total = row if row else (0, 0)
+            success_rate = wins / total if total > 0 else 0.5  # Default to 50% if no data
+        except Exception as e:
+            logger.exception(f"[Aggregator] Error computing success rate for {pair}: {e}")
+            success_rate = 0.5
+        finally:
+            conn.close()
+
+        # Weighted average
+        return (0.7 * gpt_confidence) + (0.3 * success_rate)
+
     def aggregator_cycle(self):
         """
         Single aggregator cycle => fetch ledger => build aggregator data => store in ai_snapshots => Mustache => AIStrategy => GPT => trades.
 
-        Detailed Steps:
+        Enhanced Steps:
           1) Update the local ledger DB by calling fetch_and_store_kraken_ledger(...).
           2) Fetch the latest trade balances from Kraken => convert base asset keys => determine USD.
-          3) Build a raw aggregator list with numeric data (pair, last_price, changes, etc.) => store each in ai_snapshots.
-          4) Render the Mustache template (e.g. aggregator_simple_prompt.mustache) with the aggregator list.
-          5) Pass the rendered prompt text to AIStrategy => GPT => parse => produce decisions.
+          3) Build a raw aggregator list with numeric data => store each in ai_snapshots with volatility, sentiment, and risk.
+          4) Render the Mustache template with the aggregator list.
+          5) Pass the rendered prompt to AIStrategy => GPT => parse => produce decisions => extract confidence.
           6) If valid trades come back, create pending trades + possibly place real orders.
-
-        This method does NOT embed prompt text in Python. All text is in Mustache.
         """
-        # 1) Possibly update LunarCrush data (optional)
+        # 1) Update LunarCrush data
         self._update_lunarcrush_data()
 
         logger.info("[Aggregator] Starting aggregator_cycle => checking ledger for ZUSD balance...")
 
-        # 2) Refresh ledger => read ZUSD balance from DB
+        # 2) Refresh ledger => read ZUSD balance
         fetch_and_store_kraken_ledger(
             api_key=self.kraken_api_key,
             api_secret=self.kraken_api_secret,
@@ -473,17 +563,17 @@ class HybridApp:
             ledger_type="all",
             db_path=db.DB_FILE
         )
-        trade_balances = self.manager.fetch_balance()  # or your own fetch_kraken_balance
+        trade_balances = self.manager.fetch_balance()
         current_usd_balance = get_latest_zusd_balance(db_path=db.DB_FILE)
 
-        # Convert any Kraken base-asset keys to standard wsname (e.g. "ETH/USD").
+        # Convert Kraken base-asset keys to wsname
         trade_balances_ws = convert_base_asset_keys_to_wsname(trade_balances)
         trade_balances_ws["USD"] = current_usd_balance
 
         # 3) Build aggregator items and store in ai_snapshots
         aggregator_list = []
         zero_count = 0
-        quantity = ConfigLoader.get_value("quantity_of_price_history", 15)
+        quantity = ConfigLoader.get_value("quantity_of_price_history", 50)
 
         # Risk parameters from config
         aggregator_interval_secs = ConfigLoader.get_value("trade_interval_seconds", 3600)
@@ -496,14 +586,14 @@ class HybridApp:
             if last_price == 0.0:
                 zero_count += 1
 
-            # Fetch ~N+1 data points from DB for that pair
+            # Fetch price history
             minute_data = db.fetch_minute_spaced_prices(
                 pair=pair,
                 db_path=db.DB_FILE,
                 num_points=quantity + 1
             )
 
-            # Compute minute-based % changes
+            # Compute price changes
             changes = []
             if len(minute_data) >= 2:
                 changes_raw = compute_minute_percent_changes(minute_data)
@@ -523,18 +613,12 @@ class HybridApp:
             }
             aggregator_list.append(aggregator_item)
 
-            # NEW: Store in ai_snapshots
-            # Simple inference for is_market_bullish based on recent changes
-            recent_changes = changes[-5:] if len(changes) >= 5 else changes
-            avg_recent_change = sum(recent_changes) / len(recent_changes) if recent_changes else 0.0
-            is_market_bullish = "YES" if avg_recent_change > 0.25 else "NO" if avg_recent_change < -0.25 else "MIXED"
-
-            # Placeholder for volatility and risk (enhance later if needed)
-            coin_volatility = 0.0  # Could fetch from LunarCrush or compute from changes
-            risk_estimate = 0.5   # Placeholder, could be refined with ML/AI confidence
-            lunarcrush_data = {}   # Optional, fetch if available
+            # Enhanced metrics
+            coin_volatility = self._compute_volatility(pair, changes)
+            is_market_bullish = self._get_market_sentiment(pair)
             notes = f"Aggregator cycle data for {pair}"
 
+            # Store in ai_snapshots (risk_estimate will be updated post-GPT)
             store_ai_snapshot(
                 pair=pair,
                 price_changes=changes,
@@ -545,18 +629,18 @@ class HybridApp:
                 daily_drawdown_limit=daily_drawdown_limit,
                 coin_volatility=coin_volatility,
                 is_market_bullish=is_market_bullish,
-                risk_estimate=risk_estimate,
-                lunarcrush_data=lunarcrush_data,
+                risk_estimate=0.0,  # Placeholder, updated after GPT
+                lunarcrush_data=self._fetch_lunarcrush_snapshot(pair),
                 notes=notes,
                 db_path=DB_FILE
             )
 
-        # If all pairs have a zero price, skip aggregator calls to avoid nonsense
+        # If all pairs have zero price, skip
         if zero_count == len(self.pairs):
             logger.info("[Aggregator] All pairs last_price=0 => skipping aggregator_cycle.")
             return
 
-        # 4) Prepare the Mustache context (raw data only)
+        # 4) Prepare Mustache context
         template_name = ConfigLoader.get_value("prompt_template_name", "aggregator_simple_prompt.mustache")
         builder = PromptBuilder(template_dir="templates")
 
@@ -566,7 +650,7 @@ class HybridApp:
             "aggregator_items": aggregator_list
         }
 
-        # Render the Mustache template into a final prompt text
+        # Render the Mustache template
         final_prompt_text = builder.render_template(template_name, context)
         logger.info("[Aggregator] Successfully rendered Mustache prompt => sending to AIStrategy/GPT.")
 
@@ -576,18 +660,65 @@ class HybridApp:
             current_trade_balance=trade_balances_ws,
             current_balance=current_usd_balance
         )
-        logger.info(f"[Aggregator] GPT decisions => {decisions}")
+
+        # Extract GPT confidence from AIStrategy (via gpt_manager)
+        gpt_out = self.strategy.gpt_manager.generate_decisions_from_prompt(final_prompt_text)
+        gpt_confidence = gpt_out.get("confidence", 0.5)  # Default to 0.5 if not provided
+        logger.info(f"[Aggregator] GPT decisions => {decisions}, confidence => {gpt_confidence}")
+
+        # Update ai_snapshots with risk_estimate
+        for pair in self.pairs:
+            risk_estimate = self._compute_risk_estimate(pair, gpt_confidence)
+            conn = sqlite3.connect(DB_FILE)
+            try:
+                c = conn.cursor()
+                c.execute("""
+                    UPDATE ai_snapshots
+                    SET risk_estimate = ?
+                    WHERE pair = ? AND created_at = (SELECT MAX(created_at) FROM ai_snapshots WHERE pair = ?)
+                """, (risk_estimate, pair, pair))
+                conn.commit()
+            except Exception as e:
+                logger.exception(f"[Aggregator] Error updating risk_estimate for {pair}: {e}")
+            finally:
+                conn.close()
+
+    def _fetch_lunarcrush_snapshot(self, pair: str) -> Dict[str, Any]:
+        """
+        Fetch the latest LunarCrush snapshot for the given pair.
+        """
+        symbol = db_lookup.get_formatted_name_from_pair_name(pair)
+        conn = sqlite3.connect(DB_FILE)
+        try:
+            c = conn.cursor()
+            c.execute("""
+                SELECT *
+                FROM lunarcrush_data
+                WHERE UPPER(symbol) = ?
+                ORDER BY timestamp DESC
+                LIMIT 1
+            """, (symbol.upper(),))
+            row = c.fetchone()
+            if row:
+                columns = [desc[0] for desc in c.description]
+                return dict(zip(columns, row))
+            return {}
+        except Exception as e:
+            logger.exception(f"[Aggregator] Error fetching LunarCrush data for {pair}: {e}")
+            return {}
+        finally:
+            conn.close()
 
     def _update_lunarcrush_data(self):
         """
-        If needed, fetch from LunarCrush => store.
+        Fetch and update LunarCrush data if needed.
         """
         try:
             fetcher = LunarCrushFetcher(db_file=DB_FILE)
             fetcher.fetch_snapshot_data_filtered(limit=100)
-            logger.info("[Aggregator] updated lunarcrush_data snapshot.")
+            logger.info("[Aggregator] Updated lunarcrush_data snapshot.")
         except Exception as e:
-            logger.exception(f"[Aggregator] error updating lunarcrush => {e}")
+            logger.exception(f"[Aggregator] Error updating lunarcrush => {e}")
 
 
 def main():
@@ -644,12 +775,12 @@ def main():
         country_code="US:MI"
     )
 
-    # 3) Possibly fetch Kraken public asset pairs
+    # 3) Optionally fetch Kraken public asset pairs and LunarCrush data
     logger.info("[Main] Optionally fetching Kraken public asset pairs at startup...")
     rest_manager = KrakenRestManager(api_key=KRAKEN_API_KEY, api_secret=KRAKEN_API_SECRET)
     if PRE_POPULATE_DB | IS_ASSETS_UNDERPOPULATED:
         rest_manager.build_coin_name_lookup_from_db()
-    # Also update LunarCrush data & possibly backfill timeseries for each symbol in TRADED_PAIRS
+
     logger.info("[Main] Updating local lunarcrush_data + timeseries for configured symbols...")
     try:
         fetcher = LunarCrushFetcher(db_file=DB_FILE)
@@ -706,7 +837,8 @@ def main():
         gpt_max_tokens=40000,
         private_ws_client=None
     )
-    logger.info(f"[Main] AIStrategy => multi-coin GPT => pairs={TRADED_PAIRS}, GPT={ENABLE_GPT}, place_live_orders={PLACE_LIVE_ORDERS}")
+    logger.info(
+        f"[Main] AIStrategy => multi-coin GPT => pairs={TRADED_PAIRS}, GPT={ENABLE_GPT}, place_live_orders={PLACE_LIVE_ORDERS}")
 
     # 5) Get private WS token
     def get_ws_token(api_key: str, api_secret: str):
@@ -748,7 +880,7 @@ def main():
         token_str = token_json["result"]["token"]
         logger.info(f"[Main] Got private WS token => {token_str[:5]}...")
 
-    # 6) private feed
+    # 6) Private feed
     private_client = None
     if token_str:
         def on_private_event(evt_dict):
@@ -763,7 +895,7 @@ def main():
             ai_strategy.private_ws_client = private_client
             risk_manager_db.private_ws_client = private_client
 
-    # aggregator => calls AIStrategy => multi-coin GPT
+    # Aggregator => calls AIStrategy => multi-coin GPT
     class HybridAppAggregator(HybridApp):
         pass
 
@@ -791,18 +923,18 @@ def main():
     if private_client:
         private_client.start()
 
-    logger.info("[Main] aggregator approach running. Press Ctrl+C to exit.")
+    logger.info("[Main] Aggregator approach running. Press Ctrl+C to exit.")
     try:
         loop.run_forever()
     except KeyboardInterrupt:
-        logger.info("[Main] user exit => stopping.")
+        logger.info("[Main] User exit => stopping.")
         risk_manager_task.cancel()
         loop.run_until_complete(risk_manager_task)
     finally:
         pub_client.stop()
         if private_client:
             private_client.stop()
-        logger.info("[Main] aggregator halted.")
+        logger.info("[Main] Aggregator halted.")
 
 
 if __name__ == "__main__":
