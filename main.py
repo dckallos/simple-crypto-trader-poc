@@ -603,13 +603,17 @@ class HybridApp:
             min_qty = format_no_sci(db_lookup.get_ordermin(pair))
             min_cost = format_no_sci(db_lookup.get_minimum_cost_in_usd(pair))
 
+            coin_volatility = self._compute_volatility(pair, changes)
+            is_market_bullish = self._get_market_sentiment(pair)
             # Add raw data to aggregator_list
             aggregator_item = {
                 "pair": pair,
                 "last_price": last_price,
                 "changes": changes,
                 "min_qty": min_qty,
-                "min_cost": min_cost
+                "min_cost": min_cost,
+                "coin_volatility": coin_volatility,
+                "is_market_bullish": is_market_bullish
             }
             aggregator_list.append(aggregator_item)
 
