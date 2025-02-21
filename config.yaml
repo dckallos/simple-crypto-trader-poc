@@ -18,7 +18,7 @@ risk_manager_interval_seconds: 45
 quantity_of_price_history: 50
 
 # The name of the prompt template
-prompt_template_name: "aggregator_simple_prompt.mustache"
+prompt_template_name: "aggregator_detailed_prompt.mustache"
 
 # The percent loss allowed before you exit position
 stop_loss_percent: 0.04
