@@ -5,20 +5,25 @@
 """
 main.py
 
-Consolidated single-aggregator design:
---------------------------------------
-We remove the old methods aggregator_cycle_all_coins and aggregator_cycle_all_coins_simple_prompt,
-replacing them with a single aggregator_cycle() method. This method:
+Consolidated single-aggregator design with ai_snapshots integration:
+--------------------------------------------------------------------
+This version retains the original workflow while adding storage to the 'ai_snapshots' table
+for each coin during the aggregator_cycle:
 
 1) Fetches ledger data => updates local DB
 2) Fetches current Kraken balances => determines ZUSD
-3) Builds aggregator data for each pair (no large inline strings in Python)
+3) Builds aggregator data for each pair => stores raw data in ai_snapshots
 4) Loads a Mustache template name from config (prompt_template_name or fallback)
 5) Renders the Mustache template with aggregator data
 6) Calls AIStrategy => predict_from_prompt => GPT => create pending trades => possibly place real orders
 
-The user’s KeyboardInterrupt triggers a graceful exit, canceling the risk_manager_task and
-stopping the public/private websockets.
+New Additions:
+- In aggregator_cycle, for each pair in aggregator_list, we call db.store_ai_snapshot
+  with price changes, last price, risk parameters, and optional LunarCrush data.
+- We infer a simple 'is_market_bullish' based on recent price changes.
+- All unrelated logic (e.g., WebSocket handling, risk management) remains unchanged.
+
+Graceful exit via KeyboardInterrupt cancels the risk_manager_task and stops WebSockets.
 """
 
 import time
@@ -40,7 +45,7 @@ from dotenv import load_dotenv
 
 # Local modules
 import db
-from db import init_db, DB_FILE
+from db import init_db, DB_FILE, store_ai_snapshot
 from config_loader import ConfigLoader
 from risk_manager import RiskManagerDB
 from kraken_rest_manager import KrakenRestManager
@@ -147,7 +152,6 @@ def convert_base_asset_keys_to_wsname(trade_balances: Dict[str, float]) -> Dict[
         if wsname:
             new_dict[wsname] = balance
         else:
-            # Optionally, log or skip:
             logger.warning(f"No wsname found for base_asset={base_asset}, skipping.")
             pass
     return new_dict
@@ -375,9 +379,6 @@ def fetch_and_store_kraken_public_asset_pairs(
         logger.exception(f"[AssetPairs] Unexpected => {e}")
 
 
-# ------------------------------------------------------------------------------
-# CHANGED: Add a small helper to remove scientific notation from a float.
-# ------------------------------------------------------------------------------
 def format_no_sci(value: float, decimal_places: int = 8) -> str:
     """
     Returns a string representation of 'value' without scientific notation,
@@ -391,10 +392,8 @@ def format_no_sci(value: float, decimal_places: int = 8) -> str:
     :param decimal_places: how many digits after the decimal
     :return: string e.g. "0.00005"
     """
-    # Using standard formatting, then strip trailing zeroes if you like.
     format_str = f"{{:.{decimal_places}f}}"
     out = format_str.format(value)
-    # Optionally, remove trailing zeros if you want e.g. "0.00005" instead of "0.00005000"
     out = out.rstrip("0").rstrip(".") if "." in out else out
     if out == "":
         out = "0"
@@ -403,12 +402,12 @@ def format_no_sci(value: float, decimal_places: int = 8) -> str:
 
 class HybridApp:
     """
-    Aggregator with a single aggregator_cycle method.
+    Aggregator with a single aggregator_cycle method, now storing data in ai_snapshots.
     on_ticker => aggregator_cycle every aggregator_interval seconds.
 
     aggregator_cycle =>
       1) fetch ledger => read ZUSD
-      2) build aggregator data => Mustache => AIStrategy => GPT
+      2) build aggregator data => store in ai_snapshots => Mustache => AIStrategy => GPT
       3) Create pending trades => done
     """
 
@@ -449,12 +448,12 @@ class HybridApp:
 
     def aggregator_cycle(self):
         """
-        Single aggregator cycle => fetch ledger => build aggregator data => Mustache => AIStrategy => GPT => trades.
+        Single aggregator cycle => fetch ledger => build aggregator data => store in ai_snapshots => Mustache => AIStrategy => GPT => trades.
 
         Detailed Steps:
           1) Update the local ledger DB by calling fetch_and_store_kraken_ledger(...).
           2) Fetch the latest trade balances from Kraken => convert base asset keys => determine USD.
-          3) Build a raw aggregator list with only numeric data (pair, last_price, changes, etc.).
+          3) Build a raw aggregator list with numeric data (pair, last_price, changes, etc.) => store each in ai_snapshots.
           4) Render the Mustache template (e.g. aggregator_simple_prompt.mustache) with the aggregator list.
           5) Pass the rendered prompt text to AIStrategy => GPT => parse => produce decisions.
           6) If valid trades come back, create pending trades + possibly place real orders.
@@ -479,15 +478,19 @@ class HybridApp:
 
         # Convert any Kraken base-asset keys to standard wsname (e.g. "ETH/USD").
         trade_balances_ws = convert_base_asset_keys_to_wsname(trade_balances)
-        # For clarity, store "USD": <float> as well
         trade_balances_ws["USD"] = current_usd_balance
 
-        # 3) Build aggregator items. No inline text, just raw numeric data.
+        # 3) Build aggregator items and store in ai_snapshots
         aggregator_list = []
         zero_count = 0
-
-        # You can configure how many minute-spaced points you want:
         quantity = ConfigLoader.get_value("quantity_of_price_history", 15)
+
+        # Risk parameters from config
+        aggregator_interval_secs = ConfigLoader.get_value("trade_interval_seconds", 3600)
+        stop_loss_pct = ConfigLoader.get_value("stop_loss_percent", 0.04)
+        take_profit_pct = ConfigLoader.get_value("take_profit_percent", 0.01)
+        daily_drawdown_limit = self.strategy.max_daily_drawdown if self.strategy else -0.02
+
         for pair in self.pairs:
             last_price = self.latest_prices.get(pair, 0.0)
             if last_price == 0.0:
@@ -510,14 +513,43 @@ class HybridApp:
             min_qty = format_no_sci(db_lookup.get_ordermin(pair))
             min_cost = format_no_sci(db_lookup.get_minimum_cost_in_usd(pair))
 
-            # Add a dictionary of raw data (no inline text) to aggregator_list
-            aggregator_list.append({
+            # Add raw data to aggregator_list
+            aggregator_item = {
                 "pair": pair,
                 "last_price": last_price,
-                "changes": changes,  # array of float % changes
+                "changes": changes,
                 "min_qty": min_qty,
                 "min_cost": min_cost
-            })
+            }
+            aggregator_list.append(aggregator_item)
+
+            # NEW: Store in ai_snapshots
+            # Simple inference for is_market_bullish based on recent changes
+            recent_changes = changes[-5:] if len(changes) >= 5 else changes
+            avg_recent_change = sum(recent_changes) / len(recent_changes) if recent_changes else 0.0
+            is_market_bullish = "YES" if avg_recent_change > 0.25 else "NO" if avg_recent_change < -0.25 else "MIXED"
+
+            # Placeholder for volatility and risk (enhance later if needed)
+            coin_volatility = 0.0  # Could fetch from LunarCrush or compute from changes
+            risk_estimate = 0.5   # Placeholder, could be refined with ML/AI confidence
+            lunarcrush_data = {}   # Optional, fetch if available
+            notes = f"Aggregator cycle data for {pair}"
+
+            store_ai_snapshot(
+                pair=pair,
+                price_changes=changes,
+                last_price=last_price,
+                aggregator_interval_secs=aggregator_interval_secs,
+                stop_loss_pct=stop_loss_pct,
+                take_profit_pct=take_profit_pct,
+                daily_drawdown_limit=daily_drawdown_limit,
+                coin_volatility=coin_volatility,
+                is_market_bullish=is_market_bullish,
+                risk_estimate=risk_estimate,
+                lunarcrush_data=lunarcrush_data,
+                notes=notes,
+                db_path=DB_FILE
+            )
 
         # If all pairs have a zero price, skip aggregator calls to avoid nonsense
         if zero_count == len(self.pairs):
@@ -585,7 +617,6 @@ def main():
         "max_position_value": 25.0
     })
 
-    # If we want to place real orders
     PLACE_LIVE_ORDERS = ConfigLoader.get_value("place_live_orders", False)
 
     KRAKEN_API_KEY = os.getenv("KRAKEN_API_KEY", "")
@@ -624,7 +655,6 @@ def main():
         fetcher = LunarCrushFetcher(db_file=DB_FILE)
         fetcher.fetch_snapshot_data_filtered(limit=100)
 
-        # Backfill timeseries for each symbol => e.g. 1 month
         coin_ids = [db_lookup.get_formatted_name_from_pair_name(pair) for pair in TRADED_PAIRS]
         if PRE_POPULATE_LUNARCRUSH_DATA | IS_TIMESERIES_UNDERPOPULATED:
             fetcher.backfill_coins(
@@ -637,7 +667,6 @@ def main():
     except Exception as e:
         logger.exception(f"[Main] Error updating lunarcrush => {e}")
 
-    # If we do local training
     if ENABLE_TRAINING:
         from train_model import run_full_training_pipeline
         run_full_training_pipeline(
@@ -663,10 +692,8 @@ def main():
         )
     )
 
-    # Manager
     rest_manager = KrakenRestManager(KRAKEN_API_KEY, KRAKEN_API_SECRET)
 
-    # Create AIStrategy
     ai_strategy = AIStrategy(
         pairs=TRADED_PAIRS,
         use_openai=ENABLE_GPT,
@@ -732,7 +759,6 @@ def main():
             on_private_event_callback=on_private_event,
             risk_manager=risk_manager_db
         )
-        # If placing live orders => attach it
         if PLACE_LIVE_ORDERS:
             ai_strategy.private_ws_client = private_client
             risk_manager_db.private_ws_client = private_client
@@ -762,7 +788,6 @@ def main():
     pub_client.kraken_balances = rest_manager.fetch_balance()
     pub_client.start()
 
-    # start private feed if we have token
     if private_client:
         private_client.start()
 
@@ -771,7 +796,6 @@ def main():
         loop.run_forever()
     except KeyboardInterrupt:
         logger.info("[Main] user exit => stopping.")
-        # gracefully shut down risk_manager
         risk_manager_task.cancel()
         loop.run_until_complete(risk_manager_task)
     finally:
