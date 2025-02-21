@@ -3,7 +3,7 @@
 ##################################################################
 
 # How often the AI is called to make a trading decision (seconds)
-trade_interval_seconds: 120
+trade_interval_seconds: 360
 
 # Either place live orders, or turn off ordering with app running.
 place_live_orders: true
