@@ -14,7 +14,7 @@ appropriate constraints and indexes for high-performance trading operations.
 Key Features:
 - Async support via SQLAlchemy's AsyncAttrs for non-blocking database operations.
 - Centralized schema definition for maintainability and future migrations with Alembic.
-- Indexes on frequently queried columns (e.g., pair, timestamp) for sub-second responsiveness.
+- Comprehensive indexes on frequently queried columns (e.g., pair, timestamp) for sub-second responsiveness.
 - Foreign key relationships (e.g., trades.lot_id -> holding_lots.id) for data integrity.
 - JSONB columns for flexible storage of structured data (e.g., price changes, risk params).
 
@@ -35,6 +35,7 @@ Tables Defined:
 14. AggregatorSummaries: Aggregated metrics for analysis.
 15. AggregatorClassifierProbs: Local classifier probabilities.
 16. AggregatorEmbeddings: PCA-based embeddings for ML.
+17. KrakenAssetNameLookup: Lookup table for Kraken asset metadata.
 
 Usage:
 - Import into db_manager.py to initialize the database schema.
@@ -90,8 +91,10 @@ class Trade(Base):
     trade_metrics_json = Column(JSON)  # Peak excursions, etc.
 
     __table_args__ = (
-        Index("ix_trades_pair_timestamp", "pair", "timestamp"),
-        Index("ix_trades_order_id", "order_id"),
+        Index("ix_trades_pair_timestamp", "pair", "timestamp"),  # For trade history queries
+        Index("ix_trades_order_id", "order_id"),  # For order lookups
+        Index("ix_trades_lot_id", "lot_id"),  # For linking to holding lots
+        Index("ix_trades_kraken_trade_id", "kraken_trade_id"),  # For Kraken trade reconciliation
     )
 
 
@@ -113,8 +116,10 @@ class PendingTrade(Base):
     rationale = Column(Text)
 
     __table_args__ = (
-        Index("ix_pending_trades_pair_created_at", "pair", "created_at"),
-        Index("ix_pending_trades_kraken_order_id", "kraken_order_id"),
+        Index("ix_pending_trades_pair_created_at", "pair", "created_at"),  # For pending trade history
+        Index("ix_pending_trades_kraken_order_id", "kraken_order_id"),  # For Kraken order tracking
+        Index("ix_pending_trades_lot_id", "lot_id"),  # For linking to holding lots
+        Index("ix_pending_trades_status", "status"),  # For filtering by status
     )
 
 
@@ -132,7 +137,8 @@ class PriceHistory(Base):
     volume = Column(Float)
 
     __table_args__ = (
-        Index("ix_price_history_pair_timestamp", "pair", "timestamp"),
+        Index("ix_price_history_pair_timestamp", "pair", "timestamp"),  # For price trend queries
+        Index("ix_price_history_timestamp", "timestamp"),  # For time-based aggregations
     )
 
 
@@ -152,7 +158,9 @@ class LedgerEntry(Base):
     balance = Column(Float, nullable=False)
 
     __table_args__ = (
-        Index("ix_ledger_entries_asset_time", "asset", "time"),
+        Index("ix_ledger_entries_asset_time", "asset", "time"),  # For asset-specific ledger queries
+        Index("ix_ledger_entries_refid", "refid"),  # For linking related entries
+        Index("ix_ledger_entries_type", "type"),  # For filtering by event type
     )
 
 
@@ -177,7 +185,8 @@ class AISnapshot(Base):
     notes = Column(Text)
 
     __table_args__ = (
-        Index("ix_ai_snapshots_pair_created_at", "pair", "created_at"),
+        Index("ix_ai_snapshots_pair_created_at", "pair", "created_at"),  # For AI context history
+        Index("ix_ai_snapshots_created_at", "created_at"),  # For time-based analysis
     )
 
 
@@ -201,7 +210,9 @@ class HoldingLot(Base):
     peak_adverse_price = Column(Float)
 
     __table_args__ = (
-        Index("ix_holding_lots_pair_date_purchased", "pair", "date_purchased"),
+        Index("ix_holding_lots_pair_date_purchased", "pair", "date_purchased"),  # For lot history
+        Index("ix_holding_lots_lot_status", "lot_status"),  # For filtering active/closed lots
+        Index("ix_holding_lots_pair_status", "pair", "lot_status"),  # For pair-specific status queries
     )
 
 
@@ -218,7 +229,8 @@ class StopLossEvent(Base):
     risk_params_json = Column(JSON, nullable=False)  # Snapshot of risk params
 
     __table_args__ = (
-        Index("ix_stop_loss_events_lot_id_triggered_at", "lot_id", "triggered_at"),
+        Index("ix_stop_loss_events_lot_id_triggered_at", "lot_id", "triggered_at"),  # For stop-loss history
+        Index("ix_stop_loss_events_triggered_at", "triggered_at"),  # For time-based analysis
     )
 
 
@@ -260,7 +272,9 @@ class LunarCrushData(Base):
     blockchains = Column(Text)  # JSON string
 
     __table_args__ = (
-        Index("ix_lunarcrush_data_symbol_timestamp", "symbol", "timestamp"),
+        Index("ix_lunarcrush_data_symbol_timestamp", "symbol", "timestamp"),  # For symbol-specific trends
+        Index("ix_lunarcrush_data_timestamp", "timestamp"),  # For snapshot history
+        Index("ix_lunarcrush_data_lunarcrush_id", "lunarcrush_id"),  # For LunarCrush ID lookups
     )
 
 
@@ -294,7 +308,8 @@ class LunarCrushTimeseries(Base):
 
     __table_args__ = (
         UniqueConstraint("coin_id", "timestamp", name="uq_lunarcrush_timeseries_coin_id_timestamp"),
-        Index("ix_lunarcrush_timeseries_coin_id_timestamp", "coin_id", "timestamp"),
+        Index("ix_lunarcrush_timeseries_coin_id_timestamp", "coin_id", "timestamp"),  # For time-series queries
+        Index("ix_lunarcrush_timeseries_timestamp", "timestamp"),  # For time-based aggregations
     )
 
 
@@ -331,7 +346,9 @@ class KrakenAssetPair(Base):
     last_updated = Column(BigInteger)  # Epoch time
 
     __table_args__ = (
-        Index("ix_kraken_asset_pairs_wsname", "wsname"),
+        Index("ix_kraken_asset_pairs_wsname", "wsname"),  # For WebSocket name lookups
+        Index("ix_kraken_asset_pairs_base", "base"),  # For base asset queries
+        Index("ix_kraken_asset_pairs_last_updated", "last_updated"),  # For update tracking
     )
 
 
@@ -346,7 +363,8 @@ class KrakenBalanceHistory(Base):
     balance = Column(Float, nullable=False)
 
     __table_args__ = (
-        Index("ix_kraken_balance_history_asset_timestamp", "asset", "timestamp"),
+        Index("ix_kraken_balance_history_asset_timestamp", "asset", "timestamp"),  # For balance history
+        Index("ix_kraken_balance_history_timestamp", "timestamp"),  # For time-based queries
     )
 
 
@@ -360,7 +378,7 @@ class AIContext(Base):
 
     __table_args__ = (
         UniqueConstraint("id", name="uq_ai_context_id"),
-    )
+    )  # No additional indexes needed due to single-row constraint
 
 
 # 13. AIDecisions
@@ -377,7 +395,9 @@ class AIDecision(Base):
     group_rationale = Column(Text)
 
     __table_args__ = (
-        Index("ix_ai_decisions_pair_timestamp", "pair", "timestamp"),
+        Index("ix_ai_decisions_pair_timestamp", "pair", "timestamp"),  # For decision history
+        Index("ix_ai_decisions_timestamp", "timestamp"),  # For time-based analysis
+        Index("ix_ai_decisions_action", "action"),  # For filtering by action
     )
 
 
@@ -400,7 +420,8 @@ class AggregatorSummary(Base):
     tick_size = Column(Float)
 
     __table_args__ = (
-        Index("ix_aggregator_summaries_symbol_timestamp", "symbol", "timestamp"),
+        Index("ix_aggregator_summaries_symbol_timestamp", "symbol", "timestamp"),  # For summary history
+        Index("ix_aggregator_summaries_timestamp", "timestamp"),  # For time-based queries
     )
 
 
@@ -415,7 +436,8 @@ class AggregatorClassifierProb(Base):
     prob_up = Column(Float, nullable=False)
 
     __table_args__ = (
-        Index("ix_aggregator_classifier_probs_symbol_timestamp", "symbol", "timestamp"),
+        Index("ix_aggregator_classifier_probs_symbol_timestamp", "symbol", "timestamp"),  # For probability history
+        Index("ix_aggregator_classifier_probs_timestamp", "timestamp"),  # For time-based analysis
     )
 
 
@@ -432,34 +454,15 @@ class AggregatorEmbedding(Base):
     comp3 = Column(Float, nullable=False)
 
     __table_args__ = (
-        Index("ix_aggregator_embeddings_symbol_timestamp", "symbol", "timestamp"),
+        Index("ix_aggregator_embeddings_symbol_timestamp", "symbol", "timestamp"),  # For embedding history
+        Index("ix_aggregator_embeddings_timestamp", "timestamp"),  # For time-based queries
     )
 
+
+# 17. KrakenAssetNameLookup
 class KrakenAssetNameLookup(Base):
     """
     Stores a lookup table mapping Kraken asset pairs to detailed asset information.
-    Populated by build_coin_name_lookup_from_db in kraken_rest_manager.py, this table
-    aggregates data from kraken_asset_pairs (wsname, base, pair_name) and Kraken's
-    /AssetInfo endpoint (altname, decimals, etc.) for assets with quote='ZUSD'.
-
-    Purpose:
-    - Provides a consolidated view of asset metadata for efficient lookups.
-    - Supports trading operations by storing formatting and precision details.
-
-    Columns:
-    - wsname: WebSocket name (e.g., "ETH/USD"), primary key.
-    - base_asset: Base asset code (e.g., "XETH").
-    - pair_name: Kraken pair name (e.g., "XETHZUSD").
-    - alternative_name: Alternative name from kraken_asset_pairs (e.g., "ETH").
-    - formatted_base_asset_name: Formatted name from /AssetInfo (e.g., "ETH").
-    - aclass: Asset class (e.g., "currency").
-    - decimals: Number of decimal places for the asset.
-    - display_decimals: Number of decimals for display purposes.
-    - collateral_value: Collateral value (nullable float).
-    - status: Asset status (e.g., "enabled").
-
-    Indexes:
-    - ix_kraken_asset_name_lookup_base_asset: Optimizes lookups by base_asset.
     """
     __tablename__ = "kraken_asset_name_lookup"
 
@@ -475,7 +478,9 @@ class KrakenAssetNameLookup(Base):
     status = Column(String)  # e.g., "enabled"
 
     __table_args__ = (
-        Index("ix_kraken_asset_name_lookup_base_asset", "base_asset"),
+        Index("ix_kraken_asset_name_lookup_base_asset", "base_asset"),  # For base asset lookups
+        Index("ix_kraken_asset_name_lookup_pair_name", "pair_name"),  # For pair name queries
+        Index("ix_kraken_asset_name_lookup_status", "status"),  # For filtering enabled assets
     )
 
 
@@ -483,7 +488,6 @@ if __name__ == "__main__":
     # For testing schema creation
     from sqlalchemy.ext.asyncio import create_async_engine
     import asyncio
-
 
     async def init_db():
         from dotenv import load_dotenv
@@ -493,6 +497,5 @@ if __name__ == "__main__":
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
         await engine.dispose()
-
 
     asyncio.run(init_db())

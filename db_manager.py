@@ -61,8 +61,8 @@ class DBManager:
         # Create the async engine with connection pooling for performance
         self.engine = create_async_engine(
             self.postgres_dsn,
-            echo=False,  # Disabled for production performance
-            pool_size=20,  # Adjust based on expected concurrency
+            echo=True,
+            pool_size=20,
             max_overflow=10
         )
 
