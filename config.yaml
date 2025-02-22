@@ -6,13 +6,15 @@
 trade_interval_seconds: 360
 
 # Either place live orders, or turn off ordering with app running.
-place_live_orders: true
+place_live_orders: false
 
 # The model called during any AI trading advice requests.
-openai_model: "o1-mini"
+openai_model: "o3-mini"
+is_reasoning_model: true,
+reasoning_effort: "high"
 
 # How many seconds to wait for the next ST/TP exit check
-risk_manager_interval_seconds: 45
+risk_manager_interval_seconds: 60
 
 # The number of price_history records to include in AI prompt
 quantity_of_price_history: 50
@@ -31,7 +33,7 @@ min_data_rows: 100
 
 # Pre-populate table options
 pre_populate_db_tables: true
-pre_populate_lunarcrush_data: false
+pre_populate_lunarcrush_data: true
 
 # Use simple prompt with only price history
 # [[development]]
@@ -47,14 +49,14 @@ enable_live_ai_inference: true
 enable_gpt_integration: true
 
 # The amount of time we're giving kraken private client to start
-initial_risk_manager_sleep_seconds: 20
+initial_risk_manager_sleep_seconds: 60
 
 # Have the AI model create private summaries, forcing it to think
 # [[deprecated]]
 enable_reflection: true
 
 risk_controls:
-  initial_spending_account: 90.0
+  initial_spending_account: 50.0
   purchase_upper_limit_percent: 25.0
   max_position_value: 25.0
 
