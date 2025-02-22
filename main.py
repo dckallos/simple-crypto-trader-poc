@@ -812,7 +812,7 @@ def main():
     # 4) Create risk_manager + AIStrategy
     risk_manager_db = RiskManagerDB(
         db_path=DB_FILE,
-        max_position_size=10,
+        max_position_size=20,
         max_daily_drawdown=-0.02,
         initial_spending_account=RISK_CONTROLS.get("initial_spending_account", 0.0),
         private_ws_client=None,
