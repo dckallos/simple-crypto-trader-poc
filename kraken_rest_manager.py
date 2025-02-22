@@ -277,6 +277,7 @@ class KrakenRestManager:
         """
         Calls /0/private/Balance => returns a dict {asset: float_balance},
         and also stores them into the DB via store_kraken_balances(...).
+        Ensures no scientific notation in logs or storage by formatting floats.
         """
         endpoint = "/0/private/Balance"
         payload = {}
@@ -288,11 +289,19 @@ class KrakenRestManager:
         out = {}
         for k, v in raw_dict.items():
             try:
-                out[k] = float(v)
-            except:
+                # Convert to float first
+                float_val = float(v)
+                # Format as a plain decimal string with up to 20 decimal places, stripping trailing zeros
+                formatted_val = "{:.20f}".format(float_val).rstrip("0").rstrip(".")
+                # Store as float in the output dict (avoids scientific notation internally)
+                out[k] = float(formatted_val)
+            except (ValueError, TypeError):
                 out[k] = 0.0
 
-        logger.info(f"[KrakenRestManager] fetch_balance => {out}")
+        # Log with formatted values to avoid scientific notation
+        formatted_out = {k: "{:.20f}".format(v).rstrip("0").rstrip(".") for k, v in out.items()}
+        logger.info(f"[KrakenRestManager] fetch_balance => {formatted_out}")
+
         from db import store_kraken_balances
         store_kraken_balances(out)
         return out
