@@ -175,6 +175,11 @@ class GPTManager:
             "max_completion_tokens": self.max_tokens,
         }
 
+        from config_loader import ConfigLoader
+        if ConfigLoader.get_value("is_reasoning_model"):
+            request_dict["reasoning_effort"] = ConfigLoader.get_value("reasoning_effort")
+
+
         # 3) Optionally log request
         if self.log_gpt_calls:
             self._save_prompt_files(final_prompt_text, request_dict)
