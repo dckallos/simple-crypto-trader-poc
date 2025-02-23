@@ -512,7 +512,7 @@ class HybridApp:
             """, (symbol.upper(),))
             row = c.fetchone()
             sentiment = float(row[0]) if row and row[0] is not None else 50.0  # Default to neutral
-            if sentiment > 65:
+            if sentiment > 75:
                 return "YES"
             elif sentiment < 35:
                 return "NO"
