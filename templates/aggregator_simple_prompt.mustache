@@ -49,12 +49,14 @@ Blocks:
     Coin: [{{pair}}]
     Last Price: {{last_price}}
 
-    PRICE HISTORY DATA (chronological, in ascending order, oldest first):
+    PRICE HISTORY DATA (chronological, oldest first):
     "price_changes": [
       {{#changes}}
       {{.}}%,
       {{/changes}}
     ]
+    Market Sentiment: {{is_market_bullish}}
+    Coin Volatility: {{coin_volatility}}
 
     Minimum Purchase Quantity: {{min_qty}}
     Minimum Cost in USD: ${{min_cost}}
