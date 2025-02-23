@@ -638,6 +638,59 @@ def get_recent_sells_for_pair(pair: str, limit: int = 5) -> List[str]:
     return get_recent_ledger_entries_for_pair(pair, limit=limit, trade_type='SELL')
 
 
+def has_active_position(pair: str, db_path: str = DB_FILE) -> bool:
+    """
+    Check if there is an active position for the given pair.
+    An active position exists if there are any lots with quantity > 0 and lot_status != 'CLOSED'.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT COUNT(*)
+            FROM holding_lots
+            WHERE pair = ? AND quantity > 0 AND lot_status != 'CLOSED'
+        """, (pair,))
+        count = c.fetchone()[0]
+        return count > 0
+    except Exception as e:
+        logger.exception(f"Error checking active position for {pair}: {e}")
+        return False
+    finally:
+        conn.close()
+
+def has_positive_sentiment(pair: str, sentiment_threshold: float = 50.0, db_path: str = DB_FILE) -> bool:
+    """
+    Check if the latest sentiment for the coin is positive (above the threshold).
+    Sentiment data is fetched from lunarcrush_data.
+    """
+    # Map pair to the formatted symbol used in lunarcrush_data
+    symbol = get_formatted_name_from_pair_name(pair)
+    if not symbol:
+        return False
+
+    conn = sqlite3.connect(db_path)
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT sentiment
+            FROM lunarcrush_data
+            WHERE UPPER(symbol) = ?
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """, (symbol.upper(),))
+        row = c.fetchone()
+        if row and row[0] is not None:
+            sentiment = float(row[0])
+            return sentiment > sentiment_threshold
+        return False
+    except Exception as e:
+        logger.exception(f"Error checking sentiment for {pair}: {e}")
+        return False
+    finally:
+        conn.close()
+
+
 
 if __name__ == "__main__":
     # Example usage / self-test
