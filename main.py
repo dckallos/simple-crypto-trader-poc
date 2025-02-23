@@ -830,7 +830,8 @@ def main():
         max_daily_drawdown=-0.02,
         initial_spending_account=RISK_CONTROLS.get("initial_spending_account", 0.0),
         private_ws_client=None,
-        place_live_orders=PLACE_LIVE_ORDERS
+        place_live_orders=PLACE_LIVE_ORDERS,
+        ai_lock=ai_lock
     )
     risk_manager_db.initialize()
     ## risk_manager_db.rebuild_lots_from_ledger_entries()
