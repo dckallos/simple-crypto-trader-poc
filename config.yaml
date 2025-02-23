@@ -3,7 +3,7 @@
 ##################################################################
 
 # How often the AI is called to make a trading decision (seconds)
-trade_interval_seconds: 900
+trade_interval_seconds: 300
 
 # Either place live orders, or turn off ordering with app running.
 place_live_orders: true
@@ -33,7 +33,7 @@ min_data_rows: 100
 
 # Pre-populate table options
 pre_populate_db_tables: true
-pre_populate_lunarcrush_data: false
+pre_populate_lunarcrush_data: true
 
 # Use simple prompt with only price history
 # [[development]]
@@ -93,3 +93,5 @@ traded_pairs:
   - TRX/USD
   - FTM/USD
   - INJ/USD
+  - PAXG/USD
+  - XCN/USD
