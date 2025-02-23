@@ -607,6 +607,8 @@ class HybridApp:
                     db_path=db.DB_FILE,
                     num_points=quantity + 1
                 )
+                from technical_indicators import compute_technical_indicators
+                indicators = compute_technical_indicators(minute_data)
 
                 # Compute price changes
                 changes = []
@@ -648,8 +650,15 @@ class HybridApp:
                     daily_drawdown_limit=daily_drawdown_limit,
                     coin_volatility=coin_volatility,
                     is_market_bullish=is_market_bullish,
-                    risk_estimate=0.0,  # Placeholder, updated after GPT
+                    risk_estimate=0.0,
                     lunarcrush_data=self._fetch_lunarcrush_snapshot(pair),
+                    sma_10=indicators["sma_10"],
+                    ema_10=indicators["ema_10"],
+                    rsi_14=indicators["rsi_14"],
+                    macd=indicators["macd"],
+                    macd_signal=indicators["macd_signal"],
+                    bollinger_upper=indicators["bollinger_upper"],
+                    bollinger_lower=indicators["bollinger_lower"],
                     notes=notes,
                     db_path=DB_FILE
                 )
