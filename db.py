@@ -210,6 +210,7 @@ def init_db():
         # 10) AI_SNAPSHOTS (NEW FOR ML)
         # ----------------------------------------------------------------------
         create_ai_snapshots_table(conn)
+        add_technical_indicator_columns(conn)
 
         conn.commit()
         logger.info("All DB tables ensured in init_db().")
@@ -339,13 +340,88 @@ def create_ai_snapshots_table(conn=None):
                 coin_volatility REAL,
                 is_market_bullish TEXT,
                 risk_estimate REAL,
-                notes TEXT
+                notes TEXT,
+                sma_10 REAL,
+                ema_10 REAL,
+                rsi_14 REAL,
+                macd REAL,
+                macd_signal REAL,
+                bollinger_upper REAL,
+                bollinger_lower REAL
             )
         """)
         conn.commit()
         logger.info("[DB] ai_snapshots table ensured.")
     except Exception as e:
         logger.exception(f"[DB] Error creating ai_snapshots table: {e}")
+    finally:
+        if close_conn:
+            conn.close()
+
+def add_technical_indicator_columns(conn=None):
+    close_conn = False
+    if conn is None:
+        conn = sqlite3.connect(DB_FILE)
+        close_conn = True
+
+    try:
+        c = conn.cursor()
+        columns_to_add = [
+            "sma_10 REAL",
+            "ema_10 REAL",
+            "rsi_14 REAL",
+            "macd REAL",
+            "macd_signal REAL",
+            "bollinger_upper REAL",
+            "bollinger_lower REAL"
+        ]
+        for column in columns_to_add:
+            try:
+                c.execute(f"ALTER TABLE ai_snapshots ADD COLUMN {column}")
+                logger.info(f"[DB] Added column {column} to ai_snapshots.")
+            except sqlite3.OperationalError as e:
+                if "duplicate column name" in str(e):
+                    logger.info(f"[DB] Column {column} already exists in ai_snapshots.")
+                else:
+                    raise
+        conn.commit()
+    except Exception as e:
+        logger.exception(f"[DB] Error adding technical indicator columns: {e}")
+    finally:
+        if close_conn:
+            conn.close()
+
+
+def create_order_book_table(conn=None):
+    """
+    Creates a table to store Kraken order book snapshots if it doesn't exist.
+
+    Args:
+        conn (sqlite3.Connection, optional): Database connection. If None, a new connection is created.
+
+    Raises:
+        Exception: If there's an error creating the table.
+    """
+    close_conn = False
+    if conn is None:
+        conn = sqlite3.connect(DB_FILE)
+        close_conn = True
+
+    try:
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS order_book_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER,
+                pair TEXT,
+                bids TEXT,
+                asks TEXT
+            )
+        """)
+        conn.commit()
+        logger.info("[DB] order_book_snapshots table ensured.")
+    except Exception as e:
+        logger.exception(f"[DB] Error creating order_book_snapshots table: {e}")
     finally:
         if close_conn:
             conn.close()
@@ -362,6 +438,13 @@ def store_ai_snapshot(
     coin_volatility: float,
     is_market_bullish: str,
     risk_estimate: float,
+    sma_10: float,
+    ema_10: float,
+    rsi_14: float,
+    macd: float,
+    macd_signal: float,
+    bollinger_upper: float,
+    bollinger_lower: float,
     lunarcrush_data: Dict[str, Any] = None,
     notes: str = None,
     db_path: str = DB_FILE
@@ -412,9 +495,11 @@ def store_ai_snapshot(
                 coin_volatility,
                 is_market_bullish,
                 risk_estimate,
-                notes
+                notes,
+                sma_10, ema_10, rsi_14, macd, macd_signal, 
+                bollinger_upper, bollinger_lower
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             now_ts,
             pair,
@@ -428,7 +513,14 @@ def store_ai_snapshot(
             coin_volatility,
             is_market_bullish,
             risk_estimate,
-            notes
+            notes,
+            sma_10,
+            ema_10,
+            rsi_14,
+            macd,
+            macd_signal,
+            bollinger_upper,
+            bollinger_lower
         ))
         conn.commit()
         logger.info(f"[DB] Inserted ai_snapshot => pair={pair}, last_price={last_price}")
