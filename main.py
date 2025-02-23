@@ -483,6 +483,15 @@ class HybridApp:
         finally:
             conn.close()
 
+    def _should_include_in_prompt(self, pair: str) -> bool:
+        import db_lookup
+        """
+        Determine if the pair should be included in the AI prompt based on:
+        1. Having an active position, OR
+        2. Having positive market sentiment.
+        """
+        return db_lookup.has_active_position(pair) or db_lookup.has_positive_sentiment(pair)
+
     def _get_market_sentiment(self, pair: str) -> str:
         """
         Fetch the latest sentiment from lunarcrush_data and classify market condition.
@@ -570,6 +579,9 @@ class HybridApp:
         trade_balances_ws = convert_base_asset_keys_to_wsname(trade_balances)
         trade_balances_ws["USD"] = current_usd_balance
 
+        # 3) Filter coins based on criteria: active position OR positive sentiment
+        filtered_pairs = [pair for pair in self.pairs if self._should_include_in_prompt(pair)]
+
         # 3) Build aggregator items and store in ai_snapshots
         aggregator_list = []
         zero_count = 0
@@ -581,7 +593,7 @@ class HybridApp:
         take_profit_pct = ConfigLoader.get_value("take_profit_percent", 0.01)
         daily_drawdown_limit = self.strategy.max_daily_drawdown if self.strategy else -0.02
 
-        for pair in self.pairs:
+        for pair in filtered_pairs:
             last_price = self.latest_prices.get(pair, 0.0)
             if last_price == 0.0:
                 zero_count += 1
@@ -819,7 +831,7 @@ def main():
         place_live_orders=PLACE_LIVE_ORDERS
     )
     risk_manager_db.initialize()
-    risk_manager_db.rebuild_lots_from_ledger_entries()
+    ## risk_manager_db.rebuild_lots_from_ledger_entries()
     loop = asyncio.get_event_loop()
     risk_manager_task = loop.create_task(
         risk_manager_db.start_db_price_check_cycle(
