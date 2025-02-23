@@ -56,6 +56,8 @@ Dependencies:
 import os
 import json
 import re
+
+import httpx
 import yaml
 import logging
 import datetime
@@ -118,7 +120,14 @@ class GPTManager:
         openai_api_key = os.getenv("OPENAI_API_KEY", "")
         if not openai_api_key:
             logger.warning("[GPTManager] OPENAI_API_KEY is not set. GPT calls will fail if invoked.")
-        self.client = OpenAI(api_key=openai_api_key)
+        self.client = OpenAI(
+            api_key=openai_api_key,
+            max_retries=0,
+            http_client=httpx.Client(
+                ## TODO: Make configurable
+                timeout=120.0,
+            )
+        )
 
     def generate_decisions_from_prompt(
         self,
