@@ -62,6 +62,7 @@ from dotenv import load_dotenv
 import db_lookup
 from db import create_pending_trade
 from config_loader import ConfigLoader
+from threading import Lock
 
 load_dotenv()
 
@@ -237,7 +238,8 @@ class RiskManagerDB:
         max_daily_drawdown: float = None,
         initial_spending_account: float = 100.0,
         private_ws_client=None,
-        place_live_orders: bool = False
+        place_live_orders: bool = False,
+        ai_lock: Lock = None
     ):
         """
         :param db_path: Path to SQLite DB
@@ -254,6 +256,7 @@ class RiskManagerDB:
 
         self.private_ws_client = private_ws_client
         self.place_live_orders = place_live_orders
+        self.ai_lock = ai_lock
 
     def initialize(self) -> None:
         """
@@ -332,6 +335,12 @@ class RiskManagerDB:
         logger.info(f"[RiskManager] Starting DB-based price check cycle => pairs={pairs}, interval={dynamic_interval}s")
         while True:
             try:
+                # Check if the AI is processing (lock is acquired)
+                if self.ai_lock.locked():
+                    logger.info("[RiskManager] AI is processing, skipping this cycle.")
+                    await asyncio.sleep(1)  # Sleep briefly to avoid busy-waiting
+                    continue
+
                 for pair in pairs:
                     last_price = self._fetch_latest_price_for_pair(pair)
                     if last_price > 0:
@@ -343,7 +352,6 @@ class RiskManagerDB:
             except Exception as e:
                 logger.exception(f"[RiskManager] DB price check error => {e}")
 
-            dynamic_interval = ConfigLoader.get_value("risk_manager_interval_seconds", 30.0)
             await asyncio.sleep(dynamic_interval)
 
         logger.info("[RiskManager] price_check_cycle => fully exited.")

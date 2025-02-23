@@ -131,22 +131,22 @@ class AIStrategy:
         final_prompt_text: str,
         current_trade_balance: Dict[str, float],
         current_balance: float = 0.0
-    ) -> Dict[str, Tuple[str, float]]:
+    ) -> Tuple[Dict[str, Tuple[str, float]], Dict[str, Any]]:
         """
         The unified aggregator approach:
           1) If GPT is disabled, do a fallback => hold all
           2) Otherwise, call GPT => parse => { "decisions":[...], "rationale":"..." }
           3) For each decision => check daily drawdown, size clamp => create pending trade => possibly place real order
-          4) Return { "PAIR": ("ACTION","SIZE") }.
+          4) Return decisions and the raw GPT output (for confidence and rationale).
 
         :param final_prompt_text: The entire Mustache-rendered prompt that includes instructions + aggregator data
         :param current_trade_balance: e.g. {"ETH/USD": 0.5, "XBT/USD": 0.01} user holdings
         :param current_balance: USD (or similar) currently available
-        :return: A dict mapping each "pair" => (action, size) after risk checks
+        :return: A tuple containing decisions { "PAIR": ("ACTION","SIZE") } and the raw GPT output
         """
         # If GPT is disabled, skip
         if not self.use_openai or not self.gpt_manager:
-            return {p: ("HOLD", 0.0) for p in self.pairs}
+            return {p: ("HOLD", 0.0) for p in self.pairs}, {"decisions": [], "rationale": "GPT disabled", "confidence": 0.0}
 
         # Retrieve the actual GPT model name from config
         self.gpt_manager.model = ConfigLoader.get_value("openai_model", "o1-mini")
@@ -157,11 +157,10 @@ class AIStrategy:
         logger.info("[AIStrategy] Submitting final prompt to GPT => generate_decisions_from_prompt.")
         gpt_out = self.gpt_manager.generate_decisions_from_prompt(final_prompt_text)
         decisions_list = gpt_out.get("decisions", [])
-        ai_rationale = gpt_out.get("rationale", "No rationale provided")
 
         if not decisions_list:
             logger.warning("[AIStrategy] GPT returned no decisions => hold all.")
-            return {p: ("HOLD", 0.0) for p in self.pairs}
+            return {p: ("HOLD", 0.0) for p in self.pairs}, gpt_out
 
         # For each decision => local checks => create pending trades => possibly place order
         for dec in decisions_list:
@@ -190,7 +189,7 @@ class AIStrategy:
             # If final is still BUY or SELL => create a pending trade => maybe place real order
             if final_action in ("BUY", "SELL") and final_size > 0:
                 # We'll embed the GPT rationale + model name in the final trade record
-                combined_rationale = f"{ai_rationale}\n[ai_model={ai_model_name}]"
+                combined_rationale = f"{gpt_out.get('rationale', 'No rationale')}\n[ai_model={ai_model_name}]"
 
                 pending_id = create_pending_trade(
                     side=final_action,
@@ -222,7 +221,7 @@ class AIStrategy:
                 # GPT said HOLD or risk checks forced us to skip
                 results_set[pair] = ("HOLD", 0.0)
 
-        return results_set
+        return results_set, gpt_out
 
     # --------------------------------------------------------------------------
     # Local clamp => daily drawdown

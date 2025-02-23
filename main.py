@@ -31,7 +31,6 @@ import requests
 import hashlib
 import hmac
 import base64
-import logging
 import asyncio
 import logging.config
 import os
@@ -40,6 +39,7 @@ import warnings
 import sqlite3
 from typing import Optional, Dict, Any, List
 import statistics
+from threading import Lock
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -59,6 +59,8 @@ import db_lookup
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.DEBUG)
+
+ai_lock = Lock()
 
 warnings.simplefilter(action="ignore", category=pd.errors.SettingWithCopyWarning)
 
@@ -593,111 +595,111 @@ class HybridApp:
         take_profit_pct = ConfigLoader.get_value("take_profit_percent", 0.01)
         daily_drawdown_limit = self.strategy.max_daily_drawdown if self.strategy else -0.02
 
-        for pair in filtered_pairs:
-            last_price = self.latest_prices.get(pair, 0.0)
-            if last_price == 0.0:
-                zero_count += 1
+        with ai_lock:
+            for pair in filtered_pairs:
+                last_price = self.latest_prices.get(pair, 0.0)
+                if last_price == 0.0:
+                    zero_count += 1
 
-            # Fetch price history
-            minute_data = db.fetch_minute_spaced_prices(
-                pair=pair,
-                db_path=db.DB_FILE,
-                num_points=quantity + 1
-            )
+                # Fetch price history
+                minute_data = db.fetch_minute_spaced_prices(
+                    pair=pair,
+                    db_path=db.DB_FILE,
+                    num_points=quantity + 1
+                )
 
-            # Compute price changes
-            changes = []
-            if len(minute_data) >= 2:
-                changes_raw = compute_minute_percent_changes(minute_data)
-                changes = [round(chg, 3) for chg in changes_raw]
+                # Compute price changes
+                changes = []
+                if len(minute_data) >= 2:
+                    changes_raw = compute_minute_percent_changes(minute_data)
+                    changes = [round(chg, 3) for chg in changes_raw]
 
-            # Retrieve minimum purchase constraints
-            min_qty = format_no_sci(db_lookup.get_ordermin(pair))
-            min_cost = format_no_sci(db_lookup.get_minimum_cost_in_usd(pair))
+                # Retrieve minimum purchase constraints
+                min_qty = format_no_sci(db_lookup.get_ordermin(pair))
+                min_cost = format_no_sci(db_lookup.get_minimum_cost_in_usd(pair))
 
-            coin_volatility = self._compute_volatility(pair, changes)
-            is_market_bullish = self._get_market_sentiment(pair)
-            # Add raw data to aggregator_list
-            aggregator_item = {
-                "pair": pair,
-                "last_price": last_price,
-                "changes": changes,
-                "min_qty": min_qty,
-                "min_cost": min_cost,
-                "coin_volatility": coin_volatility,
-                "is_market_bullish": is_market_bullish
+                coin_volatility = self._compute_volatility(pair, changes)
+                is_market_bullish = self._get_market_sentiment(pair)
+                # Add raw data to aggregator_list
+                aggregator_item = {
+                    "pair": pair,
+                    "last_price": last_price,
+                    "changes": changes,
+                    "min_qty": min_qty,
+                    "min_cost": min_cost,
+                    "coin_volatility": coin_volatility,
+                    "is_market_bullish": is_market_bullish
+                }
+                aggregator_list.append(aggregator_item)
+
+                # Enhanced metrics
+                coin_volatility = self._compute_volatility(pair, changes)
+                is_market_bullish = self._get_market_sentiment(pair)
+                notes = f"Aggregator cycle data for {pair}"
+
+                # Store in ai_snapshots (risk_estimate will be updated post-GPT)
+                store_ai_snapshot(
+                    pair=pair,
+                    price_changes=changes,
+                    last_price=last_price,
+                    aggregator_interval_secs=aggregator_interval_secs,
+                    stop_loss_pct=stop_loss_pct,
+                    take_profit_pct=take_profit_pct,
+                    daily_drawdown_limit=daily_drawdown_limit,
+                    coin_volatility=coin_volatility,
+                    is_market_bullish=is_market_bullish,
+                    risk_estimate=0.0,  # Placeholder, updated after GPT
+                    lunarcrush_data=self._fetch_lunarcrush_snapshot(pair),
+                    notes=notes,
+                    db_path=DB_FILE
+                )
+
+            # If all pairs have zero price, skip
+            if zero_count == len(self.pairs):
+                logger.info("[Aggregator] All pairs last_price=0 => skipping aggregator_cycle.")
+                return
+
+            # 4) Prepare Mustache context
+            template_name = ConfigLoader.get_value("prompt_template_name", "aggregator_simple_prompt.mustache")
+            builder = PromptBuilder(template_dir="templates")
+
+            context = {
+                "current_usd_balance": f"{current_usd_balance:.4f}",
+                "trade_balances": json.dumps(trade_balances_ws, indent=2, ensure_ascii=False),
+                "aggregator_items": aggregator_list
             }
-            aggregator_list.append(aggregator_item)
 
-            # Enhanced metrics
-            coin_volatility = self._compute_volatility(pair, changes)
-            is_market_bullish = self._get_market_sentiment(pair)
-            notes = f"Aggregator cycle data for {pair}"
+            # Render the Mustache template
+            final_prompt_text = builder.render_template(template_name, context)
+            logger.info("[Aggregator] Successfully rendered Mustache prompt => sending to AIStrategy/GPT.")
 
-            # Store in ai_snapshots (risk_estimate will be updated post-GPT)
-            store_ai_snapshot(
-                pair=pair,
-                price_changes=changes,
-                last_price=last_price,
-                aggregator_interval_secs=aggregator_interval_secs,
-                stop_loss_pct=stop_loss_pct,
-                take_profit_pct=take_profit_pct,
-                daily_drawdown_limit=daily_drawdown_limit,
-                coin_volatility=coin_volatility,
-                is_market_bullish=is_market_bullish,
-                risk_estimate=0.0,  # Placeholder, updated after GPT
-                lunarcrush_data=self._fetch_lunarcrush_snapshot(pair),
-                notes=notes,
-                db_path=DB_FILE
+            # 5) Call AIStrategy => get decisions and raw GPT output
+            decisions, gpt_out = self.strategy.predict_from_prompt(
+                final_prompt_text=final_prompt_text,
+                current_trade_balance=trade_balances_ws,
+                current_balance=current_usd_balance
             )
 
-        # If all pairs have zero price, skip
-        if zero_count == len(self.pairs):
-            logger.info("[Aggregator] All pairs last_price=0 => skipping aggregator_cycle.")
-            return
+            # Extract GPT confidence from the returned gpt_out
+            gpt_confidence = gpt_out.get("confidence", 0.5)  # Default to 0.5 if not provided
+            logger.info(f"[Aggregator] GPT decisions => {decisions}, confidence => {gpt_confidence}")
 
-        # 4) Prepare Mustache context
-        template_name = ConfigLoader.get_value("prompt_template_name", "aggregator_simple_prompt.mustache")
-        builder = PromptBuilder(template_dir="templates")
-
-        context = {
-            "current_usd_balance": f"{current_usd_balance:.4f}",
-            "trade_balances": json.dumps(trade_balances_ws, indent=2, ensure_ascii=False),
-            "aggregator_items": aggregator_list
-        }
-
-        # Render the Mustache template
-        final_prompt_text = builder.render_template(template_name, context)
-        logger.info("[Aggregator] Successfully rendered Mustache prompt => sending to AIStrategy/GPT.")
-
-        # 5) AIStrategy => parse => create trades
-        decisions = self.strategy.predict_from_prompt(
-            final_prompt_text=final_prompt_text,
-            current_trade_balance=trade_balances_ws,
-            current_balance=current_usd_balance
-        )
-
-        # Extract GPT confidence from AIStrategy (via gpt_manager)
-        gpt_out = self.strategy.gpt_manager.generate_decisions_from_prompt(final_prompt_text)
-        gpt_confidence = gpt_out.get("confidence", 0.5)  # Default to 0.5 if not provided
-        logger.info(f"[Aggregator] GPT decisions => {decisions}, confidence => {gpt_confidence}")
-
-        # Update ai_snapshots with risk_estimate
-        for pair in self.pairs:
-            risk_estimate = self._compute_risk_estimate(pair, gpt_confidence)
-            conn = sqlite3.connect(DB_FILE)
-            try:
-                c = conn.cursor()
-                c.execute("""
-                    UPDATE ai_snapshots
-                    SET risk_estimate = ?
-                    WHERE pair = ? AND created_at = (SELECT MAX(created_at) FROM ai_snapshots WHERE pair = ?)
-                """, (risk_estimate, pair, pair))
-                conn.commit()
-            except Exception as e:
-                logger.exception(f"[Aggregator] Error updating risk_estimate for {pair}: {e}")
-            finally:
-                conn.close()
+            # Update ai_snapshots with risk_estimate
+            for pair in self.pairs:
+                risk_estimate = self._compute_risk_estimate(pair, gpt_confidence)
+                conn = sqlite3.connect(DB_FILE)
+                try:
+                    c = conn.cursor()
+                    c.execute("""
+                                UPDATE ai_snapshots
+                                SET risk_estimate = ?
+                                WHERE pair = ? AND created_at = (SELECT MAX(created_at) FROM ai_snapshots WHERE pair = ?)
+                            """, (risk_estimate, pair, pair))
+                    conn.commit()
+                except Exception as e:
+                    logger.exception(f"[Aggregator] Error updating risk_estimate for {pair}: {e}")
+                finally:
+                    conn.close()
 
     def _fetch_lunarcrush_snapshot(self, pair: str) -> Dict[str, Any]:
         """
