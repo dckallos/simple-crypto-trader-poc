@@ -492,7 +492,7 @@ class HybridApp:
         1. Having an active position, OR
         2. Having positive market sentiment.
         """
-        return db_lookup.has_active_position(pair) or db_lookup.has_positive_sentiment(pair)
+        return db_lookup.has_active_position(pair) or (self._get_market_sentiment(pair) == "YES")
 
     def _get_market_sentiment(self, pair: str) -> str:
         """
