@@ -3,7 +3,7 @@
 ##################################################################
 
 # How often the AI is called to make a trading decision (seconds)
-trade_interval_seconds: 900
+trade_interval_seconds: 360
 
 # Either place live orders, or turn off ordering with app running.
 place_live_orders: true
@@ -23,7 +23,7 @@ quantity_of_price_history: 30
 prompt_template_name: "aggregator_modified_prompt.mustache"
 
 # The percent loss allowed before you exit position
-stop_loss_percent: 0.1
+stop_loss_percent: 0.05
 
 # The percent gains allowed before you exit position
 take_profit_percent: 0.015
