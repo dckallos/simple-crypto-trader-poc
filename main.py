@@ -576,6 +576,8 @@ class HybridApp:
         )
         trade_balances = self.manager.fetch_balance()
         current_usd_balance = get_latest_zusd_balance(db_path=db.DB_FILE)
+        traded_pairs = ConfigLoader.get_value("traded_pairs", [])
+        self.manager.fetch_and_store_trade_volume(traded_pairs, db_path="trades.db")
 
         # Convert Kraken base-asset keys to wsname
         trade_balances_ws = convert_base_asset_keys_to_wsname(trade_balances)
