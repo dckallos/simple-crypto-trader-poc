@@ -843,7 +843,7 @@ def main():
         ai_lock=ai_lock
     )
     risk_manager_db.initialize()
-    ## risk_manager_db.rebuild_lots_from_ledger_entries()
+    risk_manager_db.rebuild_lots_from_ledger_entries()
     loop = asyncio.get_event_loop()
     risk_manager_task = loop.create_task(
         risk_manager_db.start_db_price_check_cycle(
