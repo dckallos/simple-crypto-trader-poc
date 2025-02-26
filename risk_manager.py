@@ -386,61 +386,50 @@ class RiskManagerDB:
     # also update peak_favorable_price & peak_adverse_price for each lot
     # ----------------------------------------------------------------------
     def on_price_update(
-            self,
-            pair: str,
-            current_price: float,
-            kraken_balances: Dict[str, float]
+        self,
+        pair: str,
+        current_price: float,
+        kraken_balances: Dict[str, float],
+        stop_loss_pct: float = ConfigLoader.get_value("stop_loss_percent", 0.05),
+        take_profit_pct: float = ConfigLoader.get_value("take_profit_percent", 0.02)
     ):
         """
-        For each open lot on 'pair', update peak prices and check if stop-loss or take-profit triggers
-        using dynamic thresholds from the database.
-
-        Args:
-            pair (str): The trading pair.
-            current_price (float): Current market price.
-            kraken_balances (Dict[str, float]): Current balances (not used here but kept for compatibility).
+        For each open lot on 'pair', we update peak prices, then check if
+        SL or TP triggers => place SELL => set lot_status='PENDING_SELL'.
         """
         lots = self._load_open_lots(pair)
         if not lots:
             return
 
-        # Fetch dynamic thresholds from the database
-        stop_loss_threshold, take_profit_threshold = self._get_thresholds_from_db(pair)
-        if stop_loss_threshold is None or take_profit_threshold is None:
-            logger.warning(f"[RiskManager] No thresholds available for {pair}, skipping SL/TP checks.")
-            # Optional: Fall back to config.yaml values
-            stop_loss_pct = ConfigLoader.get_value("stop_loss_percent", 0.05)
-            take_profit_pct = ConfigLoader.get_value("take_profit_percent", 0.02)
-            lot_price = float(lots[0]["purchase_price"])  # Use first lot as reference
-            stop_loss_threshold = lot_price * (1.0 - stop_loss_pct)
-            take_profit_threshold = lot_price * (1.0 + take_profit_pct)
-
         for lot in lots:
             lot_id = lot["id"]
+            lot_price = float(lot["purchase_price"])
             lot_qty = float(lot["quantity"])
             lot_status = lot.get("lot_status", "ACTIVE")
 
-            # Update peak favorable / adverse prices
-            peak_fav = float(lot.get("peak_favorable_price") or lot["purchase_price"])
-            peak_adv = float(lot.get("peak_adverse_price") or lot["purchase_price"])
+            # 1) Update peak favorable / adverse
+            peak_fav = float(lot.get("peak_favorable_price") or lot_price)
+            peak_adv = float(lot.get("peak_adverse_price") or lot_price)
             updated_fav = max(peak_fav, current_price)
             updated_adv = min(peak_adv, current_price)
-            if updated_fav != peak_fav or updated_adv != peak_adv:
+            if (updated_fav != peak_fav) or (updated_adv != peak_adv):
                 self._update_lot_peak_prices(lot_id, updated_fav, updated_adv)
 
             if lot_qty <= 0 or lot_status in ("PENDING_SELL", "CLOSED"):
-                continue
+                continue  # skip
 
-            # Check stop-loss and take-profit using database thresholds
-            if current_price <= stop_loss_threshold:
-                reason = f"STOP_LOSS triggered at price={current_price:.4f} (threshold={stop_loss_threshold:.4f})"
+            # 2) STOP LOSS
+            if stop_loss_pct > 0.0 and current_price <= lot_price * (1.0 - stop_loss_pct):
+                reason = f"STOP_LOSS triggered at price={current_price:.4f}"
                 logger.info(f"[RiskManager] Stop-loss => lot_id={lot_id}, SELL all => {lot_qty:.4f} {pair}")
                 self._record_stop_loss_event(lot_id, current_price, reason)
+
                 min_order_size = db_lookup.get_ordermin(pair)
                 if lot_qty < min_order_size:
-                    logger.warning(
-                        f"[RiskManager] lot_id={lot_id} => SELL qty={lot_qty:.4f} < min={min_order_size:.4f}, skip.")
+                    logger.warning(f"[RiskManager] lot_id={lot_id} => SELL qty={lot_qty:.4f} < exch min={min_order_size:.4f}, skip.")
                     continue
+
+                # Create pending SELL
                 pending_id = create_pending_trade(
                     side="SELL",
                     requested_qty=lot_qty,
