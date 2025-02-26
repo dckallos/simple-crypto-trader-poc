@@ -56,7 +56,7 @@ initial_risk_manager_sleep_seconds: 60
 enable_reflection: true
 
 risk_controls:
-  initial_spending_account: 50.0
+  initial_spending_account: 75.0
   purchase_upper_limit_percent: 25.0
   max_position_value: 25.0
 

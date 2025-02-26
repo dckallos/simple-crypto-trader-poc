@@ -596,10 +596,12 @@ class HybridApp:
         stop_loss_pct = ConfigLoader.get_value("stop_loss_percent", 0.04)
         take_profit_pct = ConfigLoader.get_value("take_profit_percent", 0.01)
         daily_drawdown_limit = self.strategy.max_daily_drawdown if self.strategy else -0.02
-
+        import threshold_manager
+        threshold_manager.update_pair_thresholds(traded_pairs)
         with ai_lock:
             for pair in filtered_pairs:
                 last_price = self.latest_prices.get(pair, 0.0)
+
                 if last_price == 0.0:
                     zero_count += 1
 

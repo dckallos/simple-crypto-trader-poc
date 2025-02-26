@@ -386,50 +386,61 @@ class RiskManagerDB:
     # also update peak_favorable_price & peak_adverse_price for each lot
     # ----------------------------------------------------------------------
     def on_price_update(
-        self,
-        pair: str,
-        current_price: float,
-        kraken_balances: Dict[str, float],
-        stop_loss_pct: float = ConfigLoader.get_value("stop_loss_percent", 0.05),
-        take_profit_pct: float = ConfigLoader.get_value("take_profit_percent", 0.02)
+            self,
+            pair: str,
+            current_price: float,
+            kraken_balances: Dict[str, float]
     ):
         """
-        For each open lot on 'pair', we update peak prices, then check if
-        SL or TP triggers => place SELL => set lot_status='PENDING_SELL'.
+        For each open lot on 'pair', update peak prices and check if stop-loss or take-profit triggers
+        using dynamic thresholds from the database.
+
+        Args:
+            pair (str): The trading pair.
+            current_price (float): Current market price.
+            kraken_balances (Dict[str, float]): Current balances (not used here but kept for compatibility).
         """
         lots = self._load_open_lots(pair)
         if not lots:
             return
 
+        # Fetch dynamic thresholds from the database
+        stop_loss_threshold, take_profit_threshold = self._get_thresholds_from_db(pair)
+        if stop_loss_threshold is None or take_profit_threshold is None:
+            logger.warning(f"[RiskManager] No thresholds available for {pair}, skipping SL/TP checks.")
+            # Optional: Fall back to config.yaml values
+            stop_loss_pct = ConfigLoader.get_value("stop_loss_percent", 0.05)
+            take_profit_pct = ConfigLoader.get_value("take_profit_percent", 0.02)
+            lot_price = float(lots[0]["purchase_price"])  # Use first lot as reference
+            stop_loss_threshold = lot_price * (1.0 - stop_loss_pct)
+            take_profit_threshold = lot_price * (1.0 + take_profit_pct)
+
         for lot in lots:
             lot_id = lot["id"]
-            lot_price = float(lot["purchase_price"])
             lot_qty = float(lot["quantity"])
             lot_status = lot.get("lot_status", "ACTIVE")
 
-            # 1) Update peak favorable / adverse
-            peak_fav = float(lot.get("peak_favorable_price") or lot_price)
-            peak_adv = float(lot.get("peak_adverse_price") or lot_price)
+            # Update peak favorable / adverse prices
+            peak_fav = float(lot.get("peak_favorable_price") or lot["purchase_price"])
+            peak_adv = float(lot.get("peak_adverse_price") or lot["purchase_price"])
             updated_fav = max(peak_fav, current_price)
             updated_adv = min(peak_adv, current_price)
-            if (updated_fav != peak_fav) or (updated_adv != peak_adv):
+            if updated_fav != peak_fav or updated_adv != peak_adv:
                 self._update_lot_peak_prices(lot_id, updated_fav, updated_adv)
 
             if lot_qty <= 0 or lot_status in ("PENDING_SELL", "CLOSED"):
-                continue  # skip
+                continue
 
-            # 2) STOP LOSS
-            if stop_loss_pct > 0.0 and current_price <= lot_price * (1.0 - stop_loss_pct):
-                reason = f"STOP_LOSS triggered at price={current_price:.4f}"
+            # Check stop-loss and take-profit using database thresholds
+            if current_price <= stop_loss_threshold:
+                reason = f"STOP_LOSS triggered at price={current_price:.4f} (threshold={stop_loss_threshold:.4f})"
                 logger.info(f"[RiskManager] Stop-loss => lot_id={lot_id}, SELL all => {lot_qty:.4f} {pair}")
                 self._record_stop_loss_event(lot_id, current_price, reason)
-
                 min_order_size = db_lookup.get_ordermin(pair)
                 if lot_qty < min_order_size:
-                    logger.warning(f"[RiskManager] lot_id={lot_id} => SELL qty={lot_qty:.4f} < exch min={min_order_size:.4f}, skip.")
+                    logger.warning(
+                        f"[RiskManager] lot_id={lot_id} => SELL qty={lot_qty:.4f} < min={min_order_size:.4f}, skip.")
                     continue
-
-                # Create pending SELL
                 pending_id = create_pending_trade(
                     side="SELL",
                     requested_qty=lot_qty,
@@ -440,43 +451,25 @@ class RiskManagerDB:
                 )
                 if self._maybe_place_kraken_order(pair, "SELL", lot_qty, pending_id):
                     self._mark_lot_as_pending_sell(lot_id)
-                else:
-                    logger.warning("[RiskManager] Private feed not open => skip => retry next cycle.")
-                continue
 
-            # 3) TAKE PROFIT
-            if take_profit_pct > 0.0 and current_price >= lot_price * (1.0 + take_profit_pct):
-                # partial or full
-                init_qty = float(lot["initial_quantity"])
-                leftover_candidate = lot_qty
-                proposed_sell = min(lot_qty, init_qty)
-
+            elif current_price >= take_profit_threshold:
+                reason = f"TAKE_PROFIT triggered at price={current_price:.4f} (threshold={take_profit_threshold:.4f})"
+                logger.info(f"[RiskManager] Take-profit => lot_id={lot_id}, SELL => {lot_qty:.4f} {pair}")
                 min_order_size = db_lookup.get_ordermin(pair)
-                leftover = leftover_candidate - proposed_sell
-
-                # if leftover < 1.1 * min => just sell entire
-                if leftover > 0 and leftover < (1.1 * min_order_size):
-                    proposed_sell = lot_qty
-
-                if proposed_sell < min_order_size:
-                    logger.warning(f"[RiskManager] lot_id={lot_id} => SELL {proposed_sell:.4f} < exch min => skip.")
+                if lot_qty < min_order_size:
+                    logger.warning(
+                        f"[RiskManager] lot_id={lot_id} => SELL qty={lot_qty:.4f} < min={min_order_size:.4f}, skip.")
                     continue
-
-                reason = f"TAKE_PROFIT => {current_price:.4f}"
-                logger.info(f"[RiskManager] Take-profit => lot_id={lot_id}, SELL => {proposed_sell:.4f} {pair}")
-
                 pending_id = create_pending_trade(
                     side="SELL",
-                    requested_qty=proposed_sell,
+                    requested_qty=lot_qty,
                     pair=pair,
                     reason=reason,
                     source="risk_manager",
                     rationale="take-profit"
                 )
-                if self._maybe_place_kraken_order(pair, "SELL", proposed_sell, pending_id):
+                if self._maybe_place_kraken_order(pair, "SELL", lot_qty, pending_id):
                     self._mark_lot_as_pending_sell(lot_id)
-                else:
-                    logger.warning("[RiskManager] Private feed not open => skipping => retry next cycle.")
 
     def _update_lot_peak_prices(self, lot_id: int, new_fav: float, new_adv: float):
         """
@@ -494,6 +487,37 @@ class RiskManagerDB:
             conn.commit()
         except Exception as e:
             logger.exception(f"[RiskManager] _update_lot_peak_prices => {e}")
+        finally:
+            conn.close()
+
+    def _get_thresholds_from_db(self, pair: str) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Fetches the latest stop_loss and take_profit thresholds from coin_thresholds for the given pair.
+
+        Args:
+            pair (str): The trading pair (e.g., "ETH/USD").
+
+        Returns:
+            Tuple[Optional[float], Optional[float]]: (stop_loss, take_profit), or (None, None) if not found.
+        """
+        conn = sqlite3.connect(self.db_path)
+        try:
+            c = conn.cursor()
+            c.execute("""
+                SELECT stop_loss, take_profit
+                FROM coin_thresholds
+                WHERE pair = ?
+                ORDER BY last_updated DESC
+                LIMIT 1
+            """, (pair,))
+            row = c.fetchone()
+            if row:
+                return float(row[0]), float(row[1])
+            logger.warning(f"[RiskManager] No thresholds found for {pair}")
+            return None, None
+        except Exception as e:
+            logger.exception(f"[RiskManager] Error fetching thresholds for {pair}: {e}")
+            return None, None
         finally:
             conn.close()
 
