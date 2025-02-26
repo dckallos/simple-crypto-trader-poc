@@ -846,13 +846,13 @@ def main():
         place_live_orders=PLACE_LIVE_ORDERS,
         ai_lock=ai_lock
     )
+    manager = KrakenRestManager(KRAKEN_API_KEY, KRAKEN_API_SECRET)
     risk_manager_db.initialize()
     risk_manager_db.rebuild_lots_from_ledger_entries()
     loop = asyncio.get_event_loop()
     risk_manager_task = loop.create_task(
-        risk_manager_db.start_db_price_check_cycle(
-            pairs=TRADED_PAIRS
-        )
+
+        risk_manager_db.start_db_price_check_cycle(pairs=TRADED_PAIRS)
     )
 
     rest_manager = KrakenRestManager(KRAKEN_API_KEY, KRAKEN_API_SECRET)
