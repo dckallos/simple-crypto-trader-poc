@@ -64,8 +64,6 @@ from db import create_pending_trade
 from config_loader import ConfigLoader
 from threading import Lock
 
-from kraken_rest_manager import KrakenRestManager
-
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -259,11 +257,6 @@ class RiskManagerDB:
         self.private_ws_client = private_ws_client
         self.place_live_orders = place_live_orders
         self.ai_lock = ai_lock
-        self.latest_balances = {}
-        self.rest_manager = KrakenRestManager(
-            api_key=os.getenv("KRAKEN_API_KEY"),
-            api_secret=os.getenv("KRAKEN_SECRET_API_KEY")
-        )
 
     def initialize(self) -> None:
         """
@@ -319,9 +312,6 @@ class RiskManagerDB:
         """
         return db_lookup.get_base_asset(pair)
 
-    def update_balances(self, balances: Dict[str, float]):
-        self.latest_balances = balances.copy()
-
     # ----------------------------------------------------------------------
     # Price-check cycle => called in main.py with an async loop
     # ----------------------------------------------------------------------
@@ -334,7 +324,6 @@ class RiskManagerDB:
          - Repeats until canceled
         """
         import asyncio
-        self.update_balances(self.rest_manager.fetch_balance())
 
         dynamic_interval = ConfigLoader.get_value("risk_manager_interval_seconds", 30.0)
         logger.debug(f"[RiskManager] Sleeping for {dynamic_interval} seconds before start.")
@@ -674,27 +663,26 @@ class RiskManagerDB:
             )
 
     def adjust_trade(
-            self,
-            signal: str,
-            suggested_size: float,
-            pair: str,
-            current_price: float,
-            kraken_balances: Dict[str, float]
+        self,
+        signal: str,
+        suggested_size: float,
+        pair: str,
+        current_price: float,
+        kraken_balances: Dict[str, float]
     ) -> Tuple[str, float]:
         """
         Called from AIStrategy => verifies daily drawdown, clamp final_size,
         ensures cost >= exchange min cost, checks user balances, etc.
         Returns (action, final_size).
         """
-        # Daily drawdown block
+        # daily drawdown block
         if self.max_daily_drawdown is not None:
             daily_pnl = self.get_daily_realized_pnl()
             if daily_pnl <= self.max_daily_drawdown and signal == "BUY":
-                logger.warning(
-                    f"[RiskManager] dailyPnL={daily_pnl:.4f} <= {self.max_daily_drawdown} => skip BUY => HOLD.")
+                logger.warning(f"[RiskManager] dailyPnL={daily_pnl:.4f} <= {self.max_daily_drawdown} => skip BUY => HOLD.")
                 return ("HOLD", 0.0)
 
-        # Clamp action
+        # clamp action
         if signal not in ("BUY", "SELL"):
             return ("HOLD", 0.0)
 
@@ -702,7 +690,7 @@ class RiskManagerDB:
         if final_size <= 0:
             return ("HOLD", 0.0)
 
-        # If BUY => check cost & user capacity using latest_balances
+        # If BUY => check cost & user capacity
         if signal == "BUY":
             cost = final_size * current_price
             min_cost = db_lookup.get_minimum_cost_in_usd(pair)
@@ -710,19 +698,22 @@ class RiskManagerDB:
                 logger.info(f"[RiskManager] Proposed BUY cost={cost:.2f} < min cost={min_cost:.2f} => skip.")
                 return ("HOLD", 0.0)
 
-            usd_symbol = self._get_quote_symbol(pair)  # e.g., "ZUSD"
-            free_usd = self.latest_balances.get(usd_symbol, 0.0)
+            if cost > self.initial_spending_account:
+                logger.info(f"[RiskManager] cost={cost:.2f} > init_acct={self.initial_spending_account:.2f} => skip.")
+                return ("HOLD", 0.0)
+
+            usd_symbol = self._get_quote_symbol(pair)
+            free_usd = kraken_balances.get(usd_symbol, 0.0)
             if cost > free_usd:
                 logger.info(f"[RiskManager] insufficient {usd_symbol}, cost={cost:.2f}, have={free_usd:.2f} => skip.")
                 return ("HOLD", 0.0)
 
         # If SELL => ensure enough base coins
         else:
-            base_sym = self._get_base_symbol(pair)  # e.g., "XETH"
-            free_coins = self.latest_balances.get(base_sym, 0.0)
+            base_sym = self._get_base_symbol(pair)
+            free_coins = kraken_balances.get(base_sym, 0.0)
             if final_size > free_coins:
-                logger.info(
-                    f"[RiskManager] insufficient {base_sym}, need={final_size:.4f}, have={free_coins:.4f} => skip.")
+                logger.info(f"[RiskManager] insufficient {base_sym}, need={final_size:.4f}, have={free_coins:.4f} => skip.")
                 return ("HOLD", 0.0)
 
         return (signal, final_size)
