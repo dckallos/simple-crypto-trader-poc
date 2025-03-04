@@ -576,8 +576,6 @@ class HybridApp:
         )
         trade_balances = self.manager.fetch_balance()
         current_usd_balance = get_latest_zusd_balance(db_path=db.DB_FILE)
-        traded_pairs = ConfigLoader.get_value("traded_pairs", [])
-        self.manager.fetch_and_store_trade_volume(traded_pairs, db_path="trades.db")
 
         # Convert Kraken base-asset keys to wsname
         trade_balances_ws = convert_base_asset_keys_to_wsname(trade_balances)
@@ -596,12 +594,10 @@ class HybridApp:
         stop_loss_pct = ConfigLoader.get_value("stop_loss_percent", 0.04)
         take_profit_pct = ConfigLoader.get_value("take_profit_percent", 0.01)
         daily_drawdown_limit = self.strategy.max_daily_drawdown if self.strategy else -0.02
-        import threshold_manager
-        threshold_manager.update_pair_thresholds(traded_pairs)
+
         with ai_lock:
             for pair in filtered_pairs:
                 last_price = self.latest_prices.get(pair, 0.0)
-
                 if last_price == 0.0:
                     zero_count += 1
 
@@ -846,13 +842,13 @@ def main():
         place_live_orders=PLACE_LIVE_ORDERS,
         ai_lock=ai_lock
     )
-    manager = KrakenRestManager(KRAKEN_API_KEY, KRAKEN_API_SECRET)
     risk_manager_db.initialize()
     risk_manager_db.rebuild_lots_from_ledger_entries()
     loop = asyncio.get_event_loop()
     risk_manager_task = loop.create_task(
-
-        risk_manager_db.start_db_price_check_cycle(pairs=TRADED_PAIRS)
+        risk_manager_db.start_db_price_check_cycle(
+            pairs=TRADED_PAIRS
+        )
     )
 
     rest_manager = KrakenRestManager(KRAKEN_API_KEY, KRAKEN_API_SECRET)

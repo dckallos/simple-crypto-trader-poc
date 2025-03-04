@@ -3,7 +3,7 @@
 ##################################################################
 
 # How often the AI is called to make a trading decision (seconds)
-trade_interval_seconds: 360
+trade_interval_seconds: 900
 
 # Either place live orders, or turn off ordering with app running.
 place_live_orders: true
@@ -23,10 +23,10 @@ quantity_of_price_history: 30
 prompt_template_name: "aggregator_modified_prompt.mustache"
 
 # The percent loss allowed before you exit position
-stop_loss_percent: 0.03
+stop_loss_percent: 0.15
 
 # The percent gains allowed before you exit position
-take_profit_percent: 0.02
+take_profit_percent: 0.015
 
 # Minimum rows for pre-populate tables to have to be skipped
 min_data_rows: 100
@@ -56,7 +56,7 @@ initial_risk_manager_sleep_seconds: 60
 enable_reflection: true
 
 risk_controls:
-  initial_spending_account: 75.0
+  initial_spending_account: 50.0
   purchase_upper_limit_percent: 25.0
   max_position_value: 25.0
 
