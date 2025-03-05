@@ -15,6 +15,7 @@ reasoning_effort: "medium"
 
 # How many seconds to wait for the next ST/TP exit check
 risk_manager_interval_seconds: 60
+balance_refresh_interval_seconds: 60
 
 # The number of price_history records to include in AI prompt
 quantity_of_price_history: 30
@@ -23,10 +24,10 @@ quantity_of_price_history: 30
 prompt_template_name: "aggregator_modified_prompt.mustache"
 
 # The percent loss allowed before you exit position
-stop_loss_percent: 0.15
+stop_loss_percent: 0.02
 
 # The percent gains allowed before you exit position
-take_profit_percent: 0.015
+take_profit_percent: 0.01
 
 # Minimum rows for pre-populate tables to have to be skipped
 min_data_rows: 100

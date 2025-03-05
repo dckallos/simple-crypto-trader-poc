@@ -832,6 +832,8 @@ def main():
             symbols_for_timeseries=db_lookup.get_symbols_for_time_series(TRADED_PAIRS)
         )
 
+    rest_manager = KrakenRestManager(KRAKEN_API_KEY, KRAKEN_API_SECRET)
+
     # 4) Create risk_manager + AIStrategy
     risk_manager_db = RiskManagerDB(
         db_path=DB_FILE,
@@ -840,7 +842,8 @@ def main():
         initial_spending_account=RISK_CONTROLS.get("initial_spending_account", 0.0),
         private_ws_client=None,
         place_live_orders=PLACE_LIVE_ORDERS,
-        ai_lock=ai_lock
+        ai_lock=ai_lock,
+        manager=rest_manager
     )
     risk_manager_db.initialize()
     risk_manager_db.rebuild_lots_from_ledger_entries()
@@ -850,8 +853,6 @@ def main():
             pairs=TRADED_PAIRS
         )
     )
-
-    rest_manager = KrakenRestManager(KRAKEN_API_KEY, KRAKEN_API_SECRET)
 
     ai_strategy = AIStrategy(
         pairs=TRADED_PAIRS,

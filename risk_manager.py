@@ -64,6 +64,8 @@ from db import create_pending_trade
 from config_loader import ConfigLoader
 from threading import Lock
 
+from kraken_rest_manager import KrakenRestManager
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -239,7 +241,8 @@ class RiskManagerDB:
         initial_spending_account: float = 100.0,
         private_ws_client=None,
         place_live_orders: bool = False,
-        ai_lock: Lock = None
+        ai_lock: Lock = None,
+        manager: KrakenRestManager = None
     ):
         """
         :param db_path: Path to SQLite DB
@@ -257,6 +260,8 @@ class RiskManagerDB:
         self.private_ws_client = private_ws_client
         self.place_live_orders = place_live_orders
         self.ai_lock = ai_lock
+        self.manager = manager
+        self.kraken_balances = {} if manager is None else manager.fetch_balance()
 
     def initialize(self) -> None:
         """
@@ -312,6 +317,16 @@ class RiskManagerDB:
         """
         return db_lookup.get_base_asset(pair)
 
+    def _refresh_balances(self):
+        if self.manager is None:
+            logger.warning("[RiskManager] No KrakenRestManager available to refresh balances.")
+            return
+        try:
+            self.kraken_balances = self.manager.fetch_balance()
+            logger.info("[RiskManager] Refreshed Kraken balances.")
+        except Exception as e:
+            logger.exception(f"[RiskManager] Error refreshing balances: {e}")
+
     # ----------------------------------------------------------------------
     # Price-check cycle => called in main.py with an async loop
     # ----------------------------------------------------------------------
@@ -325,7 +340,9 @@ class RiskManagerDB:
         """
         import asyncio
 
-        dynamic_interval = ConfigLoader.get_value("risk_manager_interval_seconds", 30.0)
+        dynamic_interval = ConfigLoader.get_value("risk_manager_interval_seconds", 60.0)
+        balance_interval = ConfigLoader.get_value("balance_refresh_interval_seconds", 30.0)
+        last_balance_refresh = 0
         logger.debug(f"[RiskManager] Sleeping for {dynamic_interval} seconds before start.")
 
         initial_sleep = ConfigLoader.get_value("initial_risk_manager_sleep_seconds", 30.0)
@@ -335,6 +352,10 @@ class RiskManagerDB:
         logger.info(f"[RiskManager] Starting DB-based price check cycle => pairs={pairs}, interval={dynamic_interval}s")
         while True:
             try:
+                now = time.time()
+                if now - last_balance_refresh >= balance_interval:
+                    self._refresh_balances()
+                    last_balance_refresh = now
                 # Check if the AI is processing (lock is acquired)
                 if self.ai_lock.locked():
                     logger.info("[RiskManager] AI is processing, skipping this cycle.")
@@ -527,6 +548,27 @@ class RiskManagerDB:
             logger.info(f"[RiskManager] Logged stop_loss_event => lot_id={lot_id}, price={current_price}")
         except Exception as e:
             logger.exception(f"[RiskManager] error => _record_stop_loss_event => {e}")
+        finally:
+            conn.close()
+
+    # In risk_manager.py, within RiskManagerDB class
+    def on_order_rejected(self, lot_id: int, reason: str):
+        """
+        Called when a sell order is rejected by Kraken. Reverts lot_status to 'ACTIVE'.
+        """
+        conn = sqlite3.connect(self.db_path)
+        try:
+            c = conn.cursor()
+            c.execute("""
+                UPDATE holding_lots
+                SET lot_status='ACTIVE'
+                WHERE id=? AND lot_status='PENDING_SELL'
+            """, (lot_id,))
+            conn.commit()
+            if c.rowcount > 0:
+                logger.info(f"[RiskManager] Reverted lot_id={lot_id} to ACTIVE after rejection: {reason}")
+        except Exception as e:
+            logger.exception(f"[RiskManager] Error in on_order_rejected: {e}")
         finally:
             conn.close()
 

@@ -467,6 +467,16 @@ class KrakenPrivateWSClient:
             if self.on_private_event_callback:
                 self.on_private_event_callback({"feed_name": feed_name, "data": data})
 
+    def _get_lot_id_from_pending_id(self, pending_id):
+        conn = sqlite3.connect("trades.db")
+        try:
+            c = conn.cursor()
+            c.execute("SELECT lot_id FROM pending_trades WHERE id=?", (pending_id,))
+            row = c.fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
+
     def _process_private_order_message(self, msg: dict):
         """
         Called when we get addOrderStatus or cancelOrderStatus or error messages.
@@ -482,8 +492,19 @@ class KrakenPrivateWSClient:
         error_msg = msg.get("errorMessage", "")
 
         if status_str == "error":
-            logger.info(f"[PrivateWS] Order rejected => {txid}, reason={error_msg}")
-            mark_pending_trade_rejected_by_kraken_id(txid, error_msg)
+            logger.info(f"[PrivateWS] Order rejected => reason={error_msg}")
+            if userref:
+                try:
+                    pending_id = int(userref)
+                    mark_pending_trade_rejected(pending_id, error_msg)
+                    if self.risk_manager:
+                        lot_id = self._get_lot_id_from_pending_id(pending_id)
+                        if lot_id:
+                            self.risk_manager.on_order_rejected(lot_id, error_msg)
+                except ValueError:
+                    logger.warning(f"[PrivateWS] Invalid userref => {userref}")
+            else:
+                logger.warning(f"[PrivateWS] Order rejected => reason={error_msg} => no userref.")
         elif status_str in ["canceled", "expired"]:
             logger.info(f"[PrivateWS] Order canceled => {txid}, reason={status_str}")
             vol_exec = float(msg.get("vol_exec", "0.0"))
