@@ -58,7 +58,7 @@ from prompt_builder import PromptBuilder
 import db_lookup
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 
 ai_lock = Lock()
 
@@ -92,7 +92,7 @@ LOG_CONFIG = {
     'handlers': {
         'console': {
             'class': 'logging.StreamHandler',
-            'level': 'DEBUG',
+            'level': 'INFO',
             'formatter': 'standard',
             'stream': 'ext://sys.stdout'
         },
@@ -105,12 +105,12 @@ LOG_CONFIG = {
         },
         'requests': {
             'handlers': ['console'],
-            'level': 'DEBUG',
+            'level': 'INFO',
             'propagate': True
         },
         'urllib3': {
             'handlers': ['console'],
-            'level': 'DEBUG',
+            'level': 'INFO',
             'propagate': True
         },
     }

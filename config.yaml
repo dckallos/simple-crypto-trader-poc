@@ -3,7 +3,7 @@
 ##################################################################
 
 # How often the AI is called to make a trading decision (seconds)
-trade_interval_seconds: 900
+trade_interval_seconds: 180
 
 # Either place live orders, or turn off ordering with app running.
 place_live_orders: true
@@ -14,8 +14,8 @@ is_reasoning_model: true,
 reasoning_effort: "medium"
 
 # How many seconds to wait for the next ST/TP exit check
-risk_manager_interval_seconds: 60
-balance_refresh_interval_seconds: 60
+risk_manager_interval_seconds: 90
+balance_refresh_interval_seconds: 90
 
 # The number of price_history records to include in AI prompt
 quantity_of_price_history: 30

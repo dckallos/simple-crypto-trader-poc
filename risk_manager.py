@@ -327,7 +327,7 @@ class RiskManagerDB:
         except Exception as e:
             logger.exception(f"[RiskManager] Error refreshing balances: {e}")
 
-    def _place_sell_order(self, lot_id: int, pair: str, sell_qty: float, current_price: float):
+    def _place_sell_order(self, lot_id: int, pair: str, sell_qty: float, rationale: str):
         """
         Place a SELL order for the given lot_id and qty.
         Verifies sufficient base asset balance via Kraken REST API before proceeding.
@@ -337,7 +337,6 @@ class RiskManagerDB:
             lot_id (int): The ID of the lot to sell.
             pair (str): The trading pair (e.g., "ATOM/USD").
             sell_qty (float): The quantity to sell.
-            current_price (float): The current market price for logging/rationale.
 
         Returns:
             None
@@ -372,7 +371,7 @@ class RiskManagerDB:
             side="SELL",
             requested_qty=sell_qty,
             source="risk_manager",
-            rationale=f"Stop-loss or take-profit triggered at price={current_price}"
+            rationale=rationale
         )
 
         if pending_id:
@@ -463,10 +462,10 @@ class RiskManagerDB:
                         if current_price <= stop_loss_price:
                             logger.info(f"[RiskManager] Stop-loss => lot_id={lot_id}, SELL all => {lot_qty} {pair}")
                             self._record_stop_loss_event(lot_id, current_price, f"Stop-loss => lot_id={lot_id}, SELL all => {lot_qty} {pair}")
-                            self._place_sell_order(lot_id, pair, lot_qty, current_price)
+                            self._place_sell_order(lot_id, pair, lot_qty, "stop-loss")
                         elif current_price >= take_profit_price:
                             logger.info(f"[RiskManager] Take-profit => lot_id={lot_id}, SELL => {lot_qty} {pair}")
-                            self._place_sell_order(lot_id, pair, lot_qty, current_price)
+                            self._place_sell_order(lot_id, pair, lot_qty, "take-profit")
 
             except Exception as e:
                 logger.exception(f"[RiskManager] Error in DB price check cycle: {e}")
