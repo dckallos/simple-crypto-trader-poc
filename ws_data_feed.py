@@ -479,20 +479,27 @@ class KrakenPrivateWSClient:
 
     def _process_private_order_message(self, msg: dict):
         """
-        Called when we get addOrderStatus or cancelOrderStatus or error messages.
-        We'll update 'pending_trades' accordingly. Actual fills happen in ownTrades or by final closure.
+        Process private order messages from Kraken (e.g., addOrderStatus).
+        Handles order acceptance, rejections, and closures by updating pending_trades
+        and notifying RiskManagerDB where applicable.
+
+        Args:
+            msg (dict): The WebSocket message dictionary from Kraken.
+
+        Returns:
+            None
         """
         event_type = msg.get("event", "")
         if event_type != "addOrderStatus":
             return
 
-        txid = msg.get("txid", "")
         status_str = msg.get("status", "")
         userref = msg.get("userref")
         error_msg = msg.get("errorMessage", "")
+        txid = msg.get("txid", "")
 
         if status_str == "error":
-            logger.info(f"[PrivateWS] Order rejected => reason={error_msg}")
+            logger.info(f"[PrivateWS] Order rejected => reason={error_msg}, userref={userref}")
             if userref:
                 try:
                     pending_id = int(userref)
@@ -501,6 +508,8 @@ class KrakenPrivateWSClient:
                         lot_id = self._get_lot_id_from_pending_id(pending_id)
                         if lot_id:
                             self.risk_manager.on_order_rejected(lot_id, error_msg)
+                        else:
+                            logger.warning(f"[PrivateWS] No lot_id found for pending_id={pending_id}")
                 except ValueError:
                     logger.warning(f"[PrivateWS] Invalid userref => {userref}")
             else:
@@ -512,10 +521,8 @@ class KrakenPrivateWSClient:
             fee_val = float(msg.get("fee", "0.0"))
 
             if vol_exec == 0:
-                # fully unfilled => just mark rejected
                 mark_pending_trade_rejected_by_kraken_id(txid, status_str)
             else:
-                # partial => final close
                 self._finalize_trade_from_kraken(txid, vol_exec, avg_price, fee_val)
         elif status_str == "closed":
             logger.info(f"[PrivateWS] Order closed => {txid}")
@@ -524,7 +531,6 @@ class KrakenPrivateWSClient:
             fee_val = float(msg.get("fee", "0.0"))
             self._finalize_trade_from_kraken(txid, vol_exec, avg_price, fee_val)
         elif status_str == "ok":
-            # order accepted
             if userref:
                 try:
                     set_kraken_order_id_for_pending_trade(int(userref), txid)

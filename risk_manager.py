@@ -49,7 +49,7 @@ You can add them with straightforward migrations or rely on the
 automatic creation in init_holding_lots_table / _maybe_migrate_trades_table.
 
 """
-
+import asyncio
 import logging
 import os
 import sqlite3
@@ -327,55 +327,151 @@ class RiskManagerDB:
         except Exception as e:
             logger.exception(f"[RiskManager] Error refreshing balances: {e}")
 
+    def _place_sell_order(self, lot_id: int, pair: str, sell_qty: float, current_price: float):
+        """
+        Place a SELL order for the given lot_id and qty.
+        Verifies sufficient base asset balance via Kraken REST API before proceeding.
+        If place_live_orders=True, sends the order to KrakenPrivateWSClient.
+
+        Args:
+            lot_id (int): The ID of the lot to sell.
+            pair (str): The trading pair (e.g., "ATOM/USD").
+            sell_qty (float): The quantity to sell.
+            current_price (float): The current market price for logging/rationale.
+
+        Returns:
+            None
+        """
+        if sell_qty <= 0:
+            logger.warning(f"[RiskManager] Invalid sell_qty={sell_qty} for lot_id={lot_id} => skipping.")
+            return
+
+        # Fetch the latest balances if manager is available
+        if self.manager:
+            with self.ai_lock:  # Ensure thread-safe balance updates
+                self.kraken_balances = self.manager.fetch_balance()
+            logger.debug("[RiskManager] Fetched latest Kraken balances.")
+        else:
+            logger.warning("[RiskManager] No KrakenRestManager available to fetch balances.")
+
+        # Determine base asset symbol (e.g., "ATOM" from "ATOM/USD")
+        base_symbol = self._get_base_symbol(pair)
+        available_balance = self.kraken_balances.get(base_symbol, 0.0)
+
+        # Verify sufficient funds
+        if available_balance < sell_qty:
+            logger.warning(
+                f"[RiskManager] Insufficient {base_symbol}: need {sell_qty}, have {available_balance} "
+                f"=> skipping SELL for lot_id={lot_id}"
+            )
+            return
+
+        # Create pending trade entry
+        pending_id = create_pending_trade(
+            pair=pair,
+            side="SELL",
+            requested_qty=sell_qty,
+            source="risk_manager",
+            rationale=f"Stop-loss or take-profit triggered at price={current_price}"
+        )
+
+        if pending_id:
+            logger.info(f"[RiskManager] Created pending trade ID {pending_id} for SELL {sell_qty} {pair}")
+            if self._maybe_place_kraken_order(pair, "SELL", sell_qty, pending_id):
+                self._mark_lot_as_pending_sell(lot_id)
+            else:
+                logger.warning(f"[RiskManager] Failed to place order for pending_id={pending_id}")
+        else:
+            logger.error(f"[RiskManager] Failed to create pending trade for lot_id={lot_id}")
+
     # ----------------------------------------------------------------------
     # Price-check cycle => called in main.py with an async loop
     # ----------------------------------------------------------------------
     async def start_db_price_check_cycle(self, pairs: List[str]):
         """
-        Asynchronous loop:
-         - sleeps initial_risk_manager_sleep_seconds
-         - Then, every X seconds, fetches last known DB price for each pair
-         - Calls on_price_update => handle SL/TP triggers
-         - Repeats until canceled
+        Start an infinite async loop that checks DB prices for all pairs every
+        risk_manager_interval_seconds. Periodically refreshes kraken_balances to ensure
+        accurate fund availability.
+
+        Args:
+            pairs (List[str]): List of trading pairs to monitor (e.g., ["ATOM/USD"]).
+
+        Returns:
+            None
         """
-        import asyncio
-
-        dynamic_interval = ConfigLoader.get_value("risk_manager_interval_seconds", 60.0)
-        balance_interval = ConfigLoader.get_value("balance_refresh_interval_seconds", 30.0)
+        interval = ConfigLoader.get_value("risk_manager_interval_seconds", 60)
+        balance_interval = ConfigLoader.get_value("balance_refresh_interval_seconds", 300)
         last_balance_refresh = 0
-        logger.debug(f"[RiskManager] Sleeping for {dynamic_interval} seconds before start.")
 
-        initial_sleep = ConfigLoader.get_value("initial_risk_manager_sleep_seconds", 30.0)
-        logger.info(f"[RiskManager] Delaying {initial_sleep} seconds before first cycle.")
-        await asyncio.sleep(initial_sleep)
-
-        logger.info(f"[RiskManager] Starting DB-based price check cycle => pairs={pairs}, interval={dynamic_interval}s")
         while True:
             try:
                 now = time.time()
-                if now - last_balance_refresh >= balance_interval:
-                    self._refresh_balances()
+                # Refresh balances periodically
+                if now - last_balance_refresh >= balance_interval and self.manager:
+                    with self.ai_lock:  # Thread-safe update
+                        self.kraken_balances = self.manager.fetch_balance()
+                    logger.info("[RiskManager] Refreshed Kraken balances.")
                     last_balance_refresh = now
-                # Check if the AI is processing (lock is acquired)
-                if self.ai_lock.locked():
-                    logger.info("[RiskManager] AI is processing, skipping this cycle.")
-                    await asyncio.sleep(1)  # Sleep briefly to avoid busy-waiting
-                    continue
 
+                # Fetch latest prices from price_history
+                conn = sqlite3.connect(self.db_path)
+                conn.row_factory = sqlite3.Row
+                c = conn.cursor()
+
+                # Build price map incrementally
+                price_map = {}
                 for pair in pairs:
-                    last_price = self._fetch_latest_price_for_pair(pair)
-                    if last_price > 0:
-                        # We pass empty kraken_balances unless you want to pass real data
-                        self.on_price_update(pair, last_price, {})
-            except asyncio.CancelledError:
-                logger.info("[RiskManager] price_check_cycle => canceled => exit loop.")
-                break
+                    c.execute("""
+                        SELECT last_price
+                        FROM price_history
+                        WHERE pair = ?
+                        ORDER BY timestamp DESC
+                        LIMIT 1
+                    """, (pair,))
+                    row = c.fetchone()
+                    last_price = row["last_price"] if row and row["last_price"] else 0.0
+                    price_map[pair] = last_price
+
+                conn.close()
+
+                # Check each lot against latest prices
+                for pair in pairs:
+                    current_price = price_map.get(pair, 0.0)
+                    if current_price <= 0:
+                        logger.debug(f"[RiskManager] No valid price for {pair} => skipping.")
+                        continue
+
+                    lots = self._load_open_lots(pair)
+                    for lot in lots:
+                        lot_id = lot["id"]
+                        lot_qty = float(lot["quantity"])
+                        purchase_price = float(lot["purchase_price"])
+                        lot_status = lot["lot_status"]
+                        peak_favorable_price = float(lot["peak_favorable_price"])
+                        peak_adverse_price = float(lot["peak_adverse_price"])
+
+                        if lot_status == "PENDING_SELL":
+                            continue  # Skip if already pending
+
+                        # Update peak prices
+                        self._update_lot_peak_prices(lot_id, peak_favorable_price, peak_adverse_price)
+
+                        # Check stop-loss and take-profit
+                        stop_loss_price = purchase_price * (1 - ConfigLoader.get_value("stop_loss_percent", 0.05))
+                        take_profit_price = purchase_price * (1 + ConfigLoader.get_value("take_profit_percent", 0.02))
+
+                        if current_price <= stop_loss_price:
+                            logger.info(f"[RiskManager] Stop-loss => lot_id={lot_id}, SELL all => {lot_qty} {pair}")
+                            self._record_stop_loss_event(lot_id, current_price, f"Stop-loss => lot_id={lot_id}, SELL all => {lot_qty} {pair}")
+                            self._place_sell_order(lot_id, pair, lot_qty, current_price)
+                        elif current_price >= take_profit_price:
+                            logger.info(f"[RiskManager] Take-profit => lot_id={lot_id}, SELL => {lot_qty} {pair}")
+                            self._place_sell_order(lot_id, pair, lot_qty, current_price)
+
             except Exception as e:
-                logger.exception(f"[RiskManager] DB price check error => {e}")
+                logger.exception(f"[RiskManager] Error in DB price check cycle: {e}")
 
-            await asyncio.sleep(dynamic_interval)
-
-        logger.info("[RiskManager] price_check_cycle => fully exited.")
+            await asyncio.sleep(interval)
 
     def _fetch_latest_price_for_pair(self, pair: str) -> float:
         """
