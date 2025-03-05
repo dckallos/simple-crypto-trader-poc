@@ -359,7 +359,7 @@ class RiskManagerDB:
 
         # Verify sufficient funds
         if available_balance < sell_qty:
-            logger.warning(
+            logger.debug(
                 f"[RiskManager] Insufficient {base_symbol}: need {sell_qty}, have {available_balance} "
                 f"=> skipping SELL for lot_id={lot_id}"
             )
@@ -375,11 +375,11 @@ class RiskManagerDB:
         )
 
         if pending_id:
-            logger.info(f"[RiskManager] Created pending trade ID {pending_id} for SELL {sell_qty} {pair}")
+            logger.debug(f"[RiskManager] Created pending trade ID {pending_id} for SELL {sell_qty} {pair}")
             if self._maybe_place_kraken_order(pair, "SELL", sell_qty, pending_id):
                 self._mark_lot_as_pending_sell(lot_id)
             else:
-                logger.warning(f"[RiskManager] Failed to place order for pending_id={pending_id}")
+                logger.debug(f"[RiskManager] Failed to place order for pending_id={pending_id}")
         else:
             logger.error(f"[RiskManager] Failed to create pending trade for lot_id={lot_id}")
 
