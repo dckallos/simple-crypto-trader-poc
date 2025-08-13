@@ -22,35 +22,35 @@ High‑Level Architecture
 graph LR
   subgraph Core
     MAIN[main.py]
-    CFG[config_loader.py (ConfigLoader)]
-    LOG[app_logger.py (setup_logging)]
-    DBM[db_manager.py (DBManager)]
+  CFG["config_loader.py (ConfigLoader)"]
+  LOG["app_logger.py (setup_logging)"]
+  DBM["db_manager.py (DBManager)"]
   end
 
   subgraph REST
-    KRM[kraken_rest_manager.py (KrakenRestManager)]
-    HM[kraken_rate_limit_monitor.py (HallMonitor)]
+  KRM["kraken_rest_manager.py (KrakenRestManager)"]
+  HM["kraken_rate_limit_monitor.py (HallMonitor)"]
   end
 
   subgraph WS
-    WSM[ws_manager.py (WSManager)]
-    PUB[kraken_ws_feed.py (KrakenPublicWSClient)]
-    PRV[kraken_ws_feed.py (KrakenPrivateWSClient)]
-    OBW[kraken_ws_feed.py (KrakenOrderBookWSClient)]
-    OBM[order_book_manager.py (OrderBookManager)]
+  WSM["ws_manager.py (WSManager)"]
+  PUB["kraken_ws_feed.py (KrakenPublicWSClient)"]
+  PRV["kraken_ws_feed.py (KrakenPrivateWSClient)"]
+  OBW["kraken_ws_feed.py (KrakenOrderBookWSClient)"]
+  OBM["order_book_manager.py (OrderBookManager)"]
   end
 
   subgraph AI
-    AGG[aggregator.py (Aggregator)]
-    AIS[ai_strategy.py (AIStrategy)]
-    GPT[gpt_manager.py (GPTManager)]
-    MT[model_trainer.py (PriceTrendPredictor)]
+  AGG["aggregator.py (Aggregator)"]
+  AIS["ai_strategy.py (AIStrategy)"]
+  GPT["gpt_manager.py (GPTManager)"]
+  MT["model_trainer.py (PriceTrendPredictor)"]
   end
 
   subgraph Trading
-    RM[risk_manager.py (RiskManager)]
-    TS[trade_smith.py (TradeSmith)]
-    CS[coin_smith.py (CoinSmith)]
+  RM["risk_manager.py (RiskManager)"]
+  TS["trade_smith.py (TradeSmith)"]
+  CS["coin_smith.py (CoinSmith)"]
   end
 
   subgraph DB
