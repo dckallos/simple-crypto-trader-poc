@@ -166,8 +166,11 @@ Running Locally (POC)
 
 5) Start the app:
 
+_Make sure to activate the virtual environment and call python from `venv`._
+
 ```
-python -m asyncio run main.py
+source ./.venv/bin/activate
+./.venv/bin/python main.py
 ```
 
 Notes:
